@@ -3,12 +3,15 @@
 Provides an interactive interface with:
 - Real-time step visibility
 - Pause/resume capability
-- Command history
+- Interactive question handling
+- Run persistence for resume across sessions
 """
 
 import asyncio
 import sys
 import argparse
+import json
+from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -23,24 +26,25 @@ from abstractruntime.integrations.abstractcore import create_local_runtime
 
 from .agents.react import ReactAgent
 from .tools import ALL_TOOLS
+from .ui.question import get_user_response_async, Colors, _c, _supports_color
 
 
 class AgentREPL:
     """Interactive REPL for the ReAct agent."""
     
-    def __init__(self, provider: str, model: str):
+    def __init__(self, provider: str, model: str, state_file: Optional[str] = None):
         self.provider = provider
         self.model = model
+        self.state_file = state_file
         self.agent: Optional[ReactAgent] = None
-        self.paused = False
-        self._step_queue: asyncio.Queue = asyncio.Queue()
+        self._interrupted = False
         
         # Setup tool registry
         self.tool_registry = ToolRegistry()
         for tool in ALL_TOOLS:
             self.tool_registry.register(tool)
         
-        # Setup runtime
+        # Setup runtime with persistence
         self.run_store = InMemoryRunStore()
         self.ledger_store = InMemoryLedgerStore()
         self.runtime = create_local_runtime(
@@ -51,100 +55,168 @@ class AgentREPL:
             effect_policy=RetryPolicy(llm_max_attempts=2),
         )
     
-    def on_step(self, step: str, data: Dict[str, Any]) -> None:
-        """Callback for agent steps - adds to queue for async display."""
-        asyncio.get_event_loop().call_soon_threadsafe(
-            self._step_queue.put_nowait,
-            (step, data)
-        )
-    
     def print_step(self, step: str, data: Dict[str, Any]) -> None:
-        """Print a step to the console."""
+        """Print a step to the console with formatting."""
         timestamp = datetime.now().strftime("%H:%M:%S")
+        ts = _c(f"[{timestamp}]", Colors.DIM)
         
         if step == "init":
-            print(f"\n[{timestamp}] 🚀 Starting agent with task: {data.get('task', '')[:50]}...")
+            task = data.get('task', '')[:60]
+            print(f"\n{ts} {_c('Starting:', Colors.CYAN, Colors.BOLD)} {task}")
         elif step == "reason":
-            print(f"[{timestamp}] 🤔 Reasoning (iteration {data.get('iteration', '?')})...")
+            iteration = data.get('iteration', '?')
+            print(f"{ts} {_c(f'Thinking (step {iteration})...', Colors.YELLOW)}")
         elif step == "parse":
-            action = data.get('action_type', 'unknown')
-            if action == "tool":
-                print(f"[{timestamp}] 📋 Decided to use a tool")
-            elif action == "answer":
-                print(f"[{timestamp}] ✅ Found answer")
-            else:
-                print(f"[{timestamp}] 💭 Thinking...")
+            has_tools = data.get('has_tool_calls', False)
+            if has_tools:
+                print(f"{ts} {_c('Decided to use tools', Colors.BLUE)}")
         elif step == "act":
             tool = data.get('tool', 'unknown')
             args = data.get('args', {})
-            print(f"[{timestamp}] 🔧 Calling tool: {tool}({args})")
+            args_str = json.dumps(args) if args else ""
+            if len(args_str) > 50:
+                args_str = args_str[:47] + "..."
+            print(f"{ts} {_c('Tool:', Colors.GREEN)} {tool}({args_str})")
         elif step == "observe":
-            result = data.get('result', '')[:100]
-            print(f"[{timestamp}] 👁️ Observed: {result}...")
+            result = data.get('result', '')[:80]
+            print(f"{ts} {_c('Result:', Colors.DIM)} {result}")
+        elif step == "ask_user":
+            print(f"{ts} {_c('Agent has a question...', Colors.MAGENTA, Colors.BOLD)}")
+        elif step == "user_response":
+            response = data.get('response', '')[:50]
+            print(f"{ts} {_c('You answered:', Colors.MAGENTA)} {response}")
         elif step == "done":
             answer = data.get('answer', '')
-            print(f"\n[{timestamp}] ✅ ANSWER: {answer}")
-        elif step == "pause":
-            print(f"[{timestamp}] ⏸️ Agent paused. Type 'resume' to continue.")
+            print(f"\n{ts} {_c('ANSWER:', Colors.GREEN, Colors.BOLD)}")
+            print(_c("─" * 60, Colors.DIM))
+            print(answer)
+            print(_c("─" * 60, Colors.DIM))
         elif step == "max_iterations":
-            print(f"[{timestamp}] ⚠️ Max iterations ({data.get('iterations', '?')}) reached")
+            print(f"{ts} {_c('Max iterations reached', Colors.YELLOW)}")
+    
+    async def handle_waiting_state(self) -> bool:
+        """Handle agent waiting state (questions).
+        
+        Returns True if handled and should continue, False to stop.
+        """
+        if not self.agent or not self.agent.is_waiting():
+            return False
+        
+        question = self.agent.get_pending_question()
+        if not question:
+            return False
+        
+        # Get user response via UI
+        response = await get_user_response_async(
+            prompt=question.get("prompt", "Please respond:"),
+            choices=question.get("choices"),
+            allow_free_text=question.get("allow_free_text", True),
+        )
+        
+        if not response:
+            print(_c("No response provided. Agent paused.", Colors.YELLOW))
+            return False
+        
+        # Resume agent with response
+        self.agent.resume(response)
+        return True
     
     async def run_agent_async(self, task: str) -> None:
         """Run the agent asynchronously with step visibility."""
         self.agent = ReactAgent(
             runtime=self.runtime,
             tool_registry=self.tool_registry,
-            on_step=self.print_step,  # Direct print for simplicity
+            on_step=self.print_step,
         )
         
         self.agent.start(task)
-        self.paused = False
+        self._interrupted = False
         
-        print(f"\n{'='*60}")
-        print(f"Task: {task}")
-        print(f"{'='*60}")
+        print(f"\n{_c('═' * 60, Colors.CYAN)}")
+        print(f"{_c('Task:', Colors.BOLD)} {task}")
+        print(f"{_c('═' * 60, Colors.CYAN)}")
         
         try:
-            while True:
-                if self.paused:
-                    await asyncio.sleep(0.1)
-                    continue
-                
+            while not self._interrupted:
                 state = self.agent.step()
                 
                 if state.status == RunStatus.COMPLETED:
-                    print(f"\n{'='*60}")
-                    print(f"Completed in {state.output.get('iterations', '?')} iterations")
-                    print(f"{'='*60}\n")
+                    print(f"\n{_c('═' * 60, Colors.GREEN)}")
+                    print(f"{_c('Completed', Colors.GREEN, Colors.BOLD)} in {state.output.get('iterations', '?')} steps")
+                    print(f"{_c('═' * 60, Colors.GREEN)}")
                     break
+                    
                 elif state.status == RunStatus.WAITING:
-                    print("\n⏸️ Agent is waiting. Type 'resume' to continue or 'cancel' to stop.")
-                    break
+                    # Handle question
+                    handled = await self.handle_waiting_state()
+                    if not handled:
+                        print(f"\n{_c('Agent paused.', Colors.YELLOW)} Type 'resume' to continue.")
+                        break
+                    # After handling, continue the loop to process next step
+                    continue
+                    
                 elif state.status == RunStatus.FAILED:
-                    print(f"\n❌ Agent failed: {state.error}")
+                    print(f"\n{_c('Failed:', Colors.YELLOW)} {state.error}")
                     break
                 
-                # Small delay to allow for interrupt
+                # Small delay for interrupt handling
                 await asyncio.sleep(0.01)
                 
         except asyncio.CancelledError:
-            print("\n⏹️ Agent interrupted")
+            print(f"\n{_c('Interrupted', Colors.YELLOW)}")
+            self._interrupted = True
     
-    def pause(self) -> None:
-        """Pause the agent."""
-        self.paused = True
-        print("⏸️ Pausing agent...")
+    def interrupt(self) -> None:
+        """Interrupt the running agent."""
+        self._interrupted = True
+        print(f"\n{_c('Interrupting...', Colors.YELLOW)} (state preserved)")
     
-    def resume(self) -> None:
-        """Resume the agent."""
-        if self.agent and self.agent.get_state():
-            state = self.agent.get_state()
-            if state.status == RunStatus.WAITING:
-                print("▶️ Resuming agent...")
-                self.agent.resume()
-            else:
-                self.paused = False
-                print("▶️ Continuing agent...")
+    async def resume_agent(self) -> None:
+        """Resume a paused agent."""
+        if not self.agent:
+            print("No agent to resume. Start a new task.")
+            return
+        
+        state = self.agent.get_state()
+        if not state:
+            print("No active run.")
+            return
+        
+        if state.status == RunStatus.WAITING:
+            handled = await self.handle_waiting_state()
+            if handled:
+                # Continue running after handling
+                await self._continue_running()
+        elif state.status == RunStatus.RUNNING:
+            self._interrupted = False
+            await self._continue_running()
+        else:
+            print(f"Agent is {state.status.value}, cannot resume.")
+    
+    async def _continue_running(self) -> None:
+        """Continue running the agent after resume."""
+        try:
+            while not self._interrupted:
+                state = self.agent.step()
+                
+                if state.status == RunStatus.COMPLETED:
+                    print(f"\n{_c('═' * 60, Colors.GREEN)}")
+                    print(f"{_c('Completed', Colors.GREEN, Colors.BOLD)} in {state.output.get('iterations', '?')} steps")
+                    print(f"{_c('═' * 60, Colors.GREEN)}")
+                    break
+                elif state.status == RunStatus.WAITING:
+                    handled = await self.handle_waiting_state()
+                    if not handled:
+                        print(f"\n{_c('Agent paused.', Colors.YELLOW)} Type 'resume' to continue.")
+                        break
+                    continue
+                elif state.status == RunStatus.FAILED:
+                    print(f"\n{_c('Failed:', Colors.YELLOW)} {state.error}")
+                    break
+                
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            self._interrupted = True
     
     def show_status(self) -> None:
         """Show current agent status."""
@@ -157,18 +229,19 @@ class AgentREPL:
             print("No active run")
             return
         
-        print(f"\nAgent Status:")
-        print(f"  Run ID: {self.agent.run_id}")
-        print(f"  Status: {state.status.value}")
-        print(f"  Current Node: {state.current_node}")
+        print(f"\n{_c('Agent Status', Colors.CYAN, Colors.BOLD)}")
+        print(_c("─" * 40, Colors.DIM))
+        print(f"  Run ID:    {state.run_id[:16]}...")
+        print(f"  Status:    {_c(state.status.value, Colors.GREEN if state.status == RunStatus.COMPLETED else Colors.YELLOW)}")
+        print(f"  Node:      {state.current_node}")
         print(f"  Iteration: {state.vars.get('iteration', 0)}")
         
-        if state.status == RunStatus.WAITING:
-            print(f"  Waiting for: {state.waiting.wait_key}")
+        if state.status == RunStatus.WAITING and state.waiting:
+            print(f"\n  {_c('Waiting for:', Colors.MAGENTA)} {state.waiting.reason.value}")
+            if state.waiting.prompt:
+                print(f"  {_c('Question:', Colors.MAGENTA)} {state.waiting.prompt[:50]}...")
         
-        history = state.vars.get('history', [])
-        if history:
-            print(f"  History entries: {len(history)}")
+        print(_c("─" * 40, Colors.DIM))
     
     def show_history(self) -> None:
         """Show agent conversation history."""
@@ -181,59 +254,86 @@ class AgentREPL:
             print("No active run")
             return
         
-        history = state.vars.get('history', [])
+        history = state.vars.get('messages', [])
         if not history:
             print("No history yet")
             return
         
-        print("\nConversation History:")
-        print("-" * 40)
+        print(f"\n{_c('Conversation History', Colors.CYAN, Colors.BOLD)}")
+        print(_c("─" * 60, Colors.DIM))
+        
         for i, entry in enumerate(history):
             role = entry.get('role', 'unknown')
-            content = entry.get('content', '')[:200]
-            print(f"[{i+1}] {role}: {content}")
-            if len(entry.get('content', '')) > 200:
-                print("    ...")
-        print("-" * 40)
+            content = entry.get('content', '')
+            
+            if role == "assistant":
+                role_color = Colors.GREEN
+            elif role == "tool":
+                role_color = Colors.BLUE
+            elif role == "user":
+                role_color = Colors.MAGENTA
+            else:
+                role_color = Colors.DIM
+            
+            # Truncate long content
+            if len(content) > 100:
+                content = content[:97] + "..."
+            
+            print(f"[{i+1}] {_c(role, role_color, Colors.BOLD)}: {content}")
+        
+        print(_c("─" * 60, Colors.DIM))
     
     def show_help(self) -> None:
         """Show help message."""
-        print("""
-ReAct Agent REPL Commands:
-  <task>     - Start agent with a task (e.g., "list files in current directory")
-  pause      - Pause the running agent
-  resume     - Resume a paused agent
-  status     - Show current agent status
-  history    - Show conversation history
-  tools      - List available tools
-  help       - Show this help message
-  quit/exit  - Exit the REPL
+        print(f"""
+{_c('ReAct Agent REPL', Colors.CYAN, Colors.BOLD)}
+{_c('─' * 40, Colors.DIM)}
 
-Examples:
+{_c('Commands:', Colors.BOLD)}
+  <task>      Start agent with a task
+  resume      Resume a paused/interrupted agent
+  status      Show current agent status
+  history     Show conversation history
+  tools       List available tools
+  help        Show this help
+  quit        Exit
+
+{_c('During execution:', Colors.BOLD)}
+  Ctrl+C      Interrupt (preserves state)
+
+{_c('Examples:', Colors.DIM)}
   > list the python files in this directory
   > what is in the README.md file?
-  > search for all markdown files
+  > search for TODO comments in the code
 """)
     
     def show_tools(self) -> None:
         """Show available tools."""
-        print("\nAvailable Tools:")
+        print(f"\n{_c('Available Tools', Colors.CYAN, Colors.BOLD)}")
+        print(_c("─" * 50, Colors.DIM))
+        
         for tool in self.tool_registry.list_tools():
             params = ", ".join(f"{k}" for k in tool.parameters.keys())
-            print(f"  {tool.name}({params})")
-            print(f"    {tool.description}")
-        print()
+            print(f"  {_c(tool.name, Colors.GREEN)}({params})")
+            print(f"    {_c(tool.description, Colors.DIM)}")
+        
+        # Show built-in ask_user
+        print(f"  {_c('ask_user', Colors.MAGENTA)}(question, choices?)")
+        print(f"    {_c('Ask the user a question', Colors.DIM)}")
+        
+        print(_c("─" * 50, Colors.DIM))
     
     async def repl_loop(self) -> None:
         """Main REPL loop."""
+        # Header
         print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║                    ReAct Agent REPL                          ║
-║                                                              ║
-║  Provider: {self.provider:<20} Model: {self.model:<15}  ║
-║                                                              ║
-║  Type 'help' for commands, or enter a task to start.        ║
-╚══════════════════════════════════════════════════════════════╝
+{_c('╔' + '═' * 58 + '╗', Colors.CYAN)}
+{_c('║', Colors.CYAN)}  {_c('ReAct Agent REPL', Colors.BOLD)}                                   {_c('║', Colors.CYAN)}
+{_c('║', Colors.CYAN)}                                                          {_c('║', Colors.CYAN)}
+{_c('║', Colors.CYAN)}  Provider: {self.provider:<15} Model: {self.model:<17} {_c('║', Colors.CYAN)}
+{_c('║', Colors.CYAN)}                                                          {_c('║', Colors.CYAN)}
+{_c('║', Colors.CYAN)}  Type {_c("'help'", Colors.GREEN)} for commands, or enter a task.          {_c('║', Colors.CYAN)}
+{_c('╚' + '═' * 58 + '╝', Colors.CYAN)}
 """)
         
         self.show_tools()
@@ -244,8 +344,9 @@ Examples:
             try:
                 # Get input
                 if sys.stdin.isatty():
+                    prompt = f"\n{_c('>', Colors.CYAN, Colors.BOLD)} "
                     user_input = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: input("\n> ").strip()
+                        None, lambda: input(prompt).strip()
                     )
                 else:
                     line = sys.stdin.readline()
@@ -266,7 +367,7 @@ Examples:
                             await agent_task
                         except asyncio.CancelledError:
                             pass
-                    print("Goodbye!")
+                    print(_c("Goodbye!", Colors.CYAN))
                     break
                 
                 elif cmd == 'help':
@@ -281,43 +382,51 @@ Examples:
                 elif cmd == 'history':
                     self.show_history()
                 
-                elif cmd == 'pause':
-                    self.pause()
-                
                 elif cmd == 'resume':
-                    self.resume()
+                    await self.resume_agent()
                 
                 else:
                     # Treat as a task
                     if agent_task and not agent_task.done():
-                        print("Agent is already running. Use 'pause' or wait for completion.")
+                        print(_c("Agent is running. Use Ctrl+C to interrupt.", Colors.YELLOW))
                         continue
                     
                     agent_task = asyncio.create_task(self.run_agent_async(user_input))
-                    await agent_task
+                    try:
+                        await agent_task
+                    except asyncio.CancelledError:
+                        pass
                     
             except KeyboardInterrupt:
-                print("\n\nInterrupted. Type 'quit' to exit.")
+                print()
                 if agent_task and not agent_task.done():
+                    self.interrupt()
                     agent_task.cancel()
                     try:
                         await agent_task
                     except asyncio.CancelledError:
                         pass
+                else:
+                    print(_c("Type 'quit' to exit.", Colors.DIM))
             except EOFError:
                 break
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"{_c('Error:', Colors.YELLOW)} {e}")
 
 
 def main():
     """Entry point for the REPL."""
     parser = argparse.ArgumentParser(description="ReAct Agent REPL")
     parser.add_argument("--provider", default="ollama", help="LLM provider")
-    parser.add_argument("--model", default="gemma3:1b-it-q4_K_M", help="Model name")
+    parser.add_argument("--model", default="qwen3:1.7b-q4_K_M", help="Model name")
+    parser.add_argument("--state-file", help="File to persist agent state")
     args = parser.parse_args()
     
-    repl = AgentREPL(provider=args.provider, model=args.model)
+    repl = AgentREPL(
+        provider=args.provider,
+        model=args.model,
+        state_file=args.state_file,
+    )
     asyncio.run(repl.repl_loop())
 
 

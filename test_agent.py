@@ -13,6 +13,7 @@ from abstractruntime.integrations.abstractcore import create_local_runtime
 
 from abstractagent.agents.react import ReactAgent
 from abstractagent.tools import ALL_TOOLS
+from abstractagent.ui.question import get_user_response
 
 
 def on_step(step: str, data: dict) -> None:
@@ -22,11 +23,17 @@ def on_step(step: str, data: dict) -> None:
     elif step == "reason":
         print(f"🤔 Reasoning (iteration {data.get('iteration', '?')})...")
     elif step == "parse":
-        print(f"📋 Action: {data.get('action_type', 'unknown')}")
+        has_tools = data.get('has_tool_calls', False)
+        if has_tools:
+            print(f"📋 Decided to use tools")
     elif step == "act":
         print(f"🔧 Tool: {data.get('tool', '')}({data.get('args', {})})")
     elif step == "observe":
         print(f"👁️ Result: {data.get('result', '')[:80]}...")
+    elif step == "ask_user":
+        print(f"❓ Agent has a question...")
+    elif step == "user_response":
+        print(f"💬 You answered: {data.get('response', '')[:50]}")
     elif step == "done":
         print(f"✅ ANSWER: {data.get('answer', '')}")
 
@@ -39,7 +46,7 @@ def main():
     
     runtime = create_local_runtime(
         provider="ollama",
-        model="qwen3:1.7b-q4_K_M",
+        model="qwen3:4b-instruct-2507-q4_K_M",
     )
     
     agent = ReactAgent(
@@ -55,13 +62,36 @@ def main():
     print(f"{'='*60}\n")
     
     agent.start(task)
-    state = agent.run_to_completion()
     
-    print(f"\n{'='*60}")
-    print(f"Final Status: {state.status.value}")
-    print(f"Iterations: {state.output.get('iterations', '?')}")
-    print(f"Answer: {state.output.get('answer', 'N/A')}")
-    print(f"{'='*60}\n")
+    # Run with question handling
+    while True:
+        state = agent.step()
+        
+        if state.status == RunStatus.COMPLETED:
+            print(f"\n{'='*60}")
+            print(f"Final Status: {state.status.value}")
+            print(f"Iterations: {state.output.get('iterations', '?')}")
+            print(f"Answer: {state.output.get('answer', 'N/A')}")
+            print(f"{'='*60}\n")
+            break
+        
+        elif state.status == RunStatus.WAITING:
+            # Handle question
+            question = agent.get_pending_question()
+            if question:
+                response = get_user_response(
+                    prompt=question.get("prompt", "Please respond:"),
+                    choices=question.get("choices"),
+                    allow_free_text=question.get("allow_free_text", True),
+                )
+                agent.resume(response)
+            else:
+                print("Agent is waiting but no question found")
+                break
+        
+        elif state.status == RunStatus.FAILED:
+            print(f"Failed: {state.error}")
+            break
 
 
 if __name__ == "__main__":

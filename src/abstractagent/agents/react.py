@@ -6,6 +6,10 @@ The agent uses AbstractCore's tool handling:
 - Tools are passed to LLM via AbstractCore's generate(tools=...)
 - AbstractCore handles prompt formatting for the model
 - AbstractCore parses tool calls from responses
+
+Special tool: ask_user
+- Agent can ask the user questions with optional choices
+- Triggers ASK_USER effect for durable pause/resume
 """
 
 from typing import Any, Dict, List, Optional, Callable
@@ -19,10 +23,28 @@ from abstractruntime import (
     EffectType,
     WorkflowSpec,
 )
-from abstractcore.tools import ToolRegistry, ToolCall
+from abstractcore.tools import ToolRegistry, ToolCall, ToolDefinition
 
 
 MAX_ITERATIONS = 10
+
+# Built-in ask_user tool definition
+ASK_USER_TOOL = ToolDefinition(
+    name="ask_user",
+    description="Ask the user a question when you need clarification or input. Use this when the task is ambiguous or you need the user to make a choice.",
+    parameters={
+        "question": {
+            "type": "string",
+            "description": "The question to ask the user (required)",
+        },
+        "choices": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional list of choices for the user to pick from",
+        },
+    },
+    when_to_use="When the task is ambiguous or you need user input to proceed",
+)
 
 
 def create_react_workflow(
@@ -39,7 +61,8 @@ def create_react_workflow(
         WorkflowSpec for the ReAct agent
     """
     
-    tools = tool_registry.list_tools()
+    # Include ask_user tool alongside registered tools
+    tools = tool_registry.list_tools() + [ASK_USER_TOOL]
     
     def emit(step: str, data: Dict[str, Any]) -> None:
         if on_step:
@@ -137,6 +160,31 @@ def create_react_workflow(
             
             emit("act", {"tool": name, "args": args})
             
+            # Special handling for ask_user - triggers ASK_USER effect
+            if name == "ask_user":
+                question = args.get("question", "Please provide input:")
+                choices = args.get("choices", [])
+                
+                # Store remaining tool calls for after resume
+                remaining = tool_calls[tool_calls.index(tc) + 1:] if isinstance(tool_calls, list) else []
+                run.vars["pending_tool_calls"] = remaining
+                
+                emit("ask_user", {"question": question, "choices": choices})
+                
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.ASK_USER,
+                        payload={
+                            "prompt": question,
+                            "choices": choices if choices else None,
+                            "allow_free_text": True,
+                        },
+                        result_key="user_response",
+                    ),
+                    next_node="handle_user_response",
+                )
+            
             # Execute via registry
             tool_call = ToolCall(name=name, arguments=args, call_id=call_id)
             result = tool_registry.execute_tool(tool_call)
@@ -160,6 +208,26 @@ def create_react_workflow(
         # Clear pending and continue reasoning
         run.vars["pending_tool_calls"] = []
         return StepPlan(node_id="act", next_node="reason")
+    
+    def handle_user_response_node(run: RunState, ctx) -> StepPlan:
+        """Handle user response after ask_user."""
+        user_response = run.vars.get("user_response", {})
+        response_text = user_response.get("response", "")
+        
+        emit("user_response", {"response": response_text})
+        
+        # Add user response to messages
+        messages = run.vars.get("messages", [])
+        messages.append({
+            "role": "user",
+            "content": f"[User response]: {response_text}"
+        })
+        run.vars["messages"] = messages
+        
+        # Continue with any remaining tool calls or back to reasoning
+        if run.vars.get("pending_tool_calls"):
+            return StepPlan(node_id="handle_user_response", next_node="act")
+        return StepPlan(node_id="handle_user_response", next_node="reason")
     
     def done_node(run: RunState, ctx) -> StepPlan:
         """Complete with final answer."""
@@ -200,6 +268,7 @@ def create_react_workflow(
             "reason": reason_node,
             "parse": parse_node,
             "act": act_node,
+            "handle_user_response": handle_user_response_node,
             "done": done_node,
             "max_iterations": max_iterations_node,
         },
@@ -255,6 +324,65 @@ class ReactAgent:
         if not self._current_run_id:
             return None
         return self.runtime.get_state(self._current_run_id)
+    
+    def is_waiting(self) -> bool:
+        """Check if agent is waiting for user input."""
+        state = self.get_state()
+        return state is not None and state.status == RunStatus.WAITING
+    
+    def get_pending_question(self) -> Optional[Dict[str, Any]]:
+        """Get pending question if agent is waiting for user input.
+        
+        Returns dict with: prompt, choices (optional), allow_free_text
+        """
+        state = self.get_state()
+        if not state or state.status != RunStatus.WAITING or not state.waiting:
+            return None
+        
+        return {
+            "prompt": state.waiting.prompt,
+            "choices": state.waiting.choices,
+            "allow_free_text": state.waiting.allow_free_text,
+            "wait_key": state.waiting.wait_key,
+        }
+    
+    def resume(self, response: str) -> RunState:
+        """Resume agent with user response.
+        
+        Args:
+            response: User's answer to the pending question
+            
+        Returns:
+            Updated RunState after resuming
+        """
+        if not self._current_run_id:
+            raise RuntimeError("No active run.")
+        
+        state = self.get_state()
+        if not state or state.status != RunStatus.WAITING:
+            raise RuntimeError("Agent is not waiting for input.")
+        
+        wait_key = state.waiting.wait_key if state.waiting else None
+        
+        return self.runtime.resume(
+            workflow=self.workflow,
+            run_id=self._current_run_id,
+            wait_key=wait_key,
+            payload={"response": response},
+        )
+    
+    def attach(self, run_id: str) -> RunState:
+        """Attach to an existing run for resume.
+        
+        Args:
+            run_id: ID of the run to attach to
+            
+        Returns:
+            Current RunState
+        """
+        state = self.runtime.get_state(run_id)
+        self._current_run_id = run_id
+        return state
     
     @property
     def run_id(self) -> Optional[str]:
