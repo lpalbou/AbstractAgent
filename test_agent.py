@@ -3,12 +3,7 @@
 import sys
 sys.path.insert(0, "src")
 
-from abstractcore.tools import ToolRegistry
-from abstractruntime import (
-    RunStatus,
-    InMemoryRunStore,
-    InMemoryLedgerStore,
-)
+from abstractruntime import RunStatus
 from abstractruntime.integrations.abstractcore import create_local_runtime
 
 from abstractagent.agents.react import ReactAgent
@@ -19,31 +14,26 @@ from abstractagent.ui.question import get_user_response
 def on_step(step: str, data: dict) -> None:
     """Print step information."""
     if step == "init":
-        print(f"🚀 Starting: {data.get('task', '')[:50]}")
+        print(f"Starting: {data.get('task', '')[:50]}")
     elif step == "reason":
-        print(f"🤔 Reasoning (iteration {data.get('iteration', '?')})...")
+        print(f"Reasoning (iteration {data.get('iteration', '?')})...")
     elif step == "parse":
         has_tools = data.get('has_tool_calls', False)
         if has_tools:
-            print(f"📋 Decided to use tools")
+            print("Decided to use tools")
     elif step == "act":
-        print(f"🔧 Tool: {data.get('tool', '')}({data.get('args', {})})")
+        print(f"Tool: {data.get('tool', '')}({data.get('args', {})})")
     elif step == "observe":
-        print(f"👁️ Result: {data.get('result', '')[:80]}...")
+        print(f"Result: {data.get('result', '')[:80]}...")
     elif step == "ask_user":
-        print(f"❓ Agent has a question...")
+        print("Agent has a question...")
     elif step == "user_response":
-        print(f"💬 You answered: {data.get('response', '')[:50]}")
+        print(f"You answered: {data.get('response', '')[:50]}")
     elif step == "done":
-        print(f"✅ ANSWER: {data.get('answer', '')}")
+        print(f"ANSWER: {data.get('answer', '')}")
 
 
 def main():
-    # Setup
-    tool_registry = ToolRegistry()
-    for tool in ALL_TOOLS:
-        tool_registry.register(tool)
-    
     runtime = create_local_runtime(
         provider="ollama",
         model="qwen3:4b-instruct-2507-q4_K_M",
@@ -51,7 +41,7 @@ def main():
     
     agent = ReactAgent(
         runtime=runtime,
-        tool_registry=tool_registry,
+        tools=ALL_TOOLS,
         on_step=on_step,
     )
     

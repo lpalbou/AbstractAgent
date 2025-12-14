@@ -52,6 +52,7 @@ class AgentREPL:
             model=model,
             run_store=self.run_store,
             ledger_store=self.ledger_store,
+            tool_registry=self.tool_registry,  # Cleaner API
             effect_policy=RetryPolicy(llm_max_attempts=2),
         )
     

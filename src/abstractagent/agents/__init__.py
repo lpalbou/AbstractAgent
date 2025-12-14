@@ -1,5 +1,6 @@
 """AbstractAgent agents."""
 
-from .react import ReactAgent, create_react_workflow
+from .base import BaseAgent
+from .react import ReactAgent, create_react_workflow, create_react_agent
 
-__all__ = ["ReactAgent", "create_react_workflow"]
+__all__ = ["BaseAgent", "ReactAgent", "create_react_workflow", "create_react_agent"]

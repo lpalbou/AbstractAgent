@@ -12,7 +12,7 @@ Special tool: ask_user
 - Triggers ASK_USER effect for durable pause/resume
 """
 
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Union
 
 from abstractruntime import (
     Runtime,
@@ -23,7 +23,9 @@ from abstractruntime import (
     EffectType,
     WorkflowSpec,
 )
-from abstractcore.tools import ToolRegistry, ToolCall, ToolDefinition
+from abstractcore.tools import ToolCall, ToolDefinition
+
+from .base import BaseAgent
 
 
 MAX_ITERATIONS = 10
@@ -48,21 +50,30 @@ ASK_USER_TOOL = ToolDefinition(
 
 
 def create_react_workflow(
-    tool_registry: ToolRegistry,
+    tools: List[Callable],
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> WorkflowSpec:
     """Create a ReAct agent workflow using AbstractCore's tool handling.
     
     Args:
-        tool_registry: Registry containing available tools
+        tools: List of tool functions decorated with @tool
         on_step: Optional callback for step visibility (step_name, data)
     
     Returns:
         WorkflowSpec for the ReAct agent
     """
     
-    # Include ask_user tool alongside registered tools
-    tools = tool_registry.list_tools() + [ASK_USER_TOOL]
+    # Convert tool functions to ToolDefinitions for LLM prompt
+    tool_defs = []
+    for t in tools:
+        if hasattr(t, '_tool_definition'):
+            tool_defs.append(t._tool_definition)
+        else:
+            # Fallback: create definition from function
+            tool_defs.append(ToolDefinition.from_function(t))
+    
+    # Include ask_user tool
+    tool_defs.append(ASK_USER_TOOL)
     
     def emit(step: str, data: Dict[str, Any]) -> None:
         if on_step:
@@ -87,6 +98,14 @@ def create_react_workflow(
         task = run.vars.get("task", "")
         messages = run.vars.get("messages", [])
         
+        # Check for injected messages (async guidance from user)
+        inbox = run.vars.get("_inbox", [])
+        inbox_text = ""
+        if inbox:
+            inbox_messages = [m.get("content", "") for m in inbox]
+            inbox_text = "\n\n[User guidance]: " + " | ".join(inbox_messages)
+            run.vars["_inbox"] = []  # Clear inbox after reading
+        
         # Build messages for the LLM
         if not messages:
             # First turn - just the task
@@ -98,10 +117,14 @@ def create_react_workflow(
             ])
             prompt = f"Task: {task}\n\nHistory:\n{history_text}\n\nContinue working on the task. Use tools or provide final answer."
         
-        emit("reason", {"iteration": iteration + 1})
+        # Append any injected guidance
+        if inbox_text:
+            prompt += inbox_text
+        
+        emit("reason", {"iteration": iteration + 1, "has_guidance": bool(inbox_text)})
         
         # Convert tools to format AbstractCore expects
-        tool_defs = [t.to_dict() for t in tools]
+        tool_dicts = [t.to_dict() for t in tool_defs]
         
         return StepPlan(
             node_id="reason",
@@ -109,7 +132,7 @@ def create_react_workflow(
                 type=EffectType.LLM_CALL,
                 payload={
                     "prompt": prompt,
-                    "tools": tool_defs,  # AbstractCore handles tool formatting
+                    "tools": tool_dicts,  # AbstractCore handles tool formatting
                 },
                 result_key="llm_response",
             ),
@@ -142,32 +165,33 @@ def create_react_workflow(
             return StepPlan(node_id="parse", next_node="done")
     
     def act_node(run: RunState, ctx) -> StepPlan:
-        """Execute pending tool calls."""
-        tool_calls = run.vars.get("pending_tool_calls", [])
-        messages = run.vars.get("messages", [])
+        """Execute pending tool calls via TOOL_CALLS effect.
         
-        results = []
-        for tc in tool_calls:
-            # Handle both dict and ToolCall formats
+        This uses the runtime's effect system so tool calls are:
+        - Recorded in the ledger
+        - Subject to retry/idempotency policies
+        - Consistent with the effect-based architecture
+        """
+        tool_calls = run.vars.get("pending_tool_calls", [])
+        
+        if not tool_calls:
+            return StepPlan(node_id="act", next_node="reason")
+        
+        # Check for ask_user - handle specially with ASK_USER effect
+        for i, tc in enumerate(tool_calls):
             if isinstance(tc, dict):
                 name = tc.get("name", "")
                 args = tc.get("arguments", {})
-                call_id = tc.get("call_id", "1")
             else:
                 name = tc.name
                 args = tc.arguments
-                call_id = tc.call_id or "1"
             
-            emit("act", {"tool": name, "args": args})
-            
-            # Special handling for ask_user - triggers ASK_USER effect
             if name == "ask_user":
                 question = args.get("question", "Please provide input:")
                 choices = args.get("choices", [])
                 
                 # Store remaining tool calls for after resume
-                remaining = tool_calls[tool_calls.index(tc) + 1:] if isinstance(tool_calls, list) else []
-                run.vars["pending_tool_calls"] = remaining
+                run.vars["pending_tool_calls"] = tool_calls[i + 1:]
                 
                 emit("ask_user", {"question": question, "choices": choices})
                 
@@ -184,30 +208,65 @@ def create_react_workflow(
                     ),
                     next_node="handle_user_response",
                 )
-            
-            # Execute via registry
-            tool_call = ToolCall(name=name, arguments=args, call_id=call_id)
-            result = tool_registry.execute_tool(tool_call)
-            
-            if result.success:
-                output = str(result.output)
-            else:
-                output = f"Error: {result.error}"
-            
-            results.append({"tool": name, "result": output})
-            emit("observe", {"tool": name, "result": output[:150]})
         
-        # Add tool results to messages
+        # Emit act events for visibility
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {})})
+            else:
+                emit("act", {"tool": tc.name, "args": tc.arguments})
+        
+        # Use TOOL_CALLS effect for ledger recording
+        # Format tool calls for the effect
+        formatted_calls = []
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                formatted_calls.append({
+                    "name": tc.get("name", ""),
+                    "arguments": tc.get("arguments", {}),
+                    "call_id": tc.get("call_id", "1"),
+                })
+            else:
+                formatted_calls.append({
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                    "call_id": tc.call_id or "1",
+                })
+        
+        return StepPlan(
+            node_id="act",
+            effect=Effect(
+                type=EffectType.TOOL_CALLS,
+                payload={"tool_calls": formatted_calls},
+                result_key="tool_results",
+            ),
+            next_node="observe",
+        )
+    
+    def observe_node(run: RunState, ctx) -> StepPlan:
+        """Process tool results and add to conversation history."""
+        tool_results = run.vars.get("tool_results", {})
+        results = tool_results.get("results", [])
+        messages = run.vars.get("messages", [])
+        
         for r in results:
+            name = r.get("name", "tool")
+            if r.get("success"):
+                output = r.get("output", "")
+            else:
+                output = f"Error: {r.get('error', 'unknown error')}"
+            
+            emit("observe", {"tool": name, "result": str(output)[:150]})
+            
             messages.append({
                 "role": "tool",
-                "content": f"[{r['tool']}]: {r['result']}"
+                "content": f"[{name}]: {output}"
             })
-        run.vars["messages"] = messages
         
-        # Clear pending and continue reasoning
+        run.vars["messages"] = messages
         run.vars["pending_tool_calls"] = []
-        return StepPlan(node_id="act", next_node="reason")
+        
+        return StepPlan(node_id="observe", next_node="reason")
     
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
         """Handle user response after ask_user."""
@@ -268,6 +327,7 @@ def create_react_workflow(
             "reason": reason_node,
             "parse": parse_node,
             "act": act_node,
+            "observe": observe_node,
             "handle_user_response": handle_user_response_node,
             "done": done_node,
             "max_iterations": max_iterations_node,
@@ -275,26 +335,29 @@ def create_react_workflow(
     )
 
 
-class ReactAgent:
-    """ReAct agent with pause/resume capability."""
+class ReactAgent(BaseAgent):
+    """ReAct agent with pause/resume capability.
     
-    def __init__(
-        self,
-        runtime: Runtime,
-        tool_registry: ToolRegistry,
-        on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    ):
-        self.runtime = runtime
-        self.tool_registry = tool_registry
-        self.on_step = on_step
-        self.workflow = create_react_workflow(tool_registry, on_step)
-        self._current_run_id: Optional[str] = None
+    Inherits common functionality from BaseAgent:
+    - run_to_completion(), get_state(), is_waiting(), is_running(), is_complete()
+    - get_pending_question(), resume(), attach()
+    - save_state(), load_state(), clear_state()
+    - cancel(), get_ledger(), inject_message()
+    - get_output(), get_error()
+    """
+    
+    def _create_workflow(self) -> WorkflowSpec:
+        """Create the ReAct workflow."""
+        return create_react_workflow(self.tools, self.on_step)
     
     def start(self, task: str) -> str:
         """Start a new agent run with a task."""
         self._current_run_id = self.runtime.start(
             workflow=self.workflow,
-            vars={"task": task},
+            vars={
+                "task": task,
+                "_tools": self.tools,  # Tools stored in vars for effect handler
+            },
         )
         return self._current_run_id
     
@@ -307,83 +370,47 @@ class ReactAgent:
             workflow=self.workflow,
             run_id=self._current_run_id,
         )
+
+
+def create_react_agent(
+    provider: str = "ollama",
+    model: str = "qwen3:4b-instruct-2507-q4_K_M",
+    tools: Optional[List[Callable]] = None,
+    on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> ReactAgent:
+    """Create a ReAct agent with minimal configuration.
     
-    def run_to_completion(self) -> RunState:
-        """Run the agent until completion or waiting."""
-        if not self._current_run_id:
-            raise RuntimeError("No active run. Call start() first.")
+    Args:
+        provider: LLM provider (default: "ollama")
+        model: Model name (default: "qwen3:4b-instruct-2507-q4_K_M")
+        tools: List of tool functions decorated with @tool (default: ALL_TOOLS)
+        on_step: Optional callback for step visibility
         
-        state = self.step()
-        while state.status == RunStatus.RUNNING:
-            state = self.step()
+    Returns:
+        Configured ReactAgent ready to use
         
-        return state
+    Example:
+        agent = create_react_agent()
+        agent.start("List files in current directory")
+        state = agent.run_to_completion()
+        print(state.output["answer"])
+    """
+    from abstractruntime.integrations.abstractcore import create_local_runtime
+    from ..tools import ALL_TOOLS
     
-    def get_state(self) -> Optional[RunState]:
-        """Get current agent state."""
-        if not self._current_run_id:
-            return None
-        return self.runtime.get_state(self._current_run_id)
+    # Use default tools if none provided
+    if tools is None:
+        tools = list(ALL_TOOLS)
     
-    def is_waiting(self) -> bool:
-        """Check if agent is waiting for user input."""
-        state = self.get_state()
-        return state is not None and state.status == RunStatus.WAITING
+    # Create runtime (tools passed via workflow vars, no registry needed)
+    runtime = create_local_runtime(
+        provider=provider,
+        model=model,
+    )
     
-    def get_pending_question(self) -> Optional[Dict[str, Any]]:
-        """Get pending question if agent is waiting for user input.
-        
-        Returns dict with: prompt, choices (optional), allow_free_text
-        """
-        state = self.get_state()
-        if not state or state.status != RunStatus.WAITING or not state.waiting:
-            return None
-        
-        return {
-            "prompt": state.waiting.prompt,
-            "choices": state.waiting.choices,
-            "allow_free_text": state.waiting.allow_free_text,
-            "wait_key": state.waiting.wait_key,
-        }
-    
-    def resume(self, response: str) -> RunState:
-        """Resume agent with user response.
-        
-        Args:
-            response: User's answer to the pending question
-            
-        Returns:
-            Updated RunState after resuming
-        """
-        if not self._current_run_id:
-            raise RuntimeError("No active run.")
-        
-        state = self.get_state()
-        if not state or state.status != RunStatus.WAITING:
-            raise RuntimeError("Agent is not waiting for input.")
-        
-        wait_key = state.waiting.wait_key if state.waiting else None
-        
-        return self.runtime.resume(
-            workflow=self.workflow,
-            run_id=self._current_run_id,
-            wait_key=wait_key,
-            payload={"response": response},
-        )
-    
-    def attach(self, run_id: str) -> RunState:
-        """Attach to an existing run for resume.
-        
-        Args:
-            run_id: ID of the run to attach to
-            
-        Returns:
-            Current RunState
-        """
-        state = self.runtime.get_state(run_id)
-        self._current_run_id = run_id
-        return state
-    
-    @property
-    def run_id(self) -> Optional[str]:
-        return self._current_run_id
+    # Create and return agent with tools
+    return ReactAgent(
+        runtime=runtime,
+        tools=tools,
+        on_step=on_step,
+    )
