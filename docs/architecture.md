@@ -173,7 +173,7 @@ agent.is_waiting()          # Check if waiting for input
 agent.get_pending_question() # Get question details
 agent.resume(response)      # Resume with user response
 agent.attach(run_id)        # Attach to existing run
-agent.save_state(filepath)  # Persist a run reference (run_id/workflow_id/actor_id)
+agent.save_state(filepath)  # Persist a run reference (run_id/workflow_id/actor_id/session_id)
 agent.load_state(filepath)  # Attach to a persisted run reference
 ```
 
@@ -189,7 +189,7 @@ agent.cancel(reason="User cancelled")
 
 **Current state: Implemented (inbox pattern)**
 
-`BaseAgent.inject_message()` appends guidance into `run.vars["_inbox"]`. The ReAct workflow reads and clears the inbox at the start of each reasoning step.
+`BaseAgent.inject_message()` appends guidance into `run.vars["_runtime"]["inbox"]`. The ReAct workflow reads and clears the inbox at the start of each reasoning step.
 
 ### What exists:
 - `WAIT_EVENT` effect - pause until external signal
@@ -203,10 +203,10 @@ agent.cancel(reason="User cancelled")
 
 ### Potential solutions:
 
-1. **Polling-based**: Agent checks `run.vars["_inbox"]` each iteration
+1. **Polling-based**: Agent checks `run.vars["_runtime"]["inbox"]` each iteration
    ```python
    def reason_node(run, ctx):
-       inbox = run.vars.get("_inbox", [])
+       inbox = (run.vars.get("_runtime") or {}).get("inbox", [])
        if inbox:
            # Incorporate messages into prompt
            ...
@@ -293,7 +293,7 @@ for entry in ledger:
 agent.inject_message("Consider using grep instead of reading the whole file")
 ```
 
-The `inject_message()` method stores messages in `run.vars["_inbox"]`. The agent reads and clears the inbox at the start of each reasoning step, incorporating the guidance into the LLM prompt.
+The `inject_message()` method stores messages in `run.vars["_runtime"]["inbox"]`. The agent reads and clears the inbox at the start of each reasoning step, incorporating the guidance into the LLM prompt.
 
 ## Multi-Agent Patterns
 
@@ -508,7 +508,7 @@ class CodeActAgent(BaseAgent):
 │  └─────────────────────────────────────────────────────────────────────┘    │
 │                                                                              │
 │  run.vars["_runtime"] = {"tool_specs": [...], "toolset_id": "ts_..."}       │
-│  run.vars["_inbox"] = [{"content": "Focus on .py files"}]  ←── messages     │
+│  run.vars["_runtime"]["inbox"] = [{"content": "Focus on .py files"}]  ←── messages │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
@@ -573,4 +573,4 @@ class CodeActAgent(BaseAgent):
 
 4. **AbstractFlow (future) handles orchestration** - Runtime handles execution, Flow handles coordination
 
-5. **Async messages via inbox** - `inject_message()` stores in `_inbox`, read at next reasoning step
+5. **Async messages via inbox** - `inject_message()` stores in `_runtime.inbox`, read at next reasoning step

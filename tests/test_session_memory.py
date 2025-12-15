@@ -22,8 +22,9 @@ def test_react_agent_seeds_messages_from_session():
 
     assert state.status == RunStatus.RUNNING
     assert state.current_node == "reason"
-    assert isinstance(state.vars.get("messages"), list)
-    last = state.vars["messages"][-1]
+    assert isinstance(state.vars.get("context"), dict)
+    assert isinstance(state.vars["context"].get("messages"), list)
+    last = state.vars["context"]["messages"][-1]
     assert last["role"] == "user"
     assert last["content"] == "I meant abstractcode/"
     assert isinstance(last.get("timestamp"), str)

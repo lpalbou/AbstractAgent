@@ -25,12 +25,15 @@ from abstractruntime import (
     EffectType,
     WorkflowSpec,
 )
+from abstractruntime.core.vars import ensure_namespaces
 from abstractcore.tools import ToolCall, ToolDefinition
 
 from .base import BaseAgent
 
 
-MAX_ITERATIONS = 10
+DEFAULT_MAX_ITERATIONS = 20
+# Legacy alias (kept for compatibility with older code/docs).
+MAX_ITERATIONS = DEFAULT_MAX_ITERATIONS
 
 # Built-in ask_user tool definition
 ASK_USER_TOOL = ToolDefinition(
@@ -82,6 +85,60 @@ def _compute_toolset_id(tool_specs: List[Dict[str, Any]]) -> str:
     return f"ts_{digest}"
 
 
+def _ensure_react_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Ensure namespaced vars exist and migrate legacy flat keys in-place.
+
+    Returns: (context, scratchpad, runtime_ns, temp)
+    """
+    ensure_namespaces(run.vars)
+    context = run.vars["context"]
+    scratchpad = run.vars["scratchpad"]
+    runtime_ns = run.vars["_runtime"]
+    temp = run.vars["_temp"]
+
+    # Legacy (flat) -> namespaced migration. This keeps resume working for older persisted runs.
+    if "task" in run.vars and "task" not in context:
+        context["task"] = run.vars.pop("task")
+    if "messages" in run.vars and "messages" not in context:
+        context["messages"] = run.vars.pop("messages")
+    if "iteration" in run.vars and "iteration" not in scratchpad:
+        scratchpad["iteration"] = run.vars.pop("iteration")
+    if "max_iterations" in run.vars and "max_iterations" not in scratchpad:
+        scratchpad["max_iterations"] = run.vars.pop("max_iterations")
+    if "_inbox" in run.vars and "inbox" not in runtime_ns:
+        runtime_ns["inbox"] = run.vars.pop("_inbox")
+
+    for key in ("llm_response", "tool_results", "pending_tool_calls", "user_response", "final_answer"):
+        if key in run.vars and key not in temp:
+            temp[key] = run.vars.pop(key)
+
+    if not isinstance(context.get("messages"), list):
+        context["messages"] = []
+    if not isinstance(runtime_ns.get("inbox"), list):
+        runtime_ns["inbox"] = []
+
+    iteration = scratchpad.get("iteration")
+    if not isinstance(iteration, int):
+        try:
+            scratchpad["iteration"] = int(iteration or 0)
+        except (TypeError, ValueError):
+            scratchpad["iteration"] = 0
+
+    max_iterations = scratchpad.get("max_iterations")
+    if max_iterations is None:
+        scratchpad["max_iterations"] = DEFAULT_MAX_ITERATIONS
+    elif not isinstance(max_iterations, int):
+        try:
+            scratchpad["max_iterations"] = int(max_iterations)
+        except (TypeError, ValueError):
+            scratchpad["max_iterations"] = DEFAULT_MAX_ITERATIONS
+
+    if scratchpad["max_iterations"] < 1:
+        scratchpad["max_iterations"] = 1
+
+    return context, scratchpad, runtime_ns, temp
+
+
 def create_react_workflow(
     tools: List[Callable],
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
@@ -114,41 +171,42 @@ def create_react_workflow(
     
     def init_node(run: RunState, ctx) -> StepPlan:
         """Initialize the agent state."""
-        run.vars["iteration"] = 0
-        messages = run.vars.get("messages")
-        if not isinstance(messages, list):
-            messages = []
+        context, scratchpad, _, _ = _ensure_react_vars(run)
+        scratchpad["iteration"] = 0
 
-        task = str(run.vars.get("task", "") or "")
+        task = str(context.get("task", "") or "")
+        context["task"] = task
+        messages = context["messages"]
+
         if task and (not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != task):
             messages.append(_new_message(ctx, role="user", content=task))
 
-        run.vars["messages"] = messages
         emit("init", {"task": task})
         return StepPlan(node_id="init", next_node="reason")
     
     def reason_node(run: RunState, ctx) -> StepPlan:
         """Call LLM with tools - AbstractCore handles formatting."""
-        iteration = run.vars.get("iteration", 0)
+        context, scratchpad, runtime_ns, _ = _ensure_react_vars(run)
+        iteration = int(scratchpad.get("iteration", 0) or 0)
+        max_iterations = int(scratchpad.get("max_iterations") or DEFAULT_MAX_ITERATIONS)
+        if max_iterations < 1:
+            max_iterations = 1
         
-        if iteration >= MAX_ITERATIONS:
+        if iteration >= max_iterations:
             return StepPlan(node_id="reason", next_node="max_iterations")
         
-        run.vars["iteration"] = iteration + 1
+        scratchpad["iteration"] = iteration + 1
         
-        task = run.vars.get("task", "")
-        messages = run.vars.get("messages", [])
-        if not isinstance(messages, list):
-            messages = []
-            run.vars["messages"] = messages
+        task = str(context.get("task", "") or "")
+        messages = context["messages"]
         
         # Check for injected messages (async guidance from user)
-        inbox = run.vars.get("_inbox", [])
+        inbox = runtime_ns.get("inbox", [])
         inbox_text = ""
         if inbox:
             inbox_messages = [m.get("content", "") for m in inbox]
             inbox_text = "\n\n[User guidance]: " + " | ".join(inbox_messages)
-            run.vars["_inbox"] = []  # Clear inbox after reading
+            runtime_ns["inbox"] = []  # Clear inbox after reading
         
         # Build messages for the LLM
         if len(messages) <= 1:
@@ -172,7 +230,10 @@ def create_react_workflow(
         if inbox_text:
             prompt += inbox_text
         
-        emit("reason", {"iteration": iteration + 1, "has_guidance": bool(inbox_text)})
+        emit(
+            "reason",
+            {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(inbox_text)},
+        )
         
         # Convert tools to format AbstractCore expects
         tool_dicts = [t.to_dict() for t in tool_defs]
@@ -185,34 +246,36 @@ def create_react_workflow(
                     "prompt": prompt,
                     "tools": tool_dicts,  # AbstractCore handles tool formatting
                 },
-                result_key="llm_response",
+                result_key="_temp.llm_response",
             ),
             next_node="parse",
         )
     
     def parse_node(run: RunState, ctx) -> StepPlan:
         """Parse LLM response - check for tool calls or final answer."""
-        response = run.vars.get("llm_response", {})
+        context, _, _, temp = _ensure_react_vars(run)
+        response = temp.get("llm_response", {})
+        if not isinstance(response, dict):
+            response = {}
         content = response.get("content", "")
         tool_calls = response.get("tool_calls") or []
         
         # Add assistant message to history
-        messages = run.vars.get("messages", [])
-        messages.append(_new_message(ctx, role="assistant", content=content))
-        run.vars["messages"] = messages
+        context["messages"].append(_new_message(ctx, role="assistant", content=content))
         
         emit("parse", {
             "has_tool_calls": len(tool_calls) > 0,
             "content_preview": content[:100] if content else "(no content)",
         })
+        temp.pop("llm_response", None)
         
         if tool_calls:
             # Store tool calls for execution
-            run.vars["pending_tool_calls"] = tool_calls
+            temp["pending_tool_calls"] = tool_calls
             return StepPlan(node_id="parse", next_node="act")
         else:
             # No tool calls - treat content as final answer
-            run.vars["final_answer"] = content
+            temp["final_answer"] = content
             return StepPlan(node_id="parse", next_node="done")
     
     def act_node(run: RunState, ctx) -> StepPlan:
@@ -223,7 +286,10 @@ def create_react_workflow(
         - Subject to retry/idempotency policies
         - Consistent with the effect-based architecture
         """
-        tool_calls = run.vars.get("pending_tool_calls", [])
+        _, _, _, temp = _ensure_react_vars(run)
+        tool_calls = temp.get("pending_tool_calls", [])
+        if not isinstance(tool_calls, list):
+            tool_calls = []
         
         if not tool_calls:
             return StepPlan(node_id="act", next_node="reason")
@@ -242,7 +308,7 @@ def create_react_workflow(
                 choices = args.get("choices", [])
                 
                 # Store remaining tool calls for after resume
-                run.vars["pending_tool_calls"] = tool_calls[i + 1:]
+                temp["pending_tool_calls"] = tool_calls[i + 1:]
                 
                 emit("ask_user", {"question": question, "choices": choices})
                 
@@ -255,7 +321,7 @@ def create_react_workflow(
                             "choices": choices if choices else None,
                             "allow_free_text": True,
                         },
-                        result_key="user_response",
+                        result_key="_temp.user_response",
                     ),
                     next_node="handle_user_response",
                 )
@@ -289,16 +355,19 @@ def create_react_workflow(
             effect=Effect(
                 type=EffectType.TOOL_CALLS,
                 payload={"tool_calls": formatted_calls},
-                result_key="tool_results",
+                result_key="_temp.tool_results",
             ),
             next_node="observe",
         )
     
     def observe_node(run: RunState, ctx) -> StepPlan:
         """Process tool results and add to conversation history."""
-        tool_results = run.vars.get("tool_results", {})
+        context, _, _, temp = _ensure_react_vars(run)
+        tool_results = temp.get("tool_results", {})
+        if not isinstance(tool_results, dict):
+            tool_results = {}
         results = tool_results.get("results", [])
-        messages = run.vars.get("messages", [])
+        messages = context["messages"]
         
         for r in results:
             name = r.get("name", "tool")
@@ -322,55 +391,62 @@ def create_react_workflow(
                 )
             )
         
-        run.vars["messages"] = messages
-        run.vars["pending_tool_calls"] = []
+        temp.pop("tool_results", None)
+        temp["pending_tool_calls"] = []
         
         return StepPlan(node_id="observe", next_node="reason")
     
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
         """Handle user response after ask_user."""
-        user_response = run.vars.get("user_response", {})
+        context, _, _, temp = _ensure_react_vars(run)
+        user_response = temp.get("user_response", {})
+        if not isinstance(user_response, dict):
+            user_response = {}
         response_text = user_response.get("response", "")
         
         emit("user_response", {"response": response_text})
         
         # Add user response to messages
-        messages = run.vars.get("messages", [])
-        messages.append(_new_message(ctx, role="user", content=f"[User response]: {response_text}"))
-        run.vars["messages"] = messages
+        context["messages"].append(_new_message(ctx, role="user", content=f"[User response]: {response_text}"))
+        temp.pop("user_response", None)
         
         # Continue with any remaining tool calls or back to reasoning
-        if run.vars.get("pending_tool_calls"):
+        if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
         return StepPlan(node_id="handle_user_response", next_node="reason")
     
     def done_node(run: RunState, ctx) -> StepPlan:
         """Complete with final answer."""
-        answer = run.vars.get("final_answer", "No answer provided")
+        context, scratchpad, _, temp = _ensure_react_vars(run)
+        answer = str(temp.get("final_answer") or "No answer provided")
         emit("done", {"answer": answer})
         
         return StepPlan(
             node_id="done",
             complete_output={
                 "answer": answer,
-                "iterations": run.vars.get("iteration", 0),
-                "messages": run.vars.get("messages", []),
+                "iterations": int(scratchpad.get("iteration", 0) or 0),
+                "messages": list(context.get("messages") or []),
             },
         )
     
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
         """Handle max iterations reached."""
-        emit("max_iterations", {"iterations": MAX_ITERATIONS})
+        context, scratchpad, _, _ = _ensure_react_vars(run)
+        max_iterations = int(scratchpad.get("max_iterations") or DEFAULT_MAX_ITERATIONS)
+        if max_iterations < 1:
+            max_iterations = 1
+        emit("max_iterations", {"iterations": max_iterations})
         
         # Use last content as answer
-        messages = run.vars.get("messages", [])
+        messages = list(context.get("messages") or [])
         last_content = messages[-1]["content"] if messages else "Max iterations reached"
         
         return StepPlan(
             node_id="max_iterations",
             complete_output={
                 "answer": last_content,
-                "iterations": MAX_ITERATIONS,
+                "iterations": max_iterations,
                 "messages": messages,
             },
         )
@@ -405,10 +481,25 @@ class ReactAgent(BaseAgent):
     def _create_workflow(self) -> WorkflowSpec:
         """Create the ReAct workflow."""
         return create_react_workflow(self.tools, self.on_step)
+
+    def __init__(
+        self,
+        *,
+        runtime: Runtime,
+        tools: Optional[List[Callable]] = None,
+        on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        actor_id: Optional[str] = None,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    ):
+        super().__init__(runtime=runtime, tools=tools, on_step=on_step, actor_id=actor_id)
+        self.max_iterations = int(max_iterations)
+        if self.max_iterations < 1:
+            raise ValueError("max_iterations must be >= 1")
     
     def start(self, task: str) -> str:
         """Start a new agent run with a task."""
         actor_id = self._ensure_actor_id()
+        session_id = self._ensure_session_id()
         seeded_messages = [dict(m) for m in (self.session_messages or [])]
         tool_defs: List[ToolDefinition] = []
         for t in self.tools:
@@ -421,14 +512,17 @@ class ReactAgent(BaseAgent):
         self._current_run_id = self.runtime.start(
             workflow=self.workflow,
             vars={
-                "task": task,
-                "messages": seeded_messages,
+                "context": {"task": task, "messages": seeded_messages},
+                "scratchpad": {"iteration": 0, "max_iterations": self.max_iterations},
                 "_runtime": {
                     "tool_specs": tool_specs,
                     "toolset_id": toolset_id,
+                    "inbox": [],
                 },
+                "_temp": {},
             },
             actor_id=actor_id,
+            session_id=session_id,
         )
         return self._current_run_id
     
@@ -448,6 +542,7 @@ def create_react_agent(
     model: str = "qwen3:4b-instruct-2507-q4_K_M",
     tools: Optional[List[Callable]] = None,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> ReactAgent:
     """Create a ReAct agent with minimal configuration.
     
@@ -486,4 +581,5 @@ def create_react_agent(
         runtime=runtime,
         tools=tools,
         on_step=on_step,
+        max_iterations=max_iterations,
     )

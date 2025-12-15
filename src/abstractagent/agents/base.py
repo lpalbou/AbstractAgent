@@ -36,6 +36,7 @@ class BaseAgent(ABC):
         on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         *,
         actor_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         """Initialize the agent.
         
@@ -50,6 +51,7 @@ class BaseAgent(ABC):
         self.workflow = self._create_workflow()
         self._current_run_id: Optional[str] = None
         self.actor_id: Optional[str] = actor_id
+        self.session_id: Optional[str] = session_id
         self.session_messages: List[Dict[str, Any]] = []
 
     def _ensure_actor_id(self) -> str:
@@ -66,6 +68,14 @@ class BaseAgent(ABC):
         )
         self.actor_id = fp.actor_id
         return self.actor_id
+
+    def _ensure_session_id(self) -> str:
+        if self.session_id:
+            return self.session_id
+        import uuid
+
+        self.session_id = f"sess_{uuid.uuid4().hex}"
+        return self.session_id
 
     @abstractmethod
     def _create_workflow(self) -> WorkflowSpec:
@@ -219,6 +229,14 @@ class BaseAgent(ABC):
         if self.actor_id is None and state.actor_id:
             self.actor_id = state.actor_id
 
+        state_session_id = getattr(state, "session_id", None)
+        if self.session_id and state_session_id and self.session_id != state_session_id:
+            raise ValueError(
+                f"Run session_id mismatch: run has '{state_session_id}', agent expects '{self.session_id}'."
+            )
+        if self.session_id is None and state_session_id:
+            self.session_id = state_session_id
+
         self._current_run_id = run_id
         return state
     
@@ -248,6 +266,7 @@ class BaseAgent(ABC):
             "run_id": self._current_run_id,
             "workflow_id": self.workflow.workflow_id,
             "actor_id": self.actor_id,
+            "session_id": self._ensure_session_id(),
         }
         
         Path(filepath).write_text(json.dumps(data, indent=2))
@@ -289,6 +308,14 @@ class BaseAgent(ABC):
             )
         if actor_id and self.actor_id is None:
             self.actor_id = actor_id
+
+        session_id = data.get("session_id")
+        if session_id and self.session_id and session_id != self.session_id:
+            raise ValueError(
+                f"Saved session_id mismatch: file has '{session_id}', agent expects '{self.session_id}'."
+            )
+        if session_id and self.session_id is None:
+            self.session_id = session_id
 
         try:
             return self.attach(str(run_id))
@@ -350,13 +377,25 @@ class BaseAgent(ABC):
             raise RuntimeError("No active run.")
         
         state = self.runtime.get_state(self._current_run_id)
-        inbox = state.vars.get("_inbox", [])
-        inbox.append({
-            "type": "user_guidance",
-            "content": message,
-            "timestamp": self.runtime._ctx.now_iso() if hasattr(self.runtime._ctx, 'now_iso') else None,
-        })
-        state.vars["_inbox"] = inbox
+        runtime_ns = state.vars.get("_runtime")
+        if not isinstance(runtime_ns, dict):
+            runtime_ns = {}
+            state.vars["_runtime"] = runtime_ns
+
+        inbox = runtime_ns.get("inbox")
+        if not isinstance(inbox, list):
+            legacy = state.vars.get("_inbox")
+            inbox = legacy if isinstance(legacy, list) else []
+            runtime_ns["inbox"] = inbox
+
+        inbox.append(
+            {
+                "type": "user_guidance",
+                "content": message,
+                "timestamp": self.runtime._ctx.now_iso() if hasattr(self.runtime._ctx, "now_iso") else None,
+            }
+        )
+        state.vars.pop("_inbox", None)
         self.runtime._run_store.save(state)
     
     def get_output(self) -> Optional[Dict[str, Any]]:
