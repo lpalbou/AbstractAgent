@@ -8,6 +8,7 @@ from .filesystem import (
     write_file,
     update_file,
 )
+from .code_execution import execute_python
 from .self_improve import self_improve
 
 ALL_TOOLS = [
@@ -27,6 +28,7 @@ __all__ = [
     "execute_command",
     "write_file",
     "update_file",
+    "execute_python",
     "self_improve",
     "ALL_TOOLS",
 ]

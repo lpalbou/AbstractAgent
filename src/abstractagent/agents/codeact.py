@@ -1,14 +1,4 @@
-"""ReAct agent implementation.
-
-This module wires:
-- Pure ReAct reasoning logic (abstractagent.logic)
-- To an AbstractRuntime workflow (abstractagent.adapters)
-
-The public API is intentionally stable:
-- ReactAgent
-- create_react_workflow
-- create_react_agent
-"""
+"""CodeAct agent implementation."""
 
 from __future__ import annotations
 
@@ -18,9 +8,9 @@ from abstractcore.tools import ToolDefinition
 from abstractruntime import RunState, Runtime, WorkflowSpec
 
 from .base import BaseAgent
-from ..adapters.react_runtime import create_react_workflow
+from ..adapters.codeact_runtime import create_codeact_workflow
 from ..logic.builtins import ASK_USER_TOOL
-from ..logic.react import ReActLogic
+from ..logic.codeact import CodeActLogic
 
 
 def _tool_definitions_from_callables(tools: List[Callable[..., Any]]) -> List[ToolDefinition]:
@@ -43,8 +33,8 @@ def _copy_messages(messages: Any) -> List[Dict[str, Any]]:
     return out
 
 
-class ReactAgent(BaseAgent):
-    """Reason-Act-Observe agent with tool calling."""
+class CodeActAgent(BaseAgent):
+    """Agent that primarily acts by executing Python code snippets."""
 
     def __init__(
         self,
@@ -64,7 +54,7 @@ class ReactAgent(BaseAgent):
         if self._max_history_messages < 1:
             self._max_history_messages = 1
 
-        self.logic: Optional[ReActLogic] = None
+        self.logic: Optional[CodeActLogic] = None
         super().__init__(
             runtime=runtime,
             tools=tools,
@@ -75,12 +65,10 @@ class ReactAgent(BaseAgent):
 
     def _create_workflow(self) -> WorkflowSpec:
         tool_defs = _tool_definitions_from_callables(self.tools)
-        # Built-in ask_user is a schema-only tool (handled via ASK_USER effect in the adapter).
         tool_defs = [ASK_USER_TOOL, *tool_defs]
-
-        logic = ReActLogic(tools=tool_defs, max_history_messages=self._max_history_messages)
+        logic = CodeActLogic(tools=tool_defs, max_history_messages=self._max_history_messages)
         self.logic = logic
-        return create_react_workflow(logic=logic, on_step=self.on_step)
+        return create_codeact_workflow(logic=logic, on_step=self.on_step)
 
     def start(self, task: str) -> str:
         task = str(task or "").strip()
@@ -109,7 +97,7 @@ class ReactAgent(BaseAgent):
         return self.runtime.tick(workflow=self.workflow, run_id=self._current_run_id, max_steps=1)
 
 
-def create_react_agent(
+def create_codeact_agent(
     *,
     provider: str = "ollama",
     model: str = "qwen3:1.7b-q4_K_M",
@@ -122,15 +110,15 @@ def create_react_agent(
     ledger_store: Optional[Any] = None,
     actor_id: Optional[str] = None,
     session_id: Optional[str] = None,
-) -> ReactAgent:
-    """Factory: create a ReactAgent with a local AbstractCore-backed runtime."""
+) -> CodeActAgent:
+    """Factory: create a CodeActAgent with a local AbstractCore-backed runtime."""
 
     from abstractruntime.integrations.abstractcore import MappingToolExecutor, create_local_runtime
 
     if tools is None:
-        from ..tools import ALL_TOOLS as _DEFAULT_TOOLS
+        from ..tools.code_execution import execute_python
 
-        tools = list(_DEFAULT_TOOLS)
+        tools = [execute_python]
 
     runtime = create_local_runtime(
         provider=provider,
@@ -141,7 +129,7 @@ def create_react_agent(
         tool_executor=MappingToolExecutor.from_tools(list(tools)),
     )
 
-    return ReactAgent(
+    return CodeActAgent(
         runtime=runtime,
         tools=list(tools),
         on_step=on_step,
@@ -152,9 +140,5 @@ def create_react_agent(
     )
 
 
-__all__ = [
-    "ReactAgent",
-    "create_react_workflow",
-    "create_react_agent",
-]
+__all__ = ["CodeActAgent", "create_codeact_workflow", "create_codeact_agent"]
 
