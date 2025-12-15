@@ -173,8 +173,8 @@ agent.is_waiting()          # Check if waiting for input
 agent.get_pending_question() # Get question details
 agent.resume(response)      # Resume with user response
 agent.attach(run_id)        # Attach to existing run
-agent.save_state(filepath)  # Persist run_id for later
-agent.load_state(filepath)  # Resume from persisted state
+agent.save_state(filepath)  # Persist a run reference (run_id/workflow_id/actor_id)
+agent.load_state(filepath)  # Attach to a persisted run reference
 ```
 
 ### Missing: Cancel Method

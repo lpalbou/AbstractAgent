@@ -90,8 +90,16 @@ def create_react_workflow(
     def init_node(run: RunState, ctx) -> StepPlan:
         """Initialize the agent state."""
         run.vars["iteration"] = 0
-        run.vars["messages"] = []
-        emit("init", {"task": run.vars.get("task", "")})
+        messages = run.vars.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+
+        task = str(run.vars.get("task", "") or "")
+        if task and (not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != task):
+            messages.append({"role": "user", "content": task})
+
+        run.vars["messages"] = messages
+        emit("init", {"task": task})
         return StepPlan(node_id="init", next_node="reason")
     
     def reason_node(run: RunState, ctx) -> StepPlan:
@@ -105,6 +113,9 @@ def create_react_workflow(
         
         task = run.vars.get("task", "")
         messages = run.vars.get("messages", [])
+        if not isinstance(messages, list):
+            messages = []
+            run.vars["messages"] = messages
         
         # Check for injected messages (async guidance from user)
         inbox = run.vars.get("_inbox", [])
@@ -115,15 +126,20 @@ def create_react_workflow(
             run.vars["_inbox"] = []  # Clear inbox after reading
         
         # Build messages for the LLM
-        if not messages:
-            # First turn - just the task
-            prompt = f"Task: {task}\n\nUse the available tools to complete this task. When done, provide your final answer."
+        if len(messages) <= 1:
+            prompt = (
+                f"Task: {task}\n\n"
+                "Use the available tools to complete this task. When done, provide your final answer."
+            )
         else:
-            # Subsequent turns - include history
-            history_text = "\n".join([
-                f"{m['role']}: {m['content']}" for m in messages[-6:]
-            ])
-            prompt = f"Task: {task}\n\nHistory:\n{history_text}\n\nContinue working on the task. Use tools or provide final answer."
+            history_text = "\n".join(
+                [f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages[-12:]]
+            )
+            prompt = (
+                "Continue the conversation and work on the user's latest request.\n\n"
+                f"History:\n{history_text}\n\n"
+                "Use tools or provide a final answer."
+            )
         
         # Append any injected guidance
         if inbox_text:
@@ -360,6 +376,8 @@ class ReactAgent(BaseAgent):
     
     def start(self, task: str) -> str:
         """Start a new agent run with a task."""
+        actor_id = self._ensure_actor_id()
+        seeded_messages = [dict(m) for m in (self.session_messages or [])]
         tool_defs: List[ToolDefinition] = []
         for t in self.tools:
             tool_defs.append(getattr(t, "_tool_definition", None) or ToolDefinition.from_function(t))
@@ -372,11 +390,13 @@ class ReactAgent(BaseAgent):
             workflow=self.workflow,
             vars={
                 "task": task,
+                "messages": seeded_messages,
                 "_runtime": {
                     "tool_specs": tool_specs,
                     "toolset_id": toolset_id,
                 },
             },
+            actor_id=actor_id,
         )
         return self._current_run_id
     

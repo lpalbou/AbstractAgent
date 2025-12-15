@@ -34,6 +34,8 @@ class BaseAgent(ABC):
         runtime: Runtime,
         tools: Optional[List[Callable]] = None,
         on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        *,
+        actor_id: Optional[str] = None,
     ):
         """Initialize the agent.
         
@@ -47,7 +49,24 @@ class BaseAgent(ABC):
         self.on_step = on_step
         self.workflow = self._create_workflow()
         self._current_run_id: Optional[str] = None
-    
+        self.actor_id: Optional[str] = actor_id
+        self.session_messages: List[Dict[str, Any]] = []
+
+    def _ensure_actor_id(self) -> str:
+        if self.actor_id:
+            return self.actor_id
+
+        from abstractruntime.identity.fingerprint import ActorFingerprint
+        import uuid
+
+        fp = ActorFingerprint.from_metadata(
+            kind="agent",
+            display_name=self.__class__.__name__,
+            metadata={"nonce": uuid.uuid4().hex},
+        )
+        self.actor_id = fp.actor_id
+        return self.actor_id
+
     @abstractmethod
     def _create_workflow(self) -> WorkflowSpec:
         """Create the workflow specification for this agent type.
@@ -192,6 +211,14 @@ class BaseAgent(ABC):
                 f"Run workflow_id mismatch: run has '{state.workflow_id}', "
                 f"agent expects '{self.workflow.workflow_id}'."
             )
+
+        if self.actor_id and state.actor_id and self.actor_id != state.actor_id:
+            raise ValueError(
+                f"Run actor_id mismatch: run has '{state.actor_id}', agent expects '{self.actor_id}'."
+            )
+        if self.actor_id is None and state.actor_id:
+            self.actor_id = state.actor_id
+
         self._current_run_id = run_id
         return state
     
@@ -217,7 +244,11 @@ class BaseAgent(ABC):
                 "the current runtime uses InMemoryRunStore which cannot resume across restarts."
             )
 
-        data = {"run_id": self._current_run_id, "workflow_id": self.workflow.workflow_id}
+        data = {
+            "run_id": self._current_run_id,
+            "workflow_id": self.workflow.workflow_id,
+            "actor_id": self.actor_id,
+        }
         
         Path(filepath).write_text(json.dumps(data, indent=2))
     
@@ -238,22 +269,34 @@ class BaseAgent(ABC):
         path = Path(filepath)
         if not path.exists():
             return None
-        
+
+        data = json.loads(path.read_text())
+        run_id = data.get("run_id")
+        if not run_id:
+            return None
+
+        workflow_id = data.get("workflow_id")
+        if workflow_id and workflow_id != self.workflow.workflow_id:
+            raise ValueError(
+                f"Saved workflow_id mismatch: file has '{workflow_id}', "
+                f"agent expects '{self.workflow.workflow_id}'."
+            )
+
+        actor_id = data.get("actor_id")
+        if actor_id and self.actor_id and actor_id != self.actor_id:
+            raise ValueError(
+                f"Saved actor_id mismatch: file has '{actor_id}', agent expects '{self.actor_id}'."
+            )
+        if actor_id and self.actor_id is None:
+            self.actor_id = actor_id
+
         try:
-            data = json.loads(path.read_text())
-            run_id = data.get("run_id")
-            workflow_id = data.get("workflow_id")
-            if workflow_id and workflow_id != self.workflow.workflow_id:
-                raise ValueError(
-                    f"Saved workflow_id mismatch: file has '{workflow_id}', "
-                    f"agent expects '{self.workflow.workflow_id}'."
-                )
-            if run_id:
-                return self.attach(run_id)
-        except (json.JSONDecodeError, KeyError):
-            pass
-        
-        return None
+            return self.attach(str(run_id))
+        except KeyError as e:
+            raise RuntimeError(
+                f"Saved run_id '{run_id}' was not found in the configured RunStore. "
+                "If you deleted/moved the store directory, this run cannot be resumed."
+            ) from e
     
     def clear_state(self, filepath: str) -> None:
         """Remove state file after completion.
