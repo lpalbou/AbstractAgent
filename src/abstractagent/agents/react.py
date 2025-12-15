@@ -12,6 +12,8 @@ Special tool: ask_user
 - Triggers ASK_USER effect for durable pause/resume
 """
 
+import hashlib
+import json
 from typing import Any, Dict, List, Optional, Callable, Union
 
 from abstractruntime import (
@@ -47,6 +49,12 @@ ASK_USER_TOOL = ToolDefinition(
     },
     when_to_use="When the task is ambiguous or you need user input to proceed",
 )
+
+def _compute_toolset_id(tool_specs: List[Dict[str, Any]]) -> str:
+    normalized = sorted((dict(s) for s in tool_specs), key=lambda s: str(s.get("name", "")))
+    payload = json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    return f"ts_{digest}"
 
 
 def create_react_workflow(
@@ -352,11 +360,22 @@ class ReactAgent(BaseAgent):
     
     def start(self, task: str) -> str:
         """Start a new agent run with a task."""
+        tool_defs: List[ToolDefinition] = []
+        for t in self.tools:
+            tool_defs.append(getattr(t, "_tool_definition", None) or ToolDefinition.from_function(t))
+        tool_defs.append(ASK_USER_TOOL)
+
+        tool_specs = [t.to_dict() for t in tool_defs]
+        toolset_id = _compute_toolset_id(tool_specs)
+
         self._current_run_id = self.runtime.start(
             workflow=self.workflow,
             vars={
                 "task": task,
-                "_tools": self.tools,  # Tools stored in vars for effect handler
+                "_runtime": {
+                    "tool_specs": tool_specs,
+                    "toolset_id": toolset_id,
+                },
             },
         )
         return self._current_run_id
@@ -396,16 +415,18 @@ def create_react_agent(
         print(state.output["answer"])
     """
     from abstractruntime.integrations.abstractcore import create_local_runtime
+    from abstractruntime.integrations.abstractcore import MappingToolExecutor
     from ..tools import ALL_TOOLS
     
     # Use default tools if none provided
     if tools is None:
         tools = list(ALL_TOOLS)
-    
-    # Create runtime (tools passed via workflow vars, no registry needed)
+
+    # Create runtime with an explicit tool executor (durable: no callables in RunState)
     runtime = create_local_runtime(
         provider=provider,
         model=model,
+        tool_executor=MappingToolExecutor.from_tools(tools),
     )
     
     # Create and return agent with tools

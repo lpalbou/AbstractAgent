@@ -187,34 +187,44 @@ class BaseAgent(ABC):
             Current RunState
         """
         state = self.runtime.get_state(run_id)
+        if state.workflow_id != self.workflow.workflow_id:
+            raise ValueError(
+                f"Run workflow_id mismatch: run has '{state.workflow_id}', "
+                f"agent expects '{self.workflow.workflow_id}'."
+            )
         self._current_run_id = run_id
         return state
     
     def save_state(self, filepath: str) -> None:
-        """Save current run_id to file for later resume.
+        """Save a run reference to file for later resume.
+
+        The full durable state is owned and persisted by AbstractRuntime's RunStore.
+        This method only stores the identifiers needed to re-attach on restart.
         
         Args:
             filepath: Path to save state file
         """
         import json
         from pathlib import Path
+        from abstractruntime.storage.in_memory import InMemoryRunStore
         
         if not self._current_run_id:
             raise RuntimeError("No active run to save.")
-        
-        state = self.get_state()
-        data = {
-            "run_id": self._current_run_id,
-            "agent_type": self.__class__.__name__,
-            "status": state.status.value if state else "unknown",
-            "current_node": state.current_node if state else None,
-            "task": state.vars.get("task") if state else None,
-        }
+
+        if isinstance(self.runtime.run_store, InMemoryRunStore):
+            raise RuntimeError(
+                "save_state requires a persistent RunStore (e.g. JsonFileRunStore); "
+                "the current runtime uses InMemoryRunStore which cannot resume across restarts."
+            )
+
+        data = {"run_id": self._current_run_id, "workflow_id": self.workflow.workflow_id}
         
         Path(filepath).write_text(json.dumps(data, indent=2))
     
     def load_state(self, filepath: str) -> Optional[RunState]:
-        """Load run_id from file and attach to it.
+        """Load run reference from file and attach to it.
+
+        The full durable state is loaded from AbstractRuntime's RunStore.
         
         Args:
             filepath: Path to state file
@@ -232,6 +242,12 @@ class BaseAgent(ABC):
         try:
             data = json.loads(path.read_text())
             run_id = data.get("run_id")
+            workflow_id = data.get("workflow_id")
+            if workflow_id and workflow_id != self.workflow.workflow_id:
+                raise ValueError(
+                    f"Saved workflow_id mismatch: file has '{workflow_id}', "
+                    f"agent expects '{self.workflow.workflow_id}'."
+                )
             if run_id:
                 return self.attach(run_id)
         except (json.JSONDecodeError, KeyError):

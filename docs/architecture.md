@@ -9,7 +9,7 @@ Yes. The flow is:
 ```
 @tool decorator → ToolDefinition → to_dict() → LLM_CALL payload → UniversalToolHandler.format_tools_prompt() → LLM prompt
 ```
-The global registry is bypassed; tools flow directly through the agent.
+Tool execution is durable: tool *specs* are persisted; tool callables are executed via a host-configured `ToolExecutor`.
 
 **Q: Can I have multiple agents?**
 Yes. Three patterns:
@@ -81,9 +81,10 @@ Yes. Three patterns:
 │                                                                              │
 │    agent.start("List files in current directory")                           │
 │                                                                              │
-│    runtime.start(workflow, vars={"task": task, "_tools": tools})            │
+│    runtime.start(workflow, vars={"task": task, "_runtime": {"tool_specs": [...], "toolset_id": "ts_..."}}) │
 │                                                                              │
-│    - Tools stored in run.vars["_tools"] for effect handler access           │
+│    - Only tool *specs* are persisted (JSON-safe)                            │
+│    - Tool callables are held by the host ToolExecutor                        │
 └──────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
@@ -134,51 +135,25 @@ Yes. Three patterns:
 │        payload={"tool_calls": [...]}                                        │
 │    ))                                                                        │
 │                                                                              │
-│    Effect handler priority:                                                 │
-│    1. payload.tools (if provided)                                           │
-│    2. run.vars["_tools"] ← THIS IS WHAT WE USE                              │
-│    3. Fallback to ToolExecutor (global registry)                            │
-│                                                                              │
-│    _execute_tools_directly():                                               │
-│        - Builds lookup: {tool_name: tool_function}                          │
-│        - Calls function with arguments                                      │
-│        - Returns results                                                    │
+│    Effect handler: ToolExecutor only                                        │
+│    - executed: executes tools locally                                       │
+│    - passthrough/approval_required: returns tool_calls and runtime waits    │
+│      until the host resumes with tool results                               │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Global Registry: Used or Bypassed?
 
-**Current architecture BYPASSES the global registry.**
+**Current architecture does not require the global registry.**
 
-The tool flow uses `run.vars["_tools"]` which contains the actual tool functions. The effect handler executes them directly without going through `ToolRegistry`.
+- Tool execution is performed by a host-configured `ToolExecutor` (explicit, per-runtime/session).
+- Run state persists only tool specs (`run.vars["_runtime"]`) so JSON-backed resume works.
 
-```python
-# This is what happens in the TOOL_CALLS effect handler:
+The AbstractCore global registry remains available only as a legacy adapter path (via `AbstractCoreToolExecutor`) and is discouraged for durable agent runs.
 
-def _execute_tools_directly(tool_calls: list, tool_funcs: list) -> dict:
-    # Build lookup from tool name to function
-    tool_lookup = {}
-    for t in tool_funcs:
-        if hasattr(t, '_tool_definition'):
-            td = t._tool_definition
-            tool_lookup[td.name] = td.function  # Direct function reference
-        elif callable(t):
-            tool_lookup[t.__name__] = t
-    
-    # Execute directly
-    for tc in tool_calls:
-        func = tool_lookup.get(tc["name"])
-        output = func(**tc["arguments"])  # Direct call, no registry
-```
+**When is the global registry used?**
 
-**When IS the global registry used?**
-
-Only if:
-1. No tools in `payload.tools`
-2. No tools in `run.vars["_tools"]`
-3. A `ToolExecutor` was provided to the runtime (e.g., `AbstractCoreToolExecutor`)
-
-This is the fallback path, not the primary path.
+Only if you explicitly configure the runtime with an executor that relies on it (e.g. `AbstractCoreToolExecutor`) and register tools globally. The recommended durable path is `MappingToolExecutor`.
 
 ## Runtime Access
 
@@ -204,17 +179,17 @@ agent.load_state(filepath)  # Resume from persisted state
 
 ### Missing: Cancel Method
 
-The agent doesn't expose a `cancel()` method. Users must access runtime directly:
+The agent exposes `cancel()` via `BaseAgent`:
 
 ```python
-agent.runtime.cancel_run(agent._current_run_id, reason="User cancelled")
+agent.cancel(reason="User cancelled")
 ```
 
 ## Async Message Passing
 
-**Current state: NOT IMPLEMENTED**
+**Current state: Implemented (inbox pattern)**
 
-The architecture supports pausing (WAITING state) but not injecting messages while running.
+`BaseAgent.inject_message()` appends guidance into `run.vars["_inbox"]`. The ReAct workflow reads and clears the inbox at the start of each reasoning step.
 
 ### What exists:
 - `WAIT_EVENT` effect - pause until external signal
@@ -279,7 +254,7 @@ entries = agent.runtime.ledger_store.list(run_id)
 
 1. **Tool definition** - `@tool` decorator creates `ToolDefinition`
 2. **Tool prompt formatting** - `UniversalToolHandler` formats for any model
-3. **Tool execution** - Direct execution via `run.vars["_tools"]`
+3. **Tool execution** - Via host-configured `ToolExecutor` (durable)
 4. **Ledger recording** - All effects recorded
 5. **Pause/resume** - `ASK_USER`, `WAIT_EVENT`, `WAIT_UNTIL`
 6. **State persistence** - `save_state()` / `load_state()`
@@ -294,12 +269,12 @@ entries = agent.runtime.ledger_store.list(run_id)
 
 ### 🔍 Verified: Global Registry Bypassed
 
-The current architecture does NOT use the global `ToolRegistry`. Tools flow:
+The current architecture does not require the global `ToolRegistry`. Tools flow:
 1. Agent constructor → `agent.tools`
-2. Workflow start → `run.vars["_tools"]`
-3. Effect handler → direct execution
+2. Workflow start → `run.vars["_runtime"]` stores tool specs/toolset_id (JSON-safe)
+3. TOOL_CALLS handler → `ToolExecutor.execute(...)` (explicit execution boundary)
 
-This is intentional - it allows different agents to have different tool sets without global state pollution.
+This is intentional - it avoids hidden global state and makes pause/persist/resume reliable.
 
 ## New Agent Methods
 
@@ -487,7 +462,7 @@ class CodeActAgent(BaseAgent):
     def start(self, task: str) -> str:
         self._current_run_id = self.runtime.start(
             workflow=self.workflow,
-            vars={"task": task, "_tools": self.tools},
+            vars={"task": task},
         )
         return self._current_run_id
     
@@ -532,7 +507,7 @@ class CodeActAgent(BaseAgent):
 │  │ Workflow: init → reason → parse → act → observe → reason → ... → done│    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 │                                                                              │
-│  run.vars["_tools"] = [list_files, read_file]  ←── tools stored here        │
+│  run.vars["_runtime"] = {"tool_specs": [...], "toolset_id": "ts_..."}       │
 │  run.vars["_inbox"] = [{"content": "Focus on .py files"}]  ←── messages     │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -554,7 +529,7 @@ class CodeActAgent(BaseAgent):
 │         │                   │                                               │
 │         ▼                   ▼                                               │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ Tools from run.vars["_tools"] → direct execution (NO global registry)│   │
+│  │ TOOL_CALLS handler → ToolExecutor.execute(tool_calls)                 │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -590,7 +565,7 @@ class CodeActAgent(BaseAgent):
 
 ## Key Architectural Decisions
 
-1. **Tools bypass global registry** - Each agent has its own tool set via `run.vars["_tools"]`
+1. **No callables in RunState** - Tools are executed via `ToolExecutor`; only specs are persisted
 
 2. **BaseAgent provides common functionality** - All agent types inherit cancel, ledger, inject_message, etc.
 

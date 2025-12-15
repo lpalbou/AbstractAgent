@@ -11,22 +11,23 @@ import asyncio
 import sys
 import argparse
 import json
-from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
+from pathlib import Path
 
-from abstractcore.tools import ToolRegistry
+from abstractcore.tools import ToolDefinition
 from abstractruntime import (
     RunStatus,
     InMemoryRunStore,
     InMemoryLedgerStore,
-    RetryPolicy,
+    JsonFileRunStore,
+    JsonlLedgerStore,
 )
-from abstractruntime.integrations.abstractcore import create_local_runtime
+from abstractruntime.integrations.abstractcore import MappingToolExecutor, create_local_runtime
 
 from .agents.react import ReactAgent
 from .tools import ALL_TOOLS
-from .ui.question import get_user_response_async, Colors, _c, _supports_color
+from .ui.question import get_user_response_async, Colors, _c
 
 
 class AgentREPL:
@@ -38,22 +39,31 @@ class AgentREPL:
         self.state_file = state_file
         self.agent: Optional[ReactAgent] = None
         self._interrupted = False
+        self._tools = list(ALL_TOOLS)
         
-        # Setup tool registry
-        self.tool_registry = ToolRegistry()
-        for tool in ALL_TOOLS:
-            self.tool_registry.register(tool)
-        
-        # Setup runtime with persistence
-        self.run_store = InMemoryRunStore()
-        self.ledger_store = InMemoryLedgerStore()
+        # Setup runtime with persistence. If a state file is provided, use
+        # file-backed stores so runs can resume across process restarts.
+        if self.state_file:
+            base_dir = Path(self.state_file).expanduser().resolve()
+            store_dir = base_dir.with_name(base_dir.name + ".d")
+            self.run_store = JsonFileRunStore(store_dir)
+            self.ledger_store = JsonlLedgerStore(store_dir)
+        else:
+            self.run_store = InMemoryRunStore()
+            self.ledger_store = InMemoryLedgerStore()
+
         self.runtime = create_local_runtime(
             provider=provider,
             model=model,
             run_store=self.run_store,
             ledger_store=self.ledger_store,
-            tool_registry=self.tool_registry,  # Cleaner API
-            effect_policy=RetryPolicy(llm_max_attempts=2),
+            tool_executor=MappingToolExecutor.from_tools(self._tools),
+        )
+
+        self.agent = ReactAgent(
+            runtime=self.runtime,
+            tools=self._tools,
+            on_step=self.print_step,
         )
     
     def print_step(self, step: str, data: Dict[str, Any]) -> None:
@@ -124,13 +134,9 @@ class AgentREPL:
     
     async def run_agent_async(self, task: str) -> None:
         """Run the agent asynchronously with step visibility."""
-        self.agent = ReactAgent(
-            runtime=self.runtime,
-            tool_registry=self.tool_registry,
-            on_step=self.print_step,
-        )
-        
         self.agent.start(task)
+        if self.state_file:
+            self.agent.save_state(self.state_file)
         self._interrupted = False
         
         print(f"\n{_c('═' * 60, Colors.CYAN)}")
@@ -145,6 +151,8 @@ class AgentREPL:
                     print(f"\n{_c('═' * 60, Colors.GREEN)}")
                     print(f"{_c('Completed', Colors.GREEN, Colors.BOLD)} in {state.output.get('iterations', '?')} steps")
                     print(f"{_c('═' * 60, Colors.GREEN)}")
+                    if self.state_file:
+                        self.agent.clear_state(self.state_file)
                     break
                     
                 elif state.status == RunStatus.WAITING:
@@ -158,6 +166,8 @@ class AgentREPL:
                     
                 elif state.status == RunStatus.FAILED:
                     print(f"\n{_c('Failed:', Colors.YELLOW)} {state.error}")
+                    if self.state_file:
+                        self.agent.clear_state(self.state_file)
                     break
                 
                 # Small delay for interrupt handling
@@ -313,10 +323,14 @@ class AgentREPL:
         print(f"\n{_c('Available Tools', Colors.CYAN, Colors.BOLD)}")
         print(_c("─" * 50, Colors.DIM))
         
-        for tool in self.tool_registry.list_tools():
-            params = ", ".join(f"{k}" for k in tool.parameters.keys())
-            print(f"  {_c(tool.name, Colors.GREEN)}({params})")
-            print(f"    {_c(tool.description, Colors.DIM)}")
+        for tool in self._tools:
+            tool_def = getattr(tool, "_tool_definition", None)
+            if tool_def is None:
+                tool_def = ToolDefinition.from_function(tool)
+
+            params = ", ".join(str(k) for k in (tool_def.parameters or {}).keys())
+            print(f"  {_c(tool_def.name, Colors.GREEN)}({params})")
+            print(f"    {_c(tool_def.description, Colors.DIM)}")
         
         # Show built-in ask_user
         print(f"  {_c('ask_user', Colors.MAGENTA)}(question, choices?)")
@@ -338,6 +352,14 @@ class AgentREPL:
 """)
         
         self.show_tools()
+
+        if self.state_file:
+            try:
+                loaded = self.agent.load_state(self.state_file)
+                if loaded is not None:
+                    print(f"\n{_c('Loaded saved run.', Colors.CYAN)} Type 'status' or 'resume'.")
+            except Exception as e:
+                print(f"{_c('State load failed:', Colors.YELLOW)} {e}")
         
         agent_task: Optional[asyncio.Task] = None
         
