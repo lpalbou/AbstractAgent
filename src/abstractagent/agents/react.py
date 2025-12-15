@@ -50,6 +50,31 @@ ASK_USER_TOOL = ToolDefinition(
     when_to_use="When the task is ambiguous or you need user input to proceed",
 )
 
+
+def _new_message(
+    ctx: Any,
+    *,
+    role: str,
+    content: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    timestamp: Optional[str] = None
+    now_iso = getattr(ctx, "now_iso", None)
+    if callable(now_iso):
+        timestamp = str(now_iso())
+    if not timestamp:
+        from datetime import datetime, timezone
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+    return {
+        "role": role,
+        "content": content,
+        "timestamp": timestamp,
+        "metadata": metadata or {},
+    }
+
+
 def _compute_toolset_id(tool_specs: List[Dict[str, Any]]) -> str:
     normalized = sorted((dict(s) for s in tool_specs), key=lambda s: str(s.get("name", "")))
     payload = json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -96,7 +121,7 @@ def create_react_workflow(
 
         task = str(run.vars.get("task", "") or "")
         if task and (not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != task):
-            messages.append({"role": "user", "content": task})
+            messages.append(_new_message(ctx, role="user", content=task))
 
         run.vars["messages"] = messages
         emit("init", {"task": task})
@@ -136,6 +161,8 @@ def create_react_workflow(
                 [f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages[-12:]]
             )
             prompt = (
+                "You have access to the conversation history below as context.\n"
+                "Do not claim you have no memory of it; it is provided to you here.\n\n"
                 "Continue the conversation and work on the user's latest request.\n\n"
                 f"History:\n{history_text}\n\n"
                 "Use tools or provide a final answer."
@@ -171,7 +198,7 @@ def create_react_workflow(
         
         # Add assistant message to history
         messages = run.vars.get("messages", [])
-        messages.append({"role": "assistant", "content": content})
+        messages.append(_new_message(ctx, role="assistant", content=content))
         run.vars["messages"] = messages
         
         emit("parse", {
@@ -282,10 +309,18 @@ def create_react_workflow(
             
             emit("observe", {"tool": name, "result": str(output)[:150]})
             
-            messages.append({
-                "role": "tool",
-                "content": f"[{name}]: {output}"
-            })
+            messages.append(
+                _new_message(
+                    ctx,
+                    role="tool",
+                    content=f"[{name}]: {output}",
+                    metadata={
+                        "name": name,
+                        "call_id": r.get("call_id"),
+                        "success": bool(r.get("success")),
+                    },
+                )
+            )
         
         run.vars["messages"] = messages
         run.vars["pending_tool_calls"] = []
@@ -301,10 +336,7 @@ def create_react_workflow(
         
         # Add user response to messages
         messages = run.vars.get("messages", [])
-        messages.append({
-            "role": "user",
-            "content": f"[User response]: {response_text}"
-        })
+        messages.append(_new_message(ctx, role="user", content=f"[User response]: {response_text}"))
         run.vars["messages"] = messages
         
         # Continue with any remaining tool calls or back to reasoning
