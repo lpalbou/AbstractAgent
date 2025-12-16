@@ -87,6 +87,13 @@ class CodeActLogic:
                     if isinstance(args, dict):
                         tool_calls.append(ToolCall(name=name, arguments=dict(args), call_id=call_id))
 
+        # FALLBACK: Parse from content if no native tool calls
+        # Handles <|tool_call|>, <function_call>, ```tool_code, etc.
+        if not tool_calls and content:
+            from abstractcore.tools.parser import parse_tool_calls, detect_tool_calls
+            if detect_tool_calls(content):
+                tool_calls = parse_tool_calls(content)
+
         return content, tool_calls
 
     def extract_code(self, text: str) -> str | None:
