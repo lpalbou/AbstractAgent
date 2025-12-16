@@ -13,7 +13,7 @@ from abstractcore.tools import ToolCall, ToolDefinition
 
 from .types import LLMRequest
 
-_CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\\s*\\n(.*?)\\n```", re.IGNORECASE | re.DOTALL)
+_CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)\n```", re.IGNORECASE | re.DOTALL)
 
 
 class CodeActLogic:

@@ -16,7 +16,10 @@ from .tools import (
     search_files,
     execute_command,
     write_file,
-    update_file,
+    edit_file,
+    replace_in_file,
+    web_search,
+    fetch_url,
     execute_python,
     self_improve,
 )
@@ -39,7 +42,10 @@ __all__ = [
     "search_files",
     "execute_command",
     "write_file",
-    "update_file",
+    "edit_file",
+    "replace_in_file",
+    "web_search",
+    "fetch_url",
     "execute_python",
     "self_improve",
 ]
