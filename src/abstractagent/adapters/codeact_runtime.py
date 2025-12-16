@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from abstractcore.tools import ToolCall
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
-from abstractruntime.core.vars import ensure_namespaces
+from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 
 from ..logic.codeact import CodeActLogic
 
@@ -37,8 +37,14 @@ def _new_message(
     }
 
 
-def ensure_codeact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+def ensure_codeact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Ensure namespaced vars exist and migrate legacy flat keys in-place.
+
+    Returns:
+        Tuple of (context, scratchpad, runtime_ns, temp, limits) dicts.
+    """
     ensure_namespaces(run.vars)
+    limits = ensure_limits(run.vars)
     context = run.vars["context"]
     scratchpad = run.vars["scratchpad"]
     runtime_ns = run.vars["_runtime"]
@@ -73,17 +79,17 @@ def ensure_codeact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], 
 
     max_iterations = scratchpad.get("max_iterations")
     if max_iterations is None:
-        scratchpad["max_iterations"] = 20
+        scratchpad["max_iterations"] = 25
     elif not isinstance(max_iterations, int):
         try:
             scratchpad["max_iterations"] = int(max_iterations)
         except (TypeError, ValueError):
-            scratchpad["max_iterations"] = 20
+            scratchpad["max_iterations"] = 25
 
     if scratchpad["max_iterations"] < 1:
         scratchpad["max_iterations"] = 1
 
-    return context, scratchpad, runtime_ns, temp
+    return context, scratchpad, runtime_ns, temp, limits
 
 
 def _compute_toolset_id(tool_specs: List[Dict[str, Any]]) -> str:
@@ -107,8 +113,9 @@ def create_codeact_workflow(
     toolset_id = _compute_toolset_id(tool_specs)
 
     def init_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, runtime_ns, _ = ensure_codeact_vars(run)
+        context, scratchpad, runtime_ns, _, limits = ensure_codeact_vars(run)
         scratchpad["iteration"] = 0
+        limits["current_iteration"] = 0
 
         task = str(context.get("task", "") or "")
         context["task"] = task
@@ -124,16 +131,26 @@ def create_codeact_workflow(
         return StepPlan(node_id="init", next_node="reason")
 
     def reason_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, runtime_ns, _ = ensure_codeact_vars(run)
-        iteration = int(scratchpad.get("iteration", 0) or 0)
-        max_iterations = int(scratchpad.get("max_iterations") or 20)
+        context, scratchpad, runtime_ns, _, limits = ensure_codeact_vars(run)
+
+        # Read from _limits (canonical) with fallback to scratchpad (backward compat)
+        if "current_iteration" in limits:
+            iteration = int(limits.get("current_iteration", 0) or 0)
+            max_iterations = int(limits.get("max_iterations", 25) or 25)
+        else:
+            # Backward compatibility: use scratchpad
+            iteration = int(scratchpad.get("iteration", 0) or 0)
+            max_iterations = int(scratchpad.get("max_iterations") or 25)
+
         if max_iterations < 1:
             max_iterations = 1
 
         if iteration >= max_iterations:
             return StepPlan(node_id="reason", next_node="max_iterations")
 
+        # Update both for transition period
         scratchpad["iteration"] = iteration + 1
+        limits["current_iteration"] = iteration + 1
 
         inbox = runtime_ns.get("inbox", [])
         guidance = ""
@@ -148,22 +165,27 @@ def create_codeact_workflow(
             guidance=guidance,
             iteration=iteration + 1,
             max_iterations=max_iterations,
+            vars=run.vars,  # Pass vars for _limits access
         )
 
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
+
+        payload = {"prompt": req.prompt, "tools": [t.to_dict() for t in req.tools]}
+        if req.max_tokens is not None:
+            payload["params"] = {"max_tokens": req.max_tokens}
 
         return StepPlan(
             node_id="reason",
             effect=Effect(
                 type=EffectType.LLM_CALL,
-                payload={"prompt": req.prompt, "tools": [t.to_dict() for t in req.tools]},
+                payload=payload,
                 result_key="_temp.llm_response",
             ),
             next_node="parse",
         )
 
     def parse_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp = ensure_codeact_vars(run)
+        context, _, _, temp, _ = ensure_codeact_vars(run)
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
 
@@ -186,7 +208,7 @@ def create_codeact_workflow(
         return StepPlan(node_id="parse", next_node="done")
 
     def act_node(run: RunState, ctx) -> StepPlan:
-        _, _, _, temp = ensure_codeact_vars(run)
+        _, _, _, temp, _ = ensure_codeact_vars(run)
         tool_calls = temp.get("pending_tool_calls", [])
         if not isinstance(tool_calls, list):
             tool_calls = []
@@ -243,7 +265,7 @@ def create_codeact_workflow(
         )
 
     def execute_code_node(run: RunState, ctx) -> StepPlan:
-        _, _, _, temp = ensure_codeact_vars(run)
+        _, _, _, temp, _ = ensure_codeact_vars(run)
         code = temp.get("pending_code")
         if not isinstance(code, str) or not code.strip():
             return StepPlan(node_id="execute_code", next_node="reason")
@@ -270,7 +292,7 @@ def create_codeact_workflow(
         )
 
     def observe_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp = ensure_codeact_vars(run)
+        context, _, _, temp, _ = ensure_codeact_vars(run)
         tool_results = temp.get("tool_results", {})
         if not isinstance(tool_results, dict):
             tool_results = {}
@@ -306,7 +328,7 @@ def create_codeact_workflow(
         return StepPlan(node_id="observe", next_node="reason")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp = ensure_codeact_vars(run)
+        context, _, _, temp, _ = ensure_codeact_vars(run)
         user_response = temp.get("user_response", {})
         if not isinstance(user_response, dict):
             user_response = {}
@@ -321,21 +343,27 @@ def create_codeact_workflow(
         return StepPlan(node_id="handle_user_response", next_node="reason")
 
     def done_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, temp = ensure_codeact_vars(run)
+        context, scratchpad, _, temp, limits = ensure_codeact_vars(run)
         answer = str(temp.get("final_answer") or "No answer provided")
         emit("done", {"answer": answer})
+
+        # Prefer _limits.current_iteration, fall back to scratchpad
+        iterations = int(limits.get("current_iteration", 0) or scratchpad.get("iteration", 0) or 0)
+
         return StepPlan(
             node_id="done",
             complete_output={
                 "answer": answer,
-                "iterations": int(scratchpad.get("iteration", 0) or 0),
+                "iterations": iterations,
                 "messages": list(context.get("messages") or []),
             },
         )
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, _ = ensure_codeact_vars(run)
-        max_iterations = int(scratchpad.get("max_iterations") or 20)
+        context, scratchpad, _, _, limits = ensure_codeact_vars(run)
+
+        # Prefer _limits, fall back to scratchpad
+        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
         if max_iterations < 1:
             max_iterations = 1
         emit("max_iterations", {"iterations": max_iterations})

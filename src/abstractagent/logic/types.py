@@ -15,6 +15,7 @@ class LLMRequest:
     prompt: str
     tools: List[ToolDefinition]
     system_prompt: Optional[str] = None
+    max_tokens: Optional[int] = None
 
 
 @dataclass(frozen=True)

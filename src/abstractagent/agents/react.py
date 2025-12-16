@@ -52,8 +52,9 @@ class ReactAgent(BaseAgent):
         runtime: Runtime,
         tools: Optional[List[Callable[..., Any]]] = None,
         on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-        max_iterations: int = 20,
-        max_history_messages: int = 12,
+        max_iterations: int = 25,
+        max_history_messages: int = -1,
+        max_tokens: Optional[int] = 32768,
         actor_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
@@ -61,8 +62,10 @@ class ReactAgent(BaseAgent):
         if self._max_iterations < 1:
             self._max_iterations = 1
         self._max_history_messages = int(max_history_messages)
-        if self._max_history_messages < 1:
+        # -1 means unlimited (send all messages), otherwise must be >= 1
+        if self._max_history_messages != -1 and self._max_history_messages < 1:
             self._max_history_messages = 1
+        self._max_tokens = max_tokens
 
         self.logic: Optional[ReActLogic] = None
         super().__init__(
@@ -78,7 +81,11 @@ class ReactAgent(BaseAgent):
         # Built-in ask_user is a schema-only tool (handled via ASK_USER effect in the adapter).
         tool_defs = [ASK_USER_TOOL, *tool_defs]
 
-        logic = ReActLogic(tools=tool_defs, max_history_messages=self._max_history_messages)
+        logic = ReActLogic(
+            tools=tool_defs,
+            max_history_messages=self._max_history_messages,
+            max_tokens=self._max_tokens,
+        )
         self.logic = logic
         return create_react_workflow(logic=logic, on_step=self.on_step)
 
@@ -92,6 +99,16 @@ class ReactAgent(BaseAgent):
             "scratchpad": {"iteration": 0, "max_iterations": int(self._max_iterations)},
             "_runtime": {"inbox": []},
             "_temp": {},
+            # Canonical _limits namespace for runtime awareness
+            "_limits": {
+                "max_iterations": int(self._max_iterations),
+                "current_iteration": 0,
+                "max_tokens": self._max_tokens,
+                "max_history_messages": int(self._max_history_messages),
+                "estimated_tokens_used": 0,
+                "warn_iterations_pct": 80,
+                "warn_tokens_pct": 80,
+            },
         }
 
         run_id = self.runtime.start(
@@ -102,6 +119,37 @@ class ReactAgent(BaseAgent):
         )
         self._current_run_id = run_id
         return run_id
+
+    def get_limit_status(self) -> Dict[str, Any]:
+        """Get current limit status for the active run.
+
+        Returns a structured dict with information about iterations, tokens,
+        and history limits, including whether warning thresholds are reached.
+
+        Returns:
+            Dict with "iterations", "tokens", and "history" status info,
+            or empty dict if no active run.
+        """
+        if self._current_run_id is None:
+            return {}
+        return self.runtime.get_limit_status(self._current_run_id)
+
+    def update_limits(self, **updates: Any) -> None:
+        """Update limits mid-session.
+
+        Only allowed limit keys are updated; unknown keys are ignored.
+        Allowed keys: max_iterations, max_tokens, max_output_tokens,
+        max_history_messages, warn_iterations_pct, warn_tokens_pct.
+
+        Args:
+            **updates: Limit key-value pairs to update
+
+        Raises:
+            RuntimeError: If no active run
+        """
+        if self._current_run_id is None:
+            raise RuntimeError("No active run. Call start() first.")
+        self.runtime.update_limits(self._current_run_id, updates)
 
     def step(self) -> RunState:
         if not self._current_run_id:
@@ -115,8 +163,9 @@ def create_react_agent(
     model: str = "qwen3:1.7b-q4_K_M",
     tools: Optional[List[Callable[..., Any]]] = None,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    max_iterations: int = 20,
-    max_history_messages: int = 12,
+    max_iterations: int = 25,
+    max_history_messages: int = -1,
+    max_tokens: Optional[int] = 32768,
     llm_kwargs: Optional[Dict[str, Any]] = None,
     run_store: Optional[Any] = None,
     ledger_store: Optional[Any] = None,
@@ -147,6 +196,7 @@ def create_react_agent(
         on_step=on_step,
         max_iterations=max_iterations,
         max_history_messages=max_history_messages,
+        max_tokens=max_tokens,
         actor_id=actor_id,
         session_id=session_id,
     )

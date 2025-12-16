@@ -10,11 +10,19 @@ from .types import LLMRequest
 
 
 class ReActLogic:
-    def __init__(self, *, tools: List[ToolDefinition], max_history_messages: int = 12):
+    def __init__(
+        self,
+        *,
+        tools: List[ToolDefinition],
+        max_history_messages: int = -1,
+        max_tokens: Optional[int] = None,
+    ):
         self._tools = list(tools)
         self._max_history_messages = int(max_history_messages)
-        if self._max_history_messages < 1:
+        # -1 means unlimited (send all messages), otherwise must be >= 1
+        if self._max_history_messages != -1 and self._max_history_messages < 1:
             self._max_history_messages = 1
+        self._max_tokens = max_tokens
 
     @property
     def tools(self) -> List[ToolDefinition]:
@@ -28,9 +36,28 @@ class ReActLogic:
         guidance: str = "",
         iteration: int = 1,
         max_iterations: int = 20,
+        vars: Optional[Dict[str, Any]] = None,
     ) -> LLMRequest:
+        """Build an LLM request for the ReAct agent.
+
+        Args:
+            task: The task to perform
+            messages: Conversation history
+            guidance: Optional guidance text to inject
+            iteration: Current iteration number
+            max_iterations: Maximum allowed iterations
+            vars: Optional run.vars dict. If provided, limits are read from
+                  vars["_limits"] (canonical) with fallback to instance defaults.
+        """
         task = str(task or "")
         guidance = str(guidance or "").strip()
+
+        # Get limits from vars if available, else use instance defaults
+        limits = (vars or {}).get("_limits", {})
+        max_history = int(limits.get("max_history_messages", self._max_history_messages) or self._max_history_messages)
+        max_tokens = limits.get("max_tokens", self._max_tokens)
+        if max_tokens is not None:
+            max_tokens = int(max_tokens)
 
         if len(messages) <= 1:
             prompt = (
@@ -38,7 +65,11 @@ class ReActLogic:
                 "Use the available tools to complete this task. When done, provide your final answer."
             )
         else:
-            history = messages[-self._max_history_messages :]
+            # -1 means unlimited (use all messages)
+            if max_history == -1:
+                history = messages
+            else:
+                history = messages[-max_history:]
             history_text = "\n".join(
                 [f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in history]
             )
@@ -54,7 +85,7 @@ class ReActLogic:
         if guidance:
             prompt += "\n\n[User guidance]: " + guidance
 
-        return LLMRequest(prompt=prompt, tools=self.tools)
+        return LLMRequest(prompt=prompt, tools=self.tools, max_tokens=max_tokens)
 
     def parse_response(self, response: Any) -> Tuple[str, List[ToolCall]]:
         if not isinstance(response, dict):
