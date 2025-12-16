@@ -92,7 +92,9 @@ class CodeActLogic:
         if not tool_calls and content:
             from abstractcore.tools.parser import parse_tool_calls, detect_tool_calls
             if detect_tool_calls(content):
-                tool_calls = parse_tool_calls(content)
+                # Pass model name for architecture-specific parsing
+                model_name = response.get("model")
+                tool_calls = parse_tool_calls(content, model_name=model_name)
 
         return content, tool_calls
 
