@@ -11,7 +11,6 @@ from abstractcore.tools.common_tools import (
     search_files,
     write_file,
     edit_file,
-    replace_in_file,
     web_search,
     fetch_url,
     execute_command,
@@ -29,7 +28,6 @@ ALL_TOOLS = [
     search_files,
     write_file,
     edit_file,
-    replace_in_file,
     # Web tools (from abstractcore)
     web_search,
     fetch_url,
@@ -47,7 +45,6 @@ __all__ = [
     "search_files",
     "write_file",
     "edit_file",
-    "replace_in_file",
     # Web tools
     "web_search",
     "fetch_url",
