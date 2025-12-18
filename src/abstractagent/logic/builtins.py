@@ -117,6 +117,35 @@ REMEMBER_TOOL = ToolDefinition(
     ),
 )
 
+REMEMBER_NOTE_TOOL = ToolDefinition(
+    name="remember_note",
+    description=(
+        "Store a durable memory note (decision/fact) with optional tags and provenance sources. "
+        "Use this to remember something memorable without requiring compaction."
+    ),
+    parameters={
+        "note": {
+            "type": "string",
+            "description": "The note to remember (required). Keep it short and specific.",
+        },
+        "tags": {
+            "type": "object",
+            "description": "Optional tags (dict[str,str]) to help recall later, e.g. {\"topic\":\"api\",\"person\":\"alice\"}.",
+        },
+        "sources": {
+            "type": "object",
+            "description": (
+                "Optional provenance sources for this note. Use span_ids/message_ids when available.\n"
+                "Example: {\"span_ids\":[\"span_...\"], \"message_ids\":[\"msg_...\"]}"
+            ),
+        },
+    },
+    when_to_use=(
+        "When you want to persist a key insight/decision/fact for later recall by time/topic/person, "
+        "especially before any compaction span exists."
+    ),
+)
+
 COMPACT_MEMORY_TOOL = ToolDefinition(
     name="compact_memory",
     description=(
