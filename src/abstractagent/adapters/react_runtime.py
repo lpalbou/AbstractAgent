@@ -29,11 +29,16 @@ def _new_message(
 
         timestamp = datetime.now(timezone.utc).isoformat()
 
+    import uuid
+
+    meta = dict(metadata or {})
+    meta.setdefault("message_id", f"msg_{uuid.uuid4().hex}")
+
     return {
         "role": role,
         "content": content,
         "timestamp": timestamp,
-        "metadata": metadata or {},
+        "metadata": meta,
     }
 
 
@@ -387,4 +392,3 @@ def create_react_workflow(
             "max_iterations": max_iterations_node,
         },
     )
-
