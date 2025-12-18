@@ -25,7 +25,7 @@ def test_build_request_includes_history_and_memory_instruction() -> None:
     assert "assistant: hello" in req.prompt
 
 
-def test_build_request_applies_max_history_limit() -> None:
+def test_build_request_does_not_slice_history() -> None:
     logic = ReActLogic(tools=[read_file._tool_definition], max_history_messages=-1)
     messages = [
         {"role": "user", "content": "m1"},
@@ -39,9 +39,11 @@ def test_build_request_applies_max_history_limit() -> None:
         max_iterations=5,
         vars={"_limits": {"max_history_messages": 1}},
     )
+    # History slicing is now handled by the runtime-owned ActiveContextPolicy.
+    # Logic should treat the provided messages as the already-selected active view.
     assert "user: m3" in req.prompt
-    assert "assistant: m2" not in req.prompt
-    assert "user: m1" not in req.prompt
+    assert "assistant: m2" in req.prompt
+    assert "user: m1" in req.prompt
 
 
 def test_parse_response_reads_native_tool_calls() -> None:
@@ -56,4 +58,3 @@ def test_parse_response_reads_native_tool_calls() -> None:
     assert len(calls) == 1
     assert calls[0].name == "read_file"
     assert calls[0].arguments == {"path": "x"}
-

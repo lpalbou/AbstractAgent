@@ -29,9 +29,10 @@ def test_build_request_includes_codeact_instructions() -> None:
     )
     assert "You are CodeAct" in req.prompt
     assert "execute_python" in req.prompt
-    # With max_history_messages=1, only the last message is included.
+    # History slicing is now handled by the runtime-owned ActiveContextPolicy.
+    # Logic should treat the provided messages as the already-selected active view.
     assert "assistant: hello" in req.prompt
-    assert "user: hi" not in req.prompt
+    assert "user: hi" in req.prompt
 
 
 def test_format_observation_execute_python_dict() -> None:
@@ -43,4 +44,3 @@ def test_format_observation_execute_python_dict() -> None:
     )
     assert "stdout" in rendered
     assert "ok" in rendered
-

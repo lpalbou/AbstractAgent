@@ -54,25 +54,17 @@ class ReActLogic:
 
         # Get limits from vars if available, else use instance defaults
         limits = (vars or {}).get("_limits", {})
-        max_history = int(limits.get("max_history_messages", self._max_history_messages) or self._max_history_messages)
         max_tokens = limits.get("max_tokens", self._max_tokens)
         if max_tokens is not None:
             max_tokens = int(max_tokens)
 
-        if len(messages) <= 1:
+        history_text = "\n".join([f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages])
+        if not history_text:
             prompt = (
                 f"Task: {task}\n\n"
                 "Use the available tools to complete this task. When done, provide your final answer."
             )
         else:
-            # -1 means unlimited (use all messages)
-            if max_history == -1:
-                history = messages
-            else:
-                history = messages[-max_history:]
-            history_text = "\n".join(
-                [f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in history]
-            )
             prompt = (
                 "You have access to the conversation history below as context.\n"
                 "Do not claim you have no memory of it; it is provided to you here.\n\n"
@@ -123,4 +115,3 @@ class ReActLogic:
         if success:
             return f"[{name}]: {output}"
         return f"[{name}]: Error: {output}"
-

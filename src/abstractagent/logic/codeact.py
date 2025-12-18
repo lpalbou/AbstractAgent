@@ -61,16 +61,11 @@ class CodeActLogic:
 
         # Get limits from vars if available, else use instance defaults
         limits = (vars or {}).get("_limits", {})
-        max_history = int(limits.get("max_history_messages", self._max_history_messages) or self._max_history_messages)
         max_tokens = limits.get("max_tokens", self._max_tokens)
         if max_tokens is not None:
             max_tokens = int(max_tokens)
 
-        # -1 means unlimited (use all messages)
-        if max_history == -1:
-            history = messages if messages else []
-        else:
-            history = messages[-max_history:] if messages else []
+        history = messages if messages else []
         history_text = "\n".join(
             [f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in history]
         )
@@ -163,4 +158,3 @@ class CodeActLogic:
 
         rendered = "\n".join(parts).strip() or "(no output)"
         return f"[execute_python]: {rendered}"
-

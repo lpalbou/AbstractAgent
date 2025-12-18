@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 from abstractcore.tools import ToolCall
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
+from abstractruntime.memory.active_context import ActiveContextPolicy
 
 from ..logic.react import ReActLogic
 
@@ -162,7 +163,7 @@ def create_react_workflow(
         limits["current_iteration"] = iteration + 1
 
         task = str(context.get("task", "") or "")
-        messages = context["messages"]
+        messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
         inbox = runtime_ns.get("inbox", [])
         guidance = ""
@@ -173,7 +174,7 @@ def create_react_workflow(
 
         req = logic.build_request(
             task=task,
-            messages=messages,
+            messages=messages_view,
             guidance=guidance,
             iteration=iteration + 1,
             max_iterations=max_iterations,
@@ -228,28 +229,80 @@ def create_react_workflow(
         if not tool_calls:
             return StepPlan(node_id="act", next_node="reason")
 
-        # Handle ask_user specially with ASK_USER effect.
+        # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
         for i, tc in enumerate(tool_calls):
             if not isinstance(tc, dict):
                 continue
-            if tc.get("name") != "ask_user":
-                continue
+            name = tc.get("name")
             args = tc.get("arguments") or {}
-            question = str(args.get("question") or "Please provide input:")
-            choices = args.get("choices")
-            choices = list(choices) if isinstance(choices, list) else None
 
-            temp["pending_tool_calls"] = tool_calls[i + 1 :]
-            emit("ask_user", {"question": question, "choices": choices or []})
-            return StepPlan(
-                node_id="act",
-                effect=Effect(
-                    type=EffectType.ASK_USER,
-                    payload={"prompt": question, "choices": choices, "allow_free_text": True},
-                    result_key="_temp.user_response",
-                ),
-                next_node="handle_user_response",
-            )
+            if name == "ask_user":
+                question = str(args.get("question") or "Please provide input:")
+                choices = args.get("choices")
+                choices = list(choices) if isinstance(choices, list) else None
+
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                emit("ask_user", {"question": question, "choices": choices or []})
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.ASK_USER,
+                        payload={"prompt": question, "choices": choices, "allow_free_text": True},
+                        result_key="_temp.user_response",
+                    ),
+                    next_node="handle_user_response",
+                )
+
+            if name == "recall_memory":
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                payload = dict(args) if isinstance(args, dict) else {}
+                payload.setdefault("tool_name", "recall_memory")
+                payload.setdefault("call_id", tc.get("call_id") or "memory")
+                emit("memory_query", {"query": payload.get("query"), "span_id": payload.get("span_id")})
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.MEMORY_QUERY,
+                        payload=payload,
+                        result_key="_temp.tool_results",
+                    ),
+                    next_node="observe",
+                )
+
+            if name == "remember":
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                payload = dict(args) if isinstance(args, dict) else {}
+                payload.setdefault("tool_name", "remember")
+                payload.setdefault("call_id", tc.get("call_id") or "memory")
+                emit("memory_tag", {"span_id": payload.get("span_id"), "tags": payload.get("tags")})
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.MEMORY_TAG,
+                        payload=payload,
+                        result_key="_temp.tool_results",
+                    ),
+                    next_node="observe",
+                )
+
+            if name == "compact_memory":
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                payload = dict(args) if isinstance(args, dict) else {}
+                payload.setdefault("tool_name", "compact_memory")
+                payload.setdefault("call_id", tc.get("call_id") or "compact")
+                emit(
+                    "memory_compact",
+                    {"preserve_recent": payload.get("preserve_recent"), "mode": payload.get("compression_mode"), "focus": payload.get("focus")},
+                )
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.MEMORY_COMPACT,
+                        payload=payload,
+                        result_key="_temp.tool_results",
+                    ),
+                    next_node="observe",
+                )
 
         for tc in tool_calls:
             if isinstance(tc, dict):
