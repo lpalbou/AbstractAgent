@@ -34,6 +34,9 @@ class BaseAgent(ABC):
         runtime: Runtime,
         tools: Optional[List[Callable]] = None,
         on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        *,
+        actor_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         """Initialize the agent.
         
@@ -47,7 +50,33 @@ class BaseAgent(ABC):
         self.on_step = on_step
         self.workflow = self._create_workflow()
         self._current_run_id: Optional[str] = None
-    
+        self.actor_id: Optional[str] = actor_id
+        self.session_id: Optional[str] = session_id
+        self.session_messages: List[Dict[str, Any]] = []
+
+    def _ensure_actor_id(self) -> str:
+        if self.actor_id:
+            return self.actor_id
+
+        from abstractruntime.identity.fingerprint import ActorFingerprint
+        import uuid
+
+        fp = ActorFingerprint.from_metadata(
+            kind="agent",
+            display_name=self.__class__.__name__,
+            metadata={"nonce": uuid.uuid4().hex},
+        )
+        self.actor_id = fp.actor_id
+        return self.actor_id
+
+    def _ensure_session_id(self) -> str:
+        if self.session_id:
+            return self.session_id
+        import uuid
+
+        self.session_id = f"sess_{uuid.uuid4().hex}"
+        return self.session_id
+
     @abstractmethod
     def _create_workflow(self) -> WorkflowSpec:
         """Create the workflow specification for this agent type.
@@ -187,34 +216,65 @@ class BaseAgent(ABC):
             Current RunState
         """
         state = self.runtime.get_state(run_id)
+        if state.workflow_id != self.workflow.workflow_id:
+            raise ValueError(
+                f"Run workflow_id mismatch: run has '{state.workflow_id}', "
+                f"agent expects '{self.workflow.workflow_id}'."
+            )
+
+        if self.actor_id and state.actor_id and self.actor_id != state.actor_id:
+            raise ValueError(
+                f"Run actor_id mismatch: run has '{state.actor_id}', agent expects '{self.actor_id}'."
+            )
+        if self.actor_id is None and state.actor_id:
+            self.actor_id = state.actor_id
+
+        state_session_id = getattr(state, "session_id", None)
+        if self.session_id and state_session_id and self.session_id != state_session_id:
+            raise ValueError(
+                f"Run session_id mismatch: run has '{state_session_id}', agent expects '{self.session_id}'."
+            )
+        if self.session_id is None and state_session_id:
+            self.session_id = state_session_id
+
         self._current_run_id = run_id
         return state
     
     def save_state(self, filepath: str) -> None:
-        """Save current run_id to file for later resume.
+        """Save a run reference to file for later resume.
+
+        The full durable state is owned and persisted by AbstractRuntime's RunStore.
+        This method only stores the identifiers needed to re-attach on restart.
         
         Args:
             filepath: Path to save state file
         """
         import json
         from pathlib import Path
+        from abstractruntime.storage.in_memory import InMemoryRunStore
         
         if not self._current_run_id:
             raise RuntimeError("No active run to save.")
-        
-        state = self.get_state()
+
+        if isinstance(self.runtime.run_store, InMemoryRunStore):
+            raise RuntimeError(
+                "save_state requires a persistent RunStore (e.g. JsonFileRunStore); "
+                "the current runtime uses InMemoryRunStore which cannot resume across restarts."
+            )
+
         data = {
             "run_id": self._current_run_id,
-            "agent_type": self.__class__.__name__,
-            "status": state.status.value if state else "unknown",
-            "current_node": state.current_node if state else None,
-            "task": state.vars.get("task") if state else None,
+            "workflow_id": self.workflow.workflow_id,
+            "actor_id": self.actor_id,
+            "session_id": self._ensure_session_id(),
         }
         
         Path(filepath).write_text(json.dumps(data, indent=2))
     
     def load_state(self, filepath: str) -> Optional[RunState]:
-        """Load run_id from file and attach to it.
+        """Load run reference from file and attach to it.
+
+        The full durable state is loaded from AbstractRuntime's RunStore.
         
         Args:
             filepath: Path to state file
@@ -228,16 +288,42 @@ class BaseAgent(ABC):
         path = Path(filepath)
         if not path.exists():
             return None
-        
+
+        data = json.loads(path.read_text())
+        run_id = data.get("run_id")
+        if not run_id:
+            return None
+
+        workflow_id = data.get("workflow_id")
+        if workflow_id and workflow_id != self.workflow.workflow_id:
+            raise ValueError(
+                f"Saved workflow_id mismatch: file has '{workflow_id}', "
+                f"agent expects '{self.workflow.workflow_id}'."
+            )
+
+        actor_id = data.get("actor_id")
+        if actor_id and self.actor_id and actor_id != self.actor_id:
+            raise ValueError(
+                f"Saved actor_id mismatch: file has '{actor_id}', agent expects '{self.actor_id}'."
+            )
+        if actor_id and self.actor_id is None:
+            self.actor_id = actor_id
+
+        session_id = data.get("session_id")
+        if session_id and self.session_id and session_id != self.session_id:
+            raise ValueError(
+                f"Saved session_id mismatch: file has '{session_id}', agent expects '{self.session_id}'."
+            )
+        if session_id and self.session_id is None:
+            self.session_id = session_id
+
         try:
-            data = json.loads(path.read_text())
-            run_id = data.get("run_id")
-            if run_id:
-                return self.attach(run_id)
-        except (json.JSONDecodeError, KeyError):
-            pass
-        
-        return None
+            return self.attach(str(run_id))
+        except KeyError as e:
+            raise RuntimeError(
+                f"Saved run_id '{run_id}' was not found in the configured RunStore. "
+                "If you deleted/moved the store directory, this run cannot be resumed."
+            ) from e
     
     def clear_state(self, filepath: str) -> None:
         """Remove state file after completion.
@@ -291,13 +377,25 @@ class BaseAgent(ABC):
             raise RuntimeError("No active run.")
         
         state = self.runtime.get_state(self._current_run_id)
-        inbox = state.vars.get("_inbox", [])
-        inbox.append({
-            "type": "user_guidance",
-            "content": message,
-            "timestamp": self.runtime._ctx.now_iso() if hasattr(self.runtime._ctx, 'now_iso') else None,
-        })
-        state.vars["_inbox"] = inbox
+        runtime_ns = state.vars.get("_runtime")
+        if not isinstance(runtime_ns, dict):
+            runtime_ns = {}
+            state.vars["_runtime"] = runtime_ns
+
+        inbox = runtime_ns.get("inbox")
+        if not isinstance(inbox, list):
+            legacy = state.vars.get("_inbox")
+            inbox = legacy if isinstance(legacy, list) else []
+            runtime_ns["inbox"] = inbox
+
+        inbox.append(
+            {
+                "type": "user_guidance",
+                "content": message,
+                "timestamp": self.runtime._ctx.now_iso() if hasattr(self.runtime._ctx, "now_iso") else None,
+            }
+        )
+        state.vars.pop("_inbox", None)
         self.runtime._run_store.save(state)
     
     def get_output(self) -> Optional[Dict[str, Any]]:
