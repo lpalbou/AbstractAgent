@@ -135,6 +135,43 @@ class BaseAgent(ABC):
         if not self._current_run_id:
             return None
         return self.runtime.get_state(self._current_run_id)
+
+    def get_context(self) -> Dict[str, Any]:
+        """Get the agent's current context namespace (runtime-owned persisted state)."""
+        state = self.get_state()
+        ctx = state.vars.get("context") if state and hasattr(state, "vars") else None
+        return dict(ctx) if isinstance(ctx, dict) else {}
+
+    def get_scratchpad(self) -> Dict[str, Any]:
+        """Get the agent's current scratchpad namespace (agent-owned schema, runtime-owned storage)."""
+        state = self.get_state()
+        scratch = state.vars.get("scratchpad") if state and hasattr(state, "vars") else None
+        return dict(scratch) if isinstance(scratch, dict) else {}
+
+    def get_node_traces(self) -> Dict[str, Any]:
+        """Get runtime-owned per-node traces for the current run (passthrough to Runtime)."""
+        if not self._current_run_id:
+            return {}
+        getter = getattr(self.runtime, "get_node_traces", None)
+        if callable(getter):
+            return getter(self._current_run_id)
+        state = self.get_state()
+        runtime_ns = state.vars.get("_runtime") if state and hasattr(state, "vars") else None
+        traces = runtime_ns.get("node_traces") if isinstance(runtime_ns, dict) else None
+        return dict(traces) if isinstance(traces, dict) else {}
+
+    def get_node_trace(self, node_id: str) -> Dict[str, Any]:
+        """Get a single runtime-owned node trace for the current run."""
+        if not self._current_run_id:
+            return {"node_id": node_id, "steps": []}
+        getter = getattr(self.runtime, "get_node_trace", None)
+        if callable(getter):
+            return getter(self._current_run_id, node_id)
+        traces = self.get_node_traces()
+        trace = traces.get(node_id)
+        if isinstance(trace, dict):
+            return trace
+        return {"node_id": node_id, "steps": []}
     
     def is_waiting(self) -> bool:
         """Check if agent is waiting for input.
