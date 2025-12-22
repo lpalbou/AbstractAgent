@@ -139,24 +139,6 @@ def create_react_workflow(
         # Default allowlist: the tools the logic provided (defense-in-depth vs executor having extra tools).
         allowlist = [str(t.name) for t in tool_defs if getattr(t, "name", None)]
 
-    def _tool_guardrails(tools: list[str]) -> str:
-        if not tools:
-            return ""
-        tools_list = ", ".join(tools)
-        return (
-            "You are an autonomous agent running inside a workflow engine.\n"
-            f"You may ONLY use these tools: {tools_list}\n\n"
-            "Rules:\n"
-            "- You do not have direct access to the filesystem/web/shell; tools are the only way.\n"
-            "- If the task requires inspecting external state (filesystem, commands, web), you MUST call tools.\n"
-            "- If the task asks you to explore a directory / list files, you MUST call `list_files` first (do not guess paths).\n"
-            "- Only call `read_file` on paths that were returned by `list_files` or explicitly provided by the user.\n"
-            "- Never claim you listed/read/executed something unless it appears in tool results.\n"
-            "- When you decide to call a tool, output ONLY the tool call (no extra commentary).\n"
-            "- After tool results are provided, continue the task.\n"
-            "- Final answer MUST be a user-facing response (no role-prefixed logs like 'tool:'; do not paste raw tool output).\n"
-        )
-
     def init_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_react_vars(run)
         scratchpad["iteration"] = 0
@@ -225,9 +207,6 @@ def create_react_workflow(
         tools_payload = [t.to_dict() for t in req.tools]
         if tools_payload:
             payload["tools"] = tools_payload
-            guardrails = _tool_guardrails([str(t.get("name") or "").strip() for t in tools_payload if isinstance(t, dict)])
-            if guardrails:
-                payload["system_prompt"] = guardrails
         if isinstance(provider, str) and provider.strip():
             payload["provider"] = provider.strip()
         if isinstance(model, str) and model.strip():
@@ -462,21 +441,42 @@ def create_react_workflow(
         """
         context, _, _, _, _ = ensure_react_vars(run)
         task = str(context.get("task", "") or "")
-        messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
+        # NOTE: We intentionally use a prompt-only synthesis request (instead of
+        # passing message dicts) because host messages can contain extra metadata
+        # fields that some providers/models don't accept.
+        #
+        # We also keep the prompt small: include only the most recent tool outputs.
+        messages = list(context.get("messages") or [])
+        tool_msgs: list[str] = []
+        for m in reversed(messages):
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") != "tool":
+                continue
+            content = m.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            tool_msgs.append(content.strip())
+            if len(tool_msgs) >= 6:
+                break
+        tool_msgs.reverse()
 
-        emit("finalize", {"has_messages": bool(messages_view)})
+        obs_blocks: list[str] = []
+        for t in tool_msgs:
+            # Prevent prompt bloat from huge file reads.
+            obs_blocks.append(t if len(t) <= 2500 else (t[:2500] + "…"))
 
-        system_prompt = (
-            "You are producing the FINAL user-facing answer.\n"
-            "Use the tool observations provided in the conversation.\n"
-            "Do NOT include tool transcripts or role prefixes (no lines starting with 'tool:'),\n"
-            "and do NOT paste raw file contents unless explicitly asked.\n"
-            "Answer the user's task directly and concisely.\n"
+        observations = "\n\n".join(obs_blocks) if obs_blocks else "(no tool observations captured)"
+        prompt = (
+            "Write the final user-facing answer.\n\n"
+            f"Task:\n{task}\n\n"
+            f"Observations (tool outputs):\n{observations}\n\n"
+            "Answer:\n"
         )
-        if task:
-            system_prompt += f"\nTask:\n{task}\n"
 
-        payload: Dict[str, Any] = {"messages": messages_view, "system_prompt": system_prompt, "params": {"temperature": 0.2}}
+        emit("finalize", {"tool_messages": len(tool_msgs)})
+
+        payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
         if isinstance(provider, str) and provider.strip():
             payload["provider"] = provider.strip()
         if isinstance(model, str) and model.strip():
