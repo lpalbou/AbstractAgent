@@ -5,7 +5,7 @@ Agent implementations using AbstractRuntime and AbstractCore.
 ## Features
 
 - **ReAct Agent**: Reason-Act-Observe loop with tool calling
-- **Async REPL**: Interactive agent with real-time step visibility
+- **Host UX in AbstractCode**: the interactive terminal shell lives in **AbstractCode**; AbstractAgent stays focused on agent patterns/workflows
 - **Pause/Resume**: Durable agent state with interrupt/resume capability
 - **Ask User**: Agent can ask questions with multiple choice + free text
 - **Ledger Recording**: All tool calls recorded for auditability
@@ -89,11 +89,11 @@ state = agent.run_to_completion()
 agent.clear_state("agent_state.json")
 ```
 
-## REPL Usage
+## Interactive Shell (AbstractCode)
 
 ```bash
-# Start the ReAct agent REPL
-python -m abstractagent.repl --provider ollama --model qwen3:4b-instruct-2507-q4_K_M
+# The interactive REPL moved to AbstractCode (host UX).
+abstractcode --agent react --provider ollama --model qwen3:4b-instruct-2507-q4_K_M
 ```
 
 ## Architecture
@@ -114,8 +114,7 @@ AbstractAgent
 
 ## Available Tools
 
-- `list_files(path)` - List files and directories
-- `read_file(path)` - Read file contents
-- `search_files(pattern, path)` - Search for files matching a glob pattern
-- `execute_command(command)` - Execute a shell command (with safety restrictions)
-- `ask_user(question, choices)` - Ask the user a question (built-in)
+- Default tool callables are re-exported from AbstractCore in `abstractagent.tools` (file ops, web tools, `execute_command`), plus:
+  - `execute_python(code, timeout_s=...)`
+  - `self_improve(suggestion, ...)`
+- The agent also exposes schema-only built-ins (`ask_user`, `recall_memory`, `remember`, `compact_memory`) which are translated into **Runtime effects** by the workflow adapters (durable; no callable persistence).

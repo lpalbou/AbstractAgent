@@ -5,6 +5,11 @@ All notable changes to AbstractAgent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Documentation: clarify that the interactive REPL moved to **AbstractCode**; `react-agent`/`python -m abstractagent.repl` are deprecated shims.
+
 ## [0.2.0] - 2025-12-17
 
 ### Features

@@ -95,6 +95,13 @@ def ensure_react_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Di
     if scratchpad["max_iterations"] < 1:
         scratchpad["max_iterations"] = 1
 
+    # Track whether any external tools were actually executed during this run.
+    # This is used to reliably trigger a final "synthesis" pass so the agent
+    # returns a user-facing answer instead of echoing tool observations.
+    used_tools = scratchpad.get("used_tools")
+    if not isinstance(used_tools, bool):
+        scratchpad["used_tools"] = bool(used_tools) if used_tools is not None else False
+
     return context, scratchpad, runtime_ns, temp, limits
 
 
@@ -109,6 +116,10 @@ def create_react_workflow(
     *,
     logic: ReActLogic,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    workflow_id: str = "react_agent",
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    allowed_tools: Optional[List[str]] = None,
 ) -> WorkflowSpec:
     """Adapt ReActLogic to an AbstractRuntime workflow."""
 
@@ -119,6 +130,32 @@ def create_react_workflow(
     tool_defs = logic.tools
     tool_specs = [t.to_dict() for t in tool_defs]
     toolset_id = _compute_toolset_id(tool_specs)
+    allowlist: Optional[list[str]] = None
+    if isinstance(allowed_tools, list):
+        allowlist = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
+        if not allowlist:
+            allowlist = []
+    else:
+        # Default allowlist: the tools the logic provided (defense-in-depth vs executor having extra tools).
+        allowlist = [str(t.name) for t in tool_defs if getattr(t, "name", None)]
+
+    def _tool_guardrails(tools: list[str]) -> str:
+        if not tools:
+            return ""
+        tools_list = ", ".join(tools)
+        return (
+            "You are an autonomous agent running inside a workflow engine.\n"
+            f"You may ONLY use these tools: {tools_list}\n\n"
+            "Rules:\n"
+            "- You do not have direct access to the filesystem/web/shell; tools are the only way.\n"
+            "- If the task requires inspecting external state (filesystem, commands, web), you MUST call tools.\n"
+            "- If the task asks you to explore a directory / list files, you MUST call `list_files` first (do not guess paths).\n"
+            "- Only call `read_file` on paths that were returned by `list_files` or explicitly provided by the user.\n"
+            "- Never claim you listed/read/executed something unless it appears in tool results.\n"
+            "- When you decide to call a tool, output ONLY the tool call (no extra commentary).\n"
+            "- After tool results are provided, continue the task.\n"
+            "- Final answer MUST be a user-facing response (no role-prefixed logs like 'tool:'; do not paste raw tool output).\n"
+        )
 
     def init_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_react_vars(run)
@@ -135,6 +172,7 @@ def create_react_workflow(
         # Ensure toolset metadata is present for audit/debug.
         runtime_ns.setdefault("tool_specs", tool_specs)
         runtime_ns.setdefault("toolset_id", toolset_id)
+        runtime_ns.setdefault("allowed_tools", list(allowlist or []))
         runtime_ns.setdefault("inbox", [])
 
         emit("init", {"task": task})
@@ -183,9 +221,23 @@ def create_react_workflow(
 
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
-        payload = {"prompt": req.prompt, "tools": [t.to_dict() for t in req.tools]}
+        payload = {"prompt": req.prompt}
+        tools_payload = [t.to_dict() for t in req.tools]
+        if tools_payload:
+            payload["tools"] = tools_payload
+            guardrails = _tool_guardrails([str(t.get("name") or "").strip() for t in tools_payload if isinstance(t, dict)])
+            if guardrails:
+                payload["system_prompt"] = guardrails
+        if isinstance(provider, str) and provider.strip():
+            payload["provider"] = provider.strip()
+        if isinstance(model, str) and model.strip():
+            payload["model"] = model.strip()
+        params: Dict[str, Any] = {}
         if req.max_tokens is not None:
-            payload["params"] = {"max_tokens": req.max_tokens}
+            params["max_tokens"] = req.max_tokens
+        # Tool calling is formatting-sensitive; bias toward deterministic output when tools are present.
+        params["temperature"] = 0.2 if tools_payload else 0.7
+        payload["params"] = params
 
         return StepPlan(
             node_id="reason",
@@ -198,7 +250,7 @@ def create_react_workflow(
         )
 
     def parse_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp, _ = ensure_react_vars(run)
+        context, scratchpad, _, temp, _ = ensure_react_vars(run)
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
 
@@ -218,6 +270,10 @@ def create_react_workflow(
             return StepPlan(node_id="parse", next_node="act")
 
         temp["final_answer"] = content
+        # If we used tools, always run a final "synthesis" LLM pass to produce a
+        # clean user-facing answer (models may otherwise echo tool transcript lines).
+        if bool(scratchpad.get("used_tools")):
+            return StepPlan(node_id="parse", next_node="finalize")
         return StepPlan(node_id="parse", next_node="done")
 
     def act_node(run: RunState, ctx) -> StepPlan:
@@ -229,12 +285,31 @@ def create_react_workflow(
         if not tool_calls:
             return StepPlan(node_id="act", next_node="reason")
 
+        builtin_effect_tools = {"ask_user", "recall_memory", "remember", "compact_memory"}
+
         # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
         for i, tc in enumerate(tool_calls):
             if not isinstance(tc, dict):
                 continue
             name = tc.get("name")
             args = tc.get("arguments") or {}
+
+            if isinstance(name, str) and name in builtin_effect_tools:
+                if isinstance(allowlist, list) and name not in allowlist:
+                    temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                    temp["tool_results"] = {
+                        "results": [
+                            {
+                                "call_id": str(tc.get("call_id") or ""),
+                                "name": name,
+                                "success": False,
+                                "output": None,
+                                "error": f"Tool '{name}' is not allowed for this agent",
+                            }
+                        ]
+                    }
+                    emit("act_blocked", {"tool": name})
+                    return StepPlan(node_id="act", next_node="observe")
 
             if name == "ask_user":
                 question = str(args.get("question") or "Please provide input:")
@@ -331,14 +406,14 @@ def create_react_workflow(
             node_id="act",
             effect=Effect(
                 type=EffectType.TOOL_CALLS,
-                payload={"tool_calls": formatted_calls},
+                payload={"tool_calls": formatted_calls, "allowed_tools": list(allowlist or [])},
                 result_key="_temp.tool_results",
             ),
             next_node="observe",
         )
 
     def observe_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp, _ = ensure_react_vars(run)
+        context, scratchpad, _, temp, _ = ensure_react_vars(run)
         tool_results = temp.get("tool_results", {})
         if not isinstance(tool_results, dict):
             tool_results = {}
@@ -346,6 +421,8 @@ def create_react_workflow(
         results = tool_results.get("results", [])
         if not isinstance(results, list):
             results = []
+        if results:
+            scratchpad["used_tools"] = True
 
         for r in results:
             if not isinstance(r, dict):
@@ -376,6 +453,56 @@ def create_react_workflow(
         temp.pop("tool_results", None)
         temp["pending_tool_calls"] = []
         return StepPlan(node_id="observe", next_node="reason")
+
+    def finalize_node(run: RunState, ctx) -> StepPlan:
+        """Final synthesis pass to ensure we return a user-facing answer.
+
+        This is intentionally tool-free: tools have already been executed, and we
+        want a single clean response that uses the observations.
+        """
+        context, _, _, _, _ = ensure_react_vars(run)
+        task = str(context.get("task", "") or "")
+        messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
+
+        emit("finalize", {"has_messages": bool(messages_view)})
+
+        system_prompt = (
+            "You are producing the FINAL user-facing answer.\n"
+            "Use the tool observations provided in the conversation.\n"
+            "Do NOT include tool transcripts or role prefixes (no lines starting with 'tool:'),\n"
+            "and do NOT paste raw file contents unless explicitly asked.\n"
+            "Answer the user's task directly and concisely.\n"
+        )
+        if task:
+            system_prompt += f"\nTask:\n{task}\n"
+
+        payload: Dict[str, Any] = {"messages": messages_view, "system_prompt": system_prompt, "params": {"temperature": 0.2}}
+        if isinstance(provider, str) and provider.strip():
+            payload["provider"] = provider.strip()
+        if isinstance(model, str) and model.strip():
+            payload["model"] = model.strip()
+
+        return StepPlan(
+            node_id="finalize",
+            effect=Effect(
+                type=EffectType.LLM_CALL,
+                payload=payload,
+                result_key="_temp.final_llm_response",
+            ),
+            next_node="finalize_parse",
+        )
+
+    def finalize_parse_node(run: RunState, ctx) -> StepPlan:
+        context, _, _, temp, _ = ensure_react_vars(run)
+        resp = temp.get("final_llm_response", {})
+        if not isinstance(resp, dict):
+            resp = {}
+        content = resp.get("content")
+        answer = "" if content is None else str(content)
+        emit("finalize_parse", {"content_preview": answer[:100] if answer else "(empty)"})
+        temp["final_answer"] = answer
+        temp.pop("final_llm_response", None)
+        return StepPlan(node_id="finalize_parse", next_node="done")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
         context, _, _, temp, _ = ensure_react_vars(run)
@@ -432,7 +559,7 @@ def create_react_workflow(
         )
 
     return WorkflowSpec(
-        workflow_id="react_agent",
+        workflow_id=str(workflow_id or "react_agent"),
         entry_node="init",
         nodes={
             "init": init_node,
@@ -441,6 +568,8 @@ def create_react_workflow(
             "act": act_node,
             "observe": observe_node,
             "handle_user_response": handle_user_response_node,
+            "finalize": finalize_node,
+            "finalize_parse": finalize_parse_node,
             "done": done_node,
             "max_iterations": max_iterations_node,
         },
