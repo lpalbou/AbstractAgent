@@ -207,10 +207,14 @@ def create_react_workflow(
         tools_payload = [t.to_dict() for t in req.tools]
         if tools_payload:
             payload["tools"] = tools_payload
-        if isinstance(provider, str) and provider.strip():
-            payload["provider"] = provider.strip()
-        if isinstance(model, str) and model.strip():
-            payload["model"] = model.strip()
+        # Provider/model can be configured statically (create_react_workflow args)
+        # or injected dynamically through durable vars in `_runtime` (Visual Agent pins).
+        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
+        if isinstance(eff_provider, str) and eff_provider.strip():
+            payload["provider"] = eff_provider.strip()
+        if isinstance(eff_model, str) and eff_model.strip():
+            payload["model"] = eff_model.strip()
         params: Dict[str, Any] = {}
         if req.max_tokens is not None:
             params["max_tokens"] = req.max_tokens
@@ -477,10 +481,12 @@ def create_react_workflow(
         emit("finalize", {"tool_messages": len(tool_msgs)})
 
         payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
-        if isinstance(provider, str) and provider.strip():
-            payload["provider"] = provider.strip()
-        if isinstance(model, str) and model.strip():
-            payload["model"] = model.strip()
+        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
+        if isinstance(eff_provider, str) and eff_provider.strip():
+            payload["provider"] = eff_provider.strip()
+        if isinstance(eff_model, str) and eff_model.strip():
+            payload["model"] = eff_model.strip()
 
         return StepPlan(
             node_id="finalize",
