@@ -128,8 +128,7 @@ def create_react_workflow(
             on_step(step, data)
 
     tool_defs = logic.tools
-    tool_specs = [t.to_dict() for t in tool_defs]
-    toolset_id = _compute_toolset_id(tool_specs)
+    tool_by_name = {t.name: t for t in tool_defs if getattr(t, "name", None)}
     allowlist: Optional[list[str]] = None
     if isinstance(allowed_tools, list):
         allowlist = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
@@ -138,6 +137,56 @@ def create_react_workflow(
     else:
         # Default allowlist: the tools the logic provided (defense-in-depth vs executor having extra tools).
         allowlist = [str(t.name) for t in tool_defs if getattr(t, "name", None)]
+
+    def _normalize_allowlist(raw: Any) -> list[str]:
+        items: list[Any]
+        if isinstance(raw, list):
+            items = raw
+        elif isinstance(raw, tuple):
+            items = list(raw)
+        elif isinstance(raw, str):
+            items = [raw]
+        else:
+            items = []
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for t in items:
+            if not isinstance(t, str):
+                continue
+            name = t.strip()
+            if not name:
+                continue
+            if name in seen:
+                continue
+            # Only accept tool names known to the workflow's logic.
+            if name not in tool_by_name:
+                continue
+            seen.add(name)
+            out.append(name)
+        return out
+
+    def _effective_allowlist(runtime_ns: Dict[str, Any]) -> list[str]:
+        # Allow runtime vars to override tool selection (Visual Agent tools pin).
+        if isinstance(runtime_ns, dict) and "allowed_tools" in runtime_ns:
+            normalized = _normalize_allowlist(runtime_ns.get("allowed_tools"))
+            runtime_ns["allowed_tools"] = normalized
+            return normalized
+        return _normalize_allowlist(list(allowlist or []))
+
+    def _allowed_tool_defs(allow: list[str]) -> list[Any]:
+        out: list[Any] = []
+        for name in allow:
+            tool = tool_by_name.get(name)
+            if tool is not None:
+                out.append(tool)
+        return out
+
+    def _system_prompt(runtime_ns: Dict[str, Any]) -> Optional[str]:
+        raw = runtime_ns.get("system_prompt") if isinstance(runtime_ns, dict) else None
+        if isinstance(raw, str) and raw.strip():
+            return raw
+        return None
 
     def init_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_react_vars(run)
@@ -152,9 +201,12 @@ def create_react_workflow(
             messages.append(_new_message(ctx, role="user", content=task))
 
         # Ensure toolset metadata is present for audit/debug.
-        runtime_ns.setdefault("tool_specs", tool_specs)
-        runtime_ns.setdefault("toolset_id", toolset_id)
-        runtime_ns.setdefault("allowed_tools", list(allowlist or []))
+        allow = _effective_allowlist(runtime_ns)
+        allowed_defs = _allowed_tool_defs(allow)
+        tool_specs = [t.to_dict() for t in allowed_defs]
+        runtime_ns["tool_specs"] = tool_specs
+        runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
+        runtime_ns.setdefault("allowed_tools", allow)
         runtime_ns.setdefault("inbox", [])
 
         emit("init", {"task": task})
@@ -204,9 +256,14 @@ def create_react_workflow(
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
         payload = {"prompt": req.prompt}
-        tools_payload = [t.to_dict() for t in req.tools]
+        allow = _effective_allowlist(runtime_ns)
+        allowed_defs = _allowed_tool_defs(allow)
+        tools_payload = [t.to_dict() for t in allowed_defs]
         if tools_payload:
             payload["tools"] = tools_payload
+        sys = _system_prompt(runtime_ns)
+        if sys is not None:
+            payload["system_prompt"] = sys
         # Provider/model can be configured statically (create_react_workflow args)
         # or injected dynamically through durable vars in `_runtime` (Visual Agent pins).
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
@@ -260,7 +317,7 @@ def create_react_workflow(
         return StepPlan(node_id="parse", next_node="done")
 
     def act_node(run: RunState, ctx) -> StepPlan:
-        _, _, _, temp, _ = ensure_react_vars(run)
+        _, _, runtime_ns, temp, _ = ensure_react_vars(run)
         tool_calls = temp.get("pending_tool_calls", [])
         if not isinstance(tool_calls, list):
             tool_calls = []
@@ -268,6 +325,7 @@ def create_react_workflow(
         if not tool_calls:
             return StepPlan(node_id="act", next_node="reason")
 
+        allow = _effective_allowlist(runtime_ns)
         builtin_effect_tools = {"ask_user", "recall_memory", "remember", "compact_memory"}
 
         # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
@@ -278,7 +336,7 @@ def create_react_workflow(
             args = tc.get("arguments") or {}
 
             if isinstance(name, str) and name in builtin_effect_tools:
-                if isinstance(allowlist, list) and name not in allowlist:
+                if name not in allow:
                     temp["pending_tool_calls"] = tool_calls[i + 1 :]
                     temp["tool_results"] = {
                         "results": [
@@ -389,7 +447,7 @@ def create_react_workflow(
             node_id="act",
             effect=Effect(
                 type=EffectType.TOOL_CALLS,
-                payload={"tool_calls": formatted_calls, "allowed_tools": list(allowlist or [])},
+                payload={"tool_calls": formatted_calls, "allowed_tools": list(allow)},
                 result_key="_temp.tool_results",
             ),
             next_node="observe",
@@ -443,7 +501,7 @@ def create_react_workflow(
         This is intentionally tool-free: tools have already been executed, and we
         want a single clean response that uses the observations.
         """
-        context, _, _, _, _ = ensure_react_vars(run)
+        context, _, runtime_ns, _, _ = ensure_react_vars(run)
         task = str(context.get("task", "") or "")
         # NOTE: We intentionally use a prompt-only synthesis request (instead of
         # passing message dicts) because host messages can contain extra metadata
@@ -481,6 +539,9 @@ def create_react_workflow(
         emit("finalize", {"tool_messages": len(tool_msgs)})
 
         payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
+        sys = _system_prompt(runtime_ns)
+        if sys is not None:
+            payload["system_prompt"] = sys
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
         eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
         if isinstance(eff_provider, str) and eff_provider.strip():
