@@ -6,7 +6,7 @@ import hashlib
 import json
 from typing import Any, Callable, Dict, List, Optional
 
-from abstractcore.tools import ToolCall
+from abstractcore.tools import ToolCall, ToolDefinition
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
@@ -115,8 +115,106 @@ def create_codeact_workflow(
             on_step(step, data)
 
     tool_defs = logic.tools
-    tool_specs = [t.to_dict() for t in tool_defs]
-    toolset_id = _compute_toolset_id(tool_specs)
+    default_allowlist = [str(t.name) for t in tool_defs if getattr(t, "name", None)]
+
+    def _normalize_allowlist(raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            val = raw.strip()
+            return [val] if val else []
+        if isinstance(raw, list):
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in raw:
+                if not isinstance(item, str):
+                    continue
+                name = item.strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                out.append(name)
+            return out
+        return []
+
+    def _effective_allowlist(runtime_ns: Dict[str, Any]) -> list[str]:
+        if isinstance(runtime_ns, dict) and "allowed_tools" in runtime_ns:
+            normalized = _normalize_allowlist(runtime_ns.get("allowed_tools"))
+            runtime_ns["allowed_tools"] = normalized
+            return normalized
+        return list(default_allowlist)
+
+    def _allowed_tool_defs(allowlist: list[str]) -> list[ToolDefinition]:
+        tool_by_name = {str(t.name): t for t in tool_defs if getattr(t, "name", None)}
+        out: list[ToolDefinition] = []
+        for name in allowlist:
+            tool = tool_by_name.get(name)
+            if tool is not None:
+                out.append(tool)
+        return out
+
+    def _system_prompt(runtime_ns: Dict[str, Any]) -> Optional[str]:
+        raw = runtime_ns.get("system_prompt") if isinstance(runtime_ns, dict) else None
+        if isinstance(raw, str) and raw.strip():
+            return raw
+        return None
+
+    def _flag(runtime_ns: Dict[str, Any], key: str, *, default: bool = False) -> bool:
+        if not isinstance(runtime_ns, dict) or key not in runtime_ns:
+            return bool(default)
+        val = runtime_ns.get(key)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            lowered = val.strip().lower()
+            if lowered in ("1", "true", "yes", "on", "enabled"):
+                return True
+            if lowered in ("0", "false", "no", "off", "disabled"):
+                return False
+        return bool(default)
+
+    def _int(runtime_ns: Dict[str, Any], key: str, *, default: int) -> int:
+        if not isinstance(runtime_ns, dict) or key not in runtime_ns:
+            return int(default)
+        val = runtime_ns.get(key)
+        try:
+            return int(val)  # type: ignore[arg-type]
+        except Exception:
+            return int(default)
+
+    def _extract_plan_update(content: str) -> Optional[str]:
+        """Extract a plan update block from model content (best-effort).
+
+        Convention (prompted in Plan mode): the model appends a final section:
+
+            Plan Update:
+            - [ ] ...
+            - [x] ...
+        """
+        if not isinstance(content, str) or not content.strip():
+            return None
+
+        import re
+
+        lines = content.splitlines()
+        header_idx: Optional[int] = None
+        for i, line in enumerate(lines):
+            if re.match(r"(?i)^\s*plan\s*update\s*:\s*$", line.strip()):
+                header_idx = i
+        if header_idx is None:
+            return None
+
+        plan_lines = lines[header_idx + 1 :]
+        while plan_lines and not plan_lines[0].strip():
+            plan_lines.pop(0)
+        plan_text = "\n".join(plan_lines).strip()
+        if not plan_text:
+            return None
+        if not re.search(r"(?m)^\s*(?:[-*]|\d+\.)\s+", plan_text):
+            return None
+        return plan_text
 
     def init_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_codeact_vars(run)
@@ -129,12 +227,69 @@ def create_codeact_workflow(
         if task and (not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != task):
             messages.append(_new_message(ctx, role="user", content=task))
 
-        runtime_ns.setdefault("tool_specs", tool_specs)
-        runtime_ns.setdefault("toolset_id", toolset_id)
+        allow = _effective_allowlist(runtime_ns)
+        allowed_defs = _allowed_tool_defs(allow)
+        runtime_ns["tool_specs"] = [t.to_dict() for t in allowed_defs]
+        runtime_ns["toolset_id"] = _compute_toolset_id(runtime_ns["tool_specs"])
+        runtime_ns.setdefault("allowed_tools", allow)
         runtime_ns.setdefault("inbox", [])
 
         emit("init", {"task": task})
+        if _flag(runtime_ns, "plan_mode", default=False) and not isinstance(scratchpad.get("plan"), str):
+            return StepPlan(node_id="init", next_node="plan")
         return StepPlan(node_id="init", next_node="reason")
+
+    def plan_node(run: RunState, ctx) -> StepPlan:
+        context, scratchpad, runtime_ns, _, _ = ensure_codeact_vars(run)
+        task = str(context.get("task", "") or "")
+
+        allow = _effective_allowlist(runtime_ns)
+        tools_summary = ", ".join(allow) if allow else "(no tools)"
+
+        prompt = (
+            "You are preparing a high-level execution plan for the user's request.\n"
+            "Return a concise TODO list (5–12 steps) that is actionable and verifiable.\n"
+            "Do not call tools yet. Do not include role prefixes like 'assistant:'.\n\n"
+            f"Available tools: {tools_summary}\n\n"
+            f"User request:\n{task}\n\n"
+            "Plan (markdown checklist):\n"
+            "- [ ] ...\n"
+        )
+
+        emit("plan_request", {"tools": allow})
+
+        payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
+        sys = _system_prompt(runtime_ns)
+        if sys is not None:
+            payload["system_prompt"] = sys
+
+        return StepPlan(
+            node_id="plan",
+            effect=Effect(
+                type=EffectType.LLM_CALL,
+                payload=payload,
+                result_key="_temp.plan_llm_response",
+            ),
+            next_node="plan_parse",
+        )
+
+    def plan_parse_node(run: RunState, ctx) -> StepPlan:
+        context, scratchpad, _, temp, _ = ensure_codeact_vars(run)
+        resp = temp.get("plan_llm_response", {})
+        if not isinstance(resp, dict):
+            resp = {}
+        plan_text = resp.get("content")
+        plan = "" if plan_text is None else str(plan_text).strip()
+        if not plan and isinstance(resp.get("data"), dict):
+            plan = json.dumps(resp.get("data"), ensure_ascii=False, indent=2).strip()
+
+        scratchpad["plan"] = plan
+        temp.pop("plan_llm_response", None)
+
+        if plan:
+            context["messages"].append(_new_message(ctx, role="assistant", content=plan, metadata={"kind": "plan"}))
+        emit("plan", {"plan": plan})
+        return StepPlan(node_id="plan_parse", next_node="reason")
 
     def reason_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_codeact_vars(run)
@@ -178,7 +333,12 @@ def create_codeact_workflow(
 
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
-        payload = {"prompt": req.prompt, "tools": [t.to_dict() for t in req.tools]}
+        allow = _effective_allowlist(runtime_ns)
+        allowed_defs = _allowed_tool_defs(allow)
+        payload: Dict[str, Any] = {"prompt": req.prompt, "tools": [t.to_dict() for t in allowed_defs]}
+        sys = _system_prompt(runtime_ns)
+        if sys is not None:
+            payload["system_prompt"] = sys
         if req.max_tokens is not None:
             payload["params"] = {"max_tokens": req.max_tokens}
 
@@ -193,12 +353,16 @@ def create_codeact_workflow(
         )
 
     def parse_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp, _ = ensure_codeact_vars(run)
+        context, scratchpad, runtime_ns, temp, _ = ensure_codeact_vars(run)
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
 
         if content:
             context["messages"].append(_new_message(ctx, role="assistant", content=content))
+            if _flag(runtime_ns, "plan_mode", default=False):
+                updated = _extract_plan_update(content)
+                if isinstance(updated, str) and updated.strip():
+                    scratchpad["plan"] = updated.strip()
 
         temp.pop("llm_response", None)
         emit("parse", {"has_tool_calls": bool(tool_calls), "content_preview": (content[:100] if content else "(no content)")})
@@ -213,10 +377,10 @@ def create_codeact_workflow(
             return StepPlan(node_id="parse", next_node="execute_code")
 
         temp["final_answer"] = content
-        return StepPlan(node_id="parse", next_node="done")
+        return StepPlan(node_id="parse", next_node="maybe_review")
 
     def act_node(run: RunState, ctx) -> StepPlan:
-        _, _, _, temp, _ = ensure_codeact_vars(run)
+        _, _, runtime_ns, temp, _ = ensure_codeact_vars(run)
         tool_calls = temp.get("pending_tool_calls", [])
         if not isinstance(tool_calls, list):
             tool_calls = []
@@ -330,11 +494,12 @@ def create_codeact_workflow(
                     {"name": tc.name, "arguments": tc.arguments, "call_id": tc.call_id or "1"}
                 )
 
+        allow = _effective_allowlist(runtime_ns)
         return StepPlan(
             node_id="act",
             effect=Effect(
                 type=EffectType.TOOL_CALLS,
-                payload={"tool_calls": formatted_calls},
+                payload={"tool_calls": formatted_calls, "allowed_tools": list(allow)},
                 result_key="_temp.tool_results",
             ),
             next_node="observe",
@@ -394,7 +559,7 @@ def create_codeact_workflow(
             preview = rendered
             if len(preview) > 1000:
                 preview = preview[:1000] + f"\n… (truncated, {len(rendered):,} chars total)"
-            emit("observe", {"tool": name, "result": preview})
+            emit("observe", {"tool": name, "success": success, "result": preview})
             context["messages"].append(
                 _new_message(
                     ctx,
@@ -422,6 +587,125 @@ def create_codeact_workflow(
         if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
         return StepPlan(node_id="handle_user_response", next_node="reason")
+
+    def maybe_review_node(run: RunState, ctx) -> StepPlan:
+        _, scratchpad, runtime_ns, _, _ = ensure_codeact_vars(run)
+
+        if not _flag(runtime_ns, "review_mode", default=False):
+            return StepPlan(node_id="maybe_review", next_node="done")
+
+        max_rounds = _int(runtime_ns, "review_max_rounds", default=1)
+        if max_rounds < 0:
+            max_rounds = 0
+        count = scratchpad.get("review_count")
+        try:
+            count_int = int(count or 0)
+        except Exception:
+            count_int = 0
+
+        if count_int >= max_rounds:
+            return StepPlan(node_id="maybe_review", next_node="done")
+
+        scratchpad["review_count"] = count_int + 1
+        return StepPlan(node_id="maybe_review", next_node="review")
+
+    def review_node(run: RunState, ctx) -> StepPlan:
+        context, scratchpad, runtime_ns, _, _ = ensure_codeact_vars(run)
+        task = str(context.get("task", "") or "")
+        plan = scratchpad.get("plan")
+        plan_text = str(plan).strip() if isinstance(plan, str) and plan.strip() else "(no plan)"
+        answer = str(run.vars.get("_temp", {}).get("final_answer") or "")
+
+        messages = list(context.get("messages") or [])
+        tool_msgs: list[str] = []
+        for m in reversed(messages):
+            if not isinstance(m, dict) or m.get("role") != "tool":
+                continue
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                tool_msgs.append(content.strip())
+            if len(tool_msgs) >= 8:
+                break
+        tool_msgs.reverse()
+        observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool observations)"
+
+        prompt = (
+            "Review whether the user's request has been fully satisfied.\n"
+            "Be strict: only count actions that are supported by Observations.\n"
+            "If anything is missing, propose the next self-instruction to complete it.\n"
+            "Return JSON ONLY.\n\n"
+            f"User request:\n{task}\n\n"
+            f"Plan:\n{plan_text}\n\n"
+            f"Current answer:\n{answer}\n\n"
+            f"Observations (tool outputs):\n{observations}\n\n"
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "complete": {"type": "boolean"},
+                "missing": {"type": "array", "items": {"type": "string"}},
+                "next_prompt": {"type": "string"},
+            },
+            "required": ["complete", "missing", "next_prompt"],
+            "additionalProperties": False,
+        }
+
+        emit("review_request", {"tool_messages": len(tool_msgs)})
+
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "response_schema": schema,
+            "response_schema_name": "CodeActReview",
+            "params": {"temperature": 0.2},
+        }
+        sys = _system_prompt(runtime_ns)
+        if sys is not None:
+            payload["system_prompt"] = sys
+
+        return StepPlan(
+            node_id="review",
+            effect=Effect(
+                type=EffectType.LLM_CALL,
+                payload=payload,
+                result_key="_temp.review_llm_response",
+            ),
+            next_node="review_parse",
+        )
+
+    def review_parse_node(run: RunState, ctx) -> StepPlan:
+        _, _, runtime_ns, temp, _ = ensure_codeact_vars(run)
+        resp = temp.get("review_llm_response", {})
+        if not isinstance(resp, dict):
+            resp = {}
+
+        data = resp.get("data")
+        if data is None and isinstance(resp.get("content"), str):
+            try:
+                data = json.loads(resp["content"])
+            except Exception:
+                data = None
+        if not isinstance(data, dict):
+            data = {}
+
+        complete = bool(data.get("complete"))
+        missing = data.get("missing") if isinstance(data.get("missing"), list) else []
+        next_prompt = data.get("next_prompt")
+        next_prompt_text = str(next_prompt or "").strip()
+
+        emit("review", {"complete": complete, "missing": missing})
+        temp.pop("review_llm_response", None)
+
+        if complete:
+            return StepPlan(node_id="review_parse", next_node="done")
+
+        if next_prompt_text:
+            inbox = runtime_ns.get("inbox")
+            if not isinstance(inbox, list):
+                inbox = []
+                runtime_ns["inbox"] = inbox
+            inbox.append({"content": f"[Review] {next_prompt_text}"})
+        return StepPlan(node_id="review_parse", next_node="reason")
 
     def done_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, _, temp, limits = ensure_codeact_vars(run)
@@ -465,12 +749,17 @@ def create_codeact_workflow(
         entry_node="init",
         nodes={
             "init": init_node,
+            "plan": plan_node,
+            "plan_parse": plan_parse_node,
             "reason": reason_node,
             "parse": parse_node,
             "act": act_node,
             "execute_code": execute_code_node,
             "observe": observe_node,
             "handle_user_response": handle_user_response_node,
+            "maybe_review": maybe_review_node,
+            "review": review_node,
+            "review_parse": review_parse_node,
             "done": done_node,
             "max_iterations": max_iterations_node,
         },

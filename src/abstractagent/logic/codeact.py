@@ -65,6 +65,12 @@ class CodeActLogic:
         if max_tokens is not None:
             max_tokens = int(max_tokens)
 
+        runtime_ns = (vars or {}).get("_runtime", {})
+        scratchpad = (vars or {}).get("scratchpad", {})
+        plan_mode = bool(runtime_ns.get("plan_mode")) if isinstance(runtime_ns, dict) else False
+        plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
+        plan = str(plan_text).strip() if isinstance(plan_text, str) and plan_text.strip() else ""
+
         history = messages if messages else []
         history_text = "\n".join(
             [f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in history]
@@ -74,6 +80,8 @@ class CodeActLogic:
             "You are CodeAct: you can solve tasks by writing and executing Python code.\n"
             "Use the tool `execute_python` to run Python snippets. Prefer small, focused scripts.\n"
             "Print any intermediate results you need.\n"
+            "Be autonomous: do not ask the user for confirmation to proceed; keep going until the task is done.\n"
+            "Only ask the user a question when required information is missing.\n"
             "When you are confident, provide the final answer without calling tools.\n\n"
             f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
             f"Task: {task}\n\n"
@@ -83,6 +91,17 @@ class CodeActLogic:
 
         if guidance:
             prompt += f"[User guidance]: {guidance}\n\n"
+
+        if plan_mode and plan:
+            prompt += (
+                "Plan mode (enabled):\n"
+                "- Maintain and update the plan as you work (mark steps done, add/remove steps if needed).\n"
+                "- If the plan changes, include a final section at the END of your message:\n"
+                "  Plan Update:\n"
+                "  <markdown checklist>\n"
+                "- Do not stop until the plan is complete.\n\n"
+                f"Current plan:\n{plan}\n\n"
+            )
 
         prompt += (
             "If you need to run code, either:\n"
@@ -116,11 +135,18 @@ class CodeActLogic:
         # FALLBACK: Parse from content if no native tool calls
         # Handles <|tool_call|>, <function_call>, ```tool_code, etc.
         if not tool_calls and content:
-            from abstractcore.tools.parser import parse_tool_calls, detect_tool_calls
+            from abstractcore.tools.parser import parse_tool_calls, detect_tool_calls, clean_tool_syntax
             if detect_tool_calls(content):
                 # Pass model name for architecture-specific parsing
                 model_name = response.get("model")
                 tool_calls = parse_tool_calls(content, model_name=model_name)
+                if tool_calls:
+                    content = clean_tool_syntax(content, tool_calls)
+        elif tool_calls and content:
+            # Some providers include tool-call markup in `content` even when tool_calls
+            # are populated; strip it to avoid polluting history/UI.
+            from abstractcore.tools.parser import clean_tool_syntax
+            content = clean_tool_syntax(content, tool_calls)
 
         return content, tool_calls
 

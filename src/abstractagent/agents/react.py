@@ -55,6 +55,9 @@ class ReactAgent(BaseAgent):
         max_iterations: int = 25,
         max_history_messages: int = -1,
         max_tokens: Optional[int] = 32768,
+        plan_mode: bool = False,
+        review_mode: bool = False,
+        review_max_rounds: int = 1,
         actor_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
@@ -66,6 +69,11 @@ class ReactAgent(BaseAgent):
         if self._max_history_messages != -1 and self._max_history_messages < 1:
             self._max_history_messages = 1
         self._max_tokens = max_tokens
+        self._plan_mode = bool(plan_mode)
+        self._review_mode = bool(review_mode)
+        self._review_max_rounds = int(review_max_rounds)
+        if self._review_max_rounds < 0:
+            self._review_max_rounds = 0
 
         self.logic: Optional[ReActLogic] = None
         super().__init__(
@@ -89,15 +97,33 @@ class ReactAgent(BaseAgent):
         self.logic = logic
         return create_react_workflow(logic=logic, on_step=self.on_step)
 
-    def start(self, task: str) -> str:
+    def start(
+        self,
+        task: str,
+        *,
+        plan_mode: Optional[bool] = None,
+        review_mode: Optional[bool] = None,
+        review_max_rounds: Optional[int] = None,
+    ) -> str:
         task = str(task or "").strip()
         if not task:
             raise ValueError("task must be a non-empty string")
 
+        eff_plan_mode = self._plan_mode if plan_mode is None else bool(plan_mode)
+        eff_review_mode = self._review_mode if review_mode is None else bool(review_mode)
+        eff_review_max_rounds = self._review_max_rounds if review_max_rounds is None else int(review_max_rounds)
+        if eff_review_max_rounds < 0:
+            eff_review_max_rounds = 0
+
         vars: Dict[str, Any] = {
             "context": {"task": task, "messages": _copy_messages(self.session_messages)},
             "scratchpad": {"iteration": 0, "max_iterations": int(self._max_iterations)},
-            "_runtime": {"inbox": []},
+            "_runtime": {
+                "inbox": [],
+                "plan_mode": eff_plan_mode,
+                "review_mode": eff_review_mode,
+                "review_max_rounds": eff_review_max_rounds,
+            },
             "_temp": {},
             # Canonical _limits namespace for runtime awareness
             "_limits": {
@@ -166,6 +192,9 @@ def create_react_agent(
     max_iterations: int = 25,
     max_history_messages: int = -1,
     max_tokens: Optional[int] = 32768,
+    plan_mode: bool = False,
+    review_mode: bool = False,
+    review_max_rounds: int = 1,
     llm_kwargs: Optional[Dict[str, Any]] = None,
     run_store: Optional[Any] = None,
     ledger_store: Optional[Any] = None,
@@ -197,6 +226,9 @@ def create_react_agent(
         max_iterations=max_iterations,
         max_history_messages=max_history_messages,
         max_tokens=max_tokens,
+        plan_mode=plan_mode,
+        review_mode=review_mode,
+        review_max_rounds=review_max_rounds,
         actor_id=actor_id,
         session_id=session_id,
     )

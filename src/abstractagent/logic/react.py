@@ -58,6 +58,12 @@ class ReActLogic:
         if max_tokens is not None:
             max_tokens = int(max_tokens)
 
+        runtime_ns = (vars or {}).get("_runtime", {})
+        scratchpad = (vars or {}).get("scratchpad", {})
+        plan_mode = bool(runtime_ns.get("plan_mode")) if isinstance(runtime_ns, dict) else False
+        plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
+        plan = str(plan_text).strip() if isinstance(plan_text, str) and plan_text.strip() else ""
+
         history_text = "\n".join([f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages])
         if not history_text:
             prompt = (
@@ -77,11 +83,24 @@ class ReActLogic:
         prompt += (
             "\n\nRules:\n"
             "- Be truthful: only claim actions that are supported by tool outputs in History.\n"
+            "- Be autonomous: do not ask the user for confirmation to proceed. Keep going until the task is done.\n"
+            "- Only ask the user a question when required information is missing.\n"
             "- Before calling a tool, write 1–3 short lines explaining what you will do and why.\n"
             "- After tool results, continue from the new information; do not repeat successful tool calls with the same args.\n"
             "- For file work, prefer file tools (write_file/edit_file) and verify with list_files/read_file.\n"
             "- Do not prefix your messages with role labels like 'assistant:'.\n"
         )
+
+        if plan_mode and plan:
+            prompt += (
+                "\n\nPlan mode (enabled):\n"
+                "- Maintain and update the plan as you work (mark steps done, add/remove steps if needed).\n"
+                "- If the plan changes, include a final section at the END of your message:\n"
+                "  Plan Update:\n"
+                "  <markdown checklist>\n"
+                "- Do not stop until the plan is complete.\n\n"
+                f"Current plan:\n{plan}\n"
+            )
 
         if guidance:
             prompt += "\n\n[User guidance]: " + guidance
