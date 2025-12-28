@@ -75,13 +75,45 @@ RECALL_MEMORY_TOOL = ToolDefinition(
         },
         "max_messages": {
             "type": "integer",
-            "description": "Maximum total messages to render in the recall output across all spans (default 80).",
-            "default": 80,
+            "description": "Maximum total messages to render in the recall output across all spans (-1 = no truncation).",
+            "default": -1,
         },
     },
     when_to_use=(
         "When conversation history was compacted/summarized and you need the original messages, "
         "or when you need exact details from prior discussions."
+    ),
+)
+
+INSPECT_VARS_TOOL = ToolDefinition(
+    name="inspect_vars",
+    description=(
+        "Inspect durable run state variables (especially scratchpad) by path. "
+        "Use this for progressive recall/debugging when you need to see what the workflow/agent stored "
+        "outside of the active conversation context."
+    ),
+    parameters={
+        "path": {
+            "type": "string",
+            "description": (
+                "Path to inspect (default 'scratchpad'). Supports dot paths like 'scratchpad.foo[0]' "
+                "or JSON pointer paths like '/scratchpad/foo/0'."
+            ),
+            "default": "scratchpad",
+        },
+        "keys_only": {
+            "type": "boolean",
+            "description": "If true, return keys/length instead of the full value (useful to navigate large objects).",
+            "default": False,
+        },
+        "target_run_id": {
+            "type": "string",
+            "description": "Optional run id to inspect (defaults to the current run).",
+        },
+    },
+    when_to_use=(
+        "When you need to inspect scratchpad/runtime vars for debugging or progressive recall. "
+        "Prefer keys_only=true first to discover available fields, then retrieve a deeper path."
     ),
 )
 

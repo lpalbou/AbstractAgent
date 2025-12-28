@@ -19,12 +19,14 @@ def test_agents_include_recall_memory_tool_definition() -> None:
     react = ReactAgent(runtime=_runtime(), tools=[], max_iterations=1, max_tokens=1024)
     assert react.logic is not None
     assert any(t.name == "recall_memory" for t in react.logic.tools)
+    assert any(t.name == "inspect_vars" for t in react.logic.tools)
     assert any(t.name == "remember" for t in react.logic.tools)
     assert any(t.name == "compact_memory" for t in react.logic.tools)
 
     codeact = CodeActAgent(runtime=_runtime(), tools=[], max_iterations=1, max_tokens=1024)
     assert codeact.logic is not None
     assert any(t.name == "recall_memory" for t in codeact.logic.tools)
+    assert any(t.name == "inspect_vars" for t in codeact.logic.tools)
     assert any(t.name == "remember" for t in codeact.logic.tools)
     assert any(t.name == "compact_memory" for t in codeact.logic.tools)
 
@@ -100,6 +102,83 @@ def test_codeact_adapter_intercepts_recall_memory_as_memory_query_effect() -> No
     assert plan.next_node == "observe"
     assert plan.effect.payload.get("tool_name") == "recall_memory"
     assert plan.effect.payload.get("call_id") == "c1"
+    assert run.vars.get("_temp", {}).get("pending_tool_calls") == []
+
+
+def test_react_adapter_intercepts_inspect_vars_as_vars_query_effect() -> None:
+    agent = ReactAgent(runtime=_runtime(), tools=[], max_iterations=1, max_tokens=1024)
+    wf = agent.workflow
+    act_node = wf.get_node("act")
+
+    run = RunState(
+        run_id="run",
+        workflow_id=wf.workflow_id,
+        status=RunStatus.RUNNING,
+        current_node="act",
+        vars={
+            "context": {"task": "t", "messages": []},
+            "scratchpad": {},
+            "_runtime": {},
+            "_temp": {"pending_tool_calls": [{"name": "inspect_vars", "arguments": {"path": "scratchpad"}, "call_id": "c1"}]},
+            "_limits": {},
+        },
+        waiting=None,
+        output=None,
+        error=None,
+        created_at="2025-01-01T00:00:00+00:00",
+        updated_at="2025-01-01T00:00:00+00:00",
+        actor_id=None,
+        session_id=None,
+        parent_run_id=None,
+    )
+
+    plan = act_node(run, _Ctx())
+    assert plan.effect is not None
+    assert plan.effect.type == EffectType.VARS_QUERY
+    assert plan.effect.result_key == "_temp.tool_results"
+    assert plan.next_node == "observe"
+    assert plan.effect.payload.get("tool_name") == "inspect_vars"
+    assert plan.effect.payload.get("call_id") == "c1"
+    assert plan.effect.payload.get("path") == "scratchpad"
+    assert run.vars.get("_temp", {}).get("pending_tool_calls") == []
+
+
+def test_codeact_adapter_intercepts_inspect_vars_as_vars_query_effect() -> None:
+    agent = CodeActAgent(runtime=_runtime(), tools=[], max_iterations=1, max_tokens=1024)
+    wf = agent.workflow
+    act_node = wf.get_node("act")
+
+    run = RunState(
+        run_id="run",
+        workflow_id=wf.workflow_id,
+        status=RunStatus.RUNNING,
+        current_node="act",
+        vars={
+            "context": {"task": "t", "messages": []},
+            "scratchpad": {},
+            "_runtime": {},
+            "_temp": {"pending_tool_calls": [{"name": "inspect_vars", "arguments": {"path": "scratchpad.foo", "keys_only": True}, "call_id": "c1"}]},
+            "_limits": {},
+        },
+        waiting=None,
+        output=None,
+        error=None,
+        created_at="2025-01-01T00:00:00+00:00",
+        updated_at="2025-01-01T00:00:00+00:00",
+        actor_id=None,
+        session_id=None,
+        parent_run_id=None,
+    )
+
+    plan = act_node(run, _Ctx())
+    assert plan.effect is not None
+    assert plan.effect.type == EffectType.VARS_QUERY
+    assert plan.effect.result_key == "_temp.tool_results"
+    assert plan.next_node == "observe"
+    assert plan.effect.payload.get("tool_name") == "inspect_vars"
+    assert plan.effect.payload.get("call_id") == "c1"
+    assert plan.effect.payload.get("path") == "scratchpad.foo"
+    assert plan.effect.payload.get("keys_only") is True
     assert run.vars.get("_temp", {}).get("pending_tool_calls") == []
 
 

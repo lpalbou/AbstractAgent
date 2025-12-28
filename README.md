@@ -117,4 +117,4 @@ AbstractAgent
 - Default tool callables are re-exported from AbstractCore in `abstractagent.tools` (file ops, web tools, `execute_command`), plus:
   - `execute_python(code, timeout_s=...)`
   - `self_improve(suggestion, ...)`
-- The agent also exposes schema-only built-ins (`ask_user`, `recall_memory`, `remember`, `compact_memory`) which are translated into **Runtime effects** by the workflow adapters (durable; no callable persistence).
+- The agent also exposes schema-only built-ins (`ask_user`, `recall_memory`, `inspect_vars`, `remember`, `compact_memory`) which are translated into **Runtime effects** by the workflow adapters (durable; no callable persistence).

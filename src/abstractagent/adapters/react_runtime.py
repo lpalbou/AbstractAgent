@@ -326,7 +326,7 @@ def create_react_workflow(
             return StepPlan(node_id="act", next_node="reason")
 
         allow = _effective_allowlist(runtime_ns)
-        builtin_effect_tools = {"ask_user", "recall_memory", "remember", "compact_memory"}
+        builtin_effect_tools = {"ask_user", "recall_memory", "inspect_vars", "remember", "compact_memory"}
 
         # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
         for i, tc in enumerate(tool_calls):
@@ -379,6 +379,22 @@ def create_react_workflow(
                     node_id="act",
                     effect=Effect(
                         type=EffectType.MEMORY_QUERY,
+                        payload=payload,
+                        result_key="_temp.tool_results",
+                    ),
+                    next_node="observe",
+                )
+
+            if name == "inspect_vars":
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                payload = dict(args) if isinstance(args, dict) else {}
+                payload.setdefault("tool_name", "inspect_vars")
+                payload.setdefault("call_id", tc.get("call_id") or "vars")
+                emit("vars_query", {"path": payload.get("path")})
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.VARS_QUERY,
                         payload=payload,
                         result_key="_temp.tool_results",
                     ),

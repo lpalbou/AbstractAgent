@@ -9,7 +9,7 @@ from abstractruntime import RunState, Runtime, WorkflowSpec
 
 from .base import BaseAgent
 from ..adapters.codeact_runtime import create_codeact_workflow
-from ..logic.builtins import ASK_USER_TOOL, COMPACT_MEMORY_TOOL, RECALL_MEMORY_TOOL, REMEMBER_TOOL
+from ..logic.builtins import ASK_USER_TOOL, COMPACT_MEMORY_TOOL, INSPECT_VARS_TOOL, RECALL_MEMORY_TOOL, REMEMBER_TOOL
 from ..logic.codeact import CodeActLogic
 
 
@@ -68,7 +68,7 @@ class CodeActAgent(BaseAgent):
 
     def _create_workflow(self) -> WorkflowSpec:
         tool_defs = _tool_definitions_from_callables(self.tools)
-        tool_defs = [ASK_USER_TOOL, RECALL_MEMORY_TOOL, REMEMBER_TOOL, COMPACT_MEMORY_TOOL, *tool_defs]
+        tool_defs = [ASK_USER_TOOL, RECALL_MEMORY_TOOL, INSPECT_VARS_TOOL, REMEMBER_TOOL, COMPACT_MEMORY_TOOL, *tool_defs]
         logic = CodeActLogic(
             tools=tool_defs,
             max_history_messages=self._max_history_messages,

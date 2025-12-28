@@ -264,6 +264,22 @@ def create_codeact_workflow(
                     next_node="observe",
                 )
 
+            if name == "inspect_vars":
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                payload = dict(args) if isinstance(args, dict) else {}
+                payload.setdefault("tool_name", "inspect_vars")
+                payload.setdefault("call_id", tc.get("call_id") or "vars")
+                emit("vars_query", {"path": payload.get("path")})
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.VARS_QUERY,
+                        payload=payload,
+                        result_key="_temp.tool_results",
+                    ),
+                    next_node="observe",
+                )
+
             if name == "remember":
                 temp["pending_tool_calls"] = tool_calls[i + 1 :]
                 payload = dict(args) if isinstance(args, dict) else {}
