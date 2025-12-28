@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Documentation: clarify that the interactive REPL moved to **AbstractCode**; `react-agent`/`python -m abstractagent.repl` are deprecated shims.
+- Observability: `on_step` tool-observation previews now include up to **1000 characters** (was 150), with an explicit truncation marker for larger outputs. Full tool outputs are still preserved in the agent message history.
 
 ## [0.2.0] - 2025-12-17
 

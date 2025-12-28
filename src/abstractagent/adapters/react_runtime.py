@@ -294,13 +294,15 @@ def create_react_workflow(
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
 
-        context["messages"].append(_new_message(ctx, role="assistant", content=content))
+        if content.strip():
+            context["messages"].append(_new_message(ctx, role="assistant", content=content))
 
         emit(
             "parse",
             {
                 "has_tool_calls": bool(tool_calls),
-                "content_preview": content[:100] if content else "(no content)",
+                "content": content,
+                "tool_calls": [{"name": tc.name, "arguments": tc.arguments, "call_id": tc.call_id} for tc in tool_calls],
             },
         )
         temp.pop("llm_response", None)
@@ -438,7 +440,7 @@ def create_react_workflow(
 
         for tc in tool_calls:
             if isinstance(tc, dict):
-                emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {})})
+                emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {}), "call_id": tc.get("call_id")})
 
         formatted_calls: List[Dict[str, Any]] = []
         for tc in tool_calls:
@@ -493,7 +495,7 @@ def create_react_workflow(
                 output=str(output if success else (error or output)),
                 success=success,
             )
-            emit("observe", {"tool": name, "result": rendered[:150]})
+            emit("observe", {"tool": name, "success": success, "result": rendered})
             context["messages"].append(
                 _new_message(
                     ctx,
@@ -526,6 +528,20 @@ def create_react_workflow(
         # We also keep the prompt small: include only the most recent tool outputs.
         messages = list(context.get("messages") or [])
         tool_msgs: list[str] = []
+        tool_names: set[str] = set()
+        did_write_files = False
+
+        for m in messages:
+            if not isinstance(m, dict) or m.get("role") != "tool":
+                continue
+            meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
+            name = meta.get("name") if isinstance(meta, dict) else None
+            success = meta.get("success") if isinstance(meta, dict) else None
+            if isinstance(name, str) and name:
+                tool_names.add(name)
+                if name in ("write_file", "edit_file") and success is True:
+                    did_write_files = True
+
         for m in reversed(messages):
             if not isinstance(m, dict):
                 continue
@@ -538,6 +554,7 @@ def create_react_workflow(
             if len(tool_msgs) >= 6:
                 break
         tool_msgs.reverse()
+        tools_used = ", ".join(sorted(tool_names)) if tool_names else "(none)"
 
         obs_blocks: list[str] = []
         for t in tool_msgs:
@@ -547,6 +564,14 @@ def create_react_workflow(
         observations = "\n\n".join(obs_blocks) if obs_blocks else "(no tool observations captured)"
         prompt = (
             "Write the final user-facing answer.\n\n"
+            "Facts:\n"
+            f"- Tools executed: {tools_used}\n"
+            f"- File writes observed (write_file/edit_file): {'yes' if did_write_files else 'no'}\n\n"
+            "Hard rules:\n"
+            "- Only claim actions that are explicitly supported by the Observations.\n"
+            "- If file writes observed is 'no', do not claim you created/modified files.\n"
+            "- If something wasn't actually done, say so (do not pretend).\n"
+            "- If the task is not complete, clearly say what remains and what you would do next.\n\n"
             f"Task:\n{task}\n\n"
             f"Observations (tool outputs):\n{observations}\n\n"
             "Answer:\n"

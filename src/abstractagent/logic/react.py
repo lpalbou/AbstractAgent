@@ -74,6 +74,15 @@ class ReActLogic:
                 "Use tools when needed, or provide a final answer."
             )
 
+        prompt += (
+            "\n\nRules:\n"
+            "- Be truthful: only claim actions that are supported by tool outputs in History.\n"
+            "- Before calling a tool, write 1–3 short lines explaining what you will do and why.\n"
+            "- After tool results, continue from the new information; do not repeat successful tool calls with the same args.\n"
+            "- For file work, prefer file tools (write_file/edit_file) and verify with list_files/read_file.\n"
+            "- Do not prefix your messages with role labels like 'assistant:'.\n"
+        )
+
         if guidance:
             prompt += "\n\n[User guidance]: " + guidance
 
@@ -85,6 +94,12 @@ class ReActLogic:
 
         content = response.get("content")
         content = "" if content is None else str(content)
+        # Some OSS models echo role labels; strip common prefixes to keep UI/history clean.
+        content = content.lstrip()
+        for prefix in ("assistant:", "assistant："):
+            if content.lower().startswith(prefix):
+                content = content[len(prefix) :].lstrip()
+                break
 
         tool_calls_raw = response.get("tool_calls") or []
         tool_calls: List[ToolCall] = []
@@ -103,11 +118,21 @@ class ReActLogic:
         # FALLBACK: Parse from content if no native tool calls
         # Handles <|tool_call|>, <function_call>, ```tool_code, etc.
         if not tool_calls and content:
-            from abstractcore.tools.parser import parse_tool_calls, detect_tool_calls
+            from abstractcore.tools.parser import parse_tool_calls, detect_tool_calls, clean_tool_syntax
             if detect_tool_calls(content):
                 # Pass model name for architecture-specific parsing
                 model_name = response.get("model")
                 tool_calls = parse_tool_calls(content, model_name=model_name)
+                # Clean tool call syntax from the assistant content so:
+                # - UI shows the human-readable "why" (if any)
+                # - History doesn't get polluted with tool tags that can cause repeats
+                if tool_calls:
+                    content = clean_tool_syntax(content, tool_calls)
+        elif tool_calls and content:
+            # Even when a provider returns native tool call fields, some OSS models also
+            # embed tool-call syntax in `content`. Clean it to avoid polluting history/UI.
+            from abstractcore.tools.parser import clean_tool_syntax
+            content = clean_tool_syntax(content, tool_calls)
 
         return content, tool_calls
 

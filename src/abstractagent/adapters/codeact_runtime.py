@@ -389,7 +389,12 @@ def create_codeact_workflow(
                 output=(output if success else (error or output)),
                 success=success,
             )
-            emit("observe", {"tool": name, "result": rendered[:150]})
+            # Observability: avoid truncating normal tool results in step events.
+            # Keep a bounded preview for huge tool outputs to avoid bloating traces/ledgers.
+            preview = rendered
+            if len(preview) > 1000:
+                preview = preview[:1000] + f"\n… (truncated, {len(rendered):,} chars total)"
+            emit("observe", {"tool": name, "result": preview})
             context["messages"].append(
                 _new_message(
                     ctx,
