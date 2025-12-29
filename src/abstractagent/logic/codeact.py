@@ -146,6 +146,13 @@ class CodeActLogic:
         content = response.get("content")
         content = "" if content is None else str(content)
 
+        # Some providers return a separate `reasoning` field. If content is empty,
+        # preserve reasoning as the assistant message so iterative loops don't lose context.
+        if not content.strip():
+            reasoning = response.get("reasoning")
+            if isinstance(reasoning, str) and reasoning.strip():
+                content = reasoning.strip()
+
         tool_calls_raw = response.get("tool_calls") or []
         tool_calls: List[ToolCall] = []
         if isinstance(tool_calls_raw, list):

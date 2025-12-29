@@ -97,9 +97,14 @@ class ReActLogic:
             if etype == "llm_call" and status == "completed":
                 result = step.get("result")
                 if isinstance(result, dict):
-                    content = result.get("content")
-                    if isinstance(content, str) and content.strip():
-                        last_thought = content
+                    # Prefer a provider-supplied reasoning field when available.
+                    reasoning = result.get("reasoning")
+                    if isinstance(reasoning, str) and reasoning.strip():
+                        last_thought = reasoning
+                    else:
+                        content = result.get("content")
+                        if isinstance(content, str) and content.strip():
+                            last_thought = content
                 continue
 
             if etype != "tool_calls":
@@ -250,6 +255,14 @@ class ReActLogic:
             if content.lower().startswith(prefix):
                 content = content[len(prefix) :].lstrip()
                 break
+
+        # Some providers return a separate `reasoning` field (e.g. OSS models via OpenAI-compatible APIs).
+        # If the cleaned content is empty, fall back to reasoning so the agent's thought is preserved
+        # in history/scratchpad and can prevent repetitive tool loops.
+        if not content.strip():
+            reasoning = response.get("reasoning")
+            if isinstance(reasoning, str) and reasoning.strip():
+                content = reasoning.strip()
 
         tool_calls_raw = response.get("tool_calls") or []
         tool_calls: List[ToolCall] = []

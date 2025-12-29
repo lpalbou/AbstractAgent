@@ -479,20 +479,32 @@ def create_codeact_workflow(
                     next_node="observe",
                 )
 
-        for tc in tool_calls:
+        for i, tc in enumerate(tool_calls, start=1):
             if isinstance(tc, dict):
-                emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {})})
+                call_id_raw = tc.get("call_id")
+                call_id = str(call_id_raw).strip() if call_id_raw is not None else ""
+                if not call_id:
+                    call_id = str(i)
+                emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {}), "call_id": call_id})
+            elif isinstance(tc, ToolCall):
+                call_id = str(tc.call_id).strip() if tc.call_id is not None else ""
+                if not call_id:
+                    call_id = str(i)
+                emit("act", {"tool": tc.name, "args": tc.arguments, "call_id": call_id})
 
         formatted_calls: List[Dict[str, Any]] = []
-        for tc in tool_calls:
+        for i, tc in enumerate(tool_calls, start=1):
             if isinstance(tc, dict):
-                formatted_calls.append(
-                    {"name": tc.get("name", ""), "arguments": tc.get("arguments", {}), "call_id": tc.get("call_id", "1")}
-                )
+                call_id_raw = tc.get("call_id")
+                call_id = str(call_id_raw).strip() if call_id_raw is not None else ""
+                if not call_id:
+                    call_id = str(i)
+                formatted_calls.append({"name": tc.get("name", ""), "arguments": tc.get("arguments", {}), "call_id": call_id})
             elif isinstance(tc, ToolCall):
-                formatted_calls.append(
-                    {"name": tc.name, "arguments": tc.arguments, "call_id": tc.call_id or "1"}
-                )
+                call_id = str(tc.call_id).strip() if tc.call_id is not None else ""
+                if not call_id:
+                    call_id = str(i)
+                formatted_calls.append({"name": tc.name, "arguments": tc.arguments, "call_id": call_id})
 
         allow = _effective_allowlist(runtime_ns)
         return StepPlan(
@@ -714,6 +726,16 @@ def create_codeact_workflow(
 
         # Prefer _limits.current_iteration, fall back to scratchpad
         iterations = int(limits.get("current_iteration", 0) or scratchpad.get("iteration", 0) or 0)
+
+        # Persist the final answer into the conversation history so it becomes part of the
+        # next run's seed context and shows up in /history.
+        messages = context.get("messages")
+        if isinstance(messages, list):
+            last = messages[-1] if messages else None
+            last_role = last.get("role") if isinstance(last, dict) else None
+            last_content = last.get("content") if isinstance(last, dict) else None
+            if last_role != "assistant" or str(last_content or "") != answer:
+                messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer"}))
 
         return StepPlan(
             node_id="done",
