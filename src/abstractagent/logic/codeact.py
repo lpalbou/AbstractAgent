@@ -17,6 +17,35 @@ _CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)\n```", re.IGNORECASE |
 
 
 class CodeActLogic:
+    @staticmethod
+    def _format_history_message(message: Dict[str, Any]) -> str:
+        role = str(message.get("role", "unknown") or "unknown")
+        content = message.get("content", "")
+        content_str = "" if content is None else str(content)
+
+        if role != "tool":
+            return f"{role}: {content_str}"
+
+        meta = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        name = meta.get("name") if isinstance(meta, dict) else None
+        success = meta.get("success") if isinstance(meta, dict) else None
+
+        cleaned = content_str.strip()
+        if isinstance(name, str) and name:
+            prefix = f"[{name}]:"
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix) :].lstrip()
+
+        label = "observation"
+        if isinstance(name, str) and name:
+            label += f"[{name}]"
+        if success is True:
+            label += " (success)"
+        elif success is False:
+            label += " (error)"
+
+        return f"{label}: {cleaned}"
+
     def __init__(
         self,
         *,
@@ -72,14 +101,13 @@ class CodeActLogic:
         plan = str(plan_text).strip() if isinstance(plan_text, str) and plan_text.strip() else ""
 
         history = messages if messages else []
-        history_text = "\n".join(
-            [f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in history]
-        )
+        history_text = "\n".join([self._format_history_message(m) for m in history])
 
         prompt = (
             "You are CodeAct: you can solve tasks by writing and executing Python code.\n"
             "Use the tool `execute_python` to run Python snippets. Prefer small, focused scripts.\n"
             "Print any intermediate results you need.\n"
+            "If the latest History entry is an observation, start by stating what you observed in 1 line.\n"
             "Be autonomous: do not ask the user for confirmation to proceed; keep going until the task is done.\n"
             "Only ask the user a question when required information is missing.\n"
             "When you are confident, provide the final answer without calling tools.\n\n"

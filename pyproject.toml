@@ -9,7 +9,7 @@ description = "Agent implementations using AbstractRuntime and AbstractCore"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "abstractcore",
+    "abstractcore[tools]",
     "abstractruntime",
 ]
 

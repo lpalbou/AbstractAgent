@@ -46,6 +46,27 @@ def test_build_request_does_not_slice_history() -> None:
     assert "user: m1" in req.prompt
 
 
+def test_build_request_renders_tool_messages_as_observations() -> None:
+    logic = ReActLogic(tools=[read_file._tool_definition])
+    req = logic.build_request(
+        task="t",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "tool",
+                "content": "[execute_command]: ok",
+                "metadata": {"name": "execute_command", "success": True},
+            },
+        ],
+        iteration=1,
+        max_iterations=5,
+        vars={"_limits": {"max_history_messages": -1}},
+    )
+
+    assert "observation[execute_command] (success): ok" in req.prompt
+    assert "tool: [execute_command]" not in req.prompt
+
+
 def test_parse_response_reads_native_tool_calls() -> None:
     logic = ReActLogic(tools=[read_file._tool_definition])
     content, calls = logic.parse_response(

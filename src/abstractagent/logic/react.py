@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from abstractcore.tools import ToolCall, ToolDefinition
@@ -10,6 +11,124 @@ from .types import LLMRequest
 
 
 class ReActLogic:
+    @staticmethod
+    def _format_history_message(message: Dict[str, Any]) -> str:
+        role = str(message.get("role", "unknown") or "unknown")
+        content = message.get("content", "")
+        content_str = "" if content is None else str(content)
+
+        if role != "tool":
+            return f"{role}: {content_str}"
+
+        # Tool messages are observations. Present them explicitly as such so models don't
+        # confuse "tool:" transcript lines with tool-call request syntax.
+        meta = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        name = meta.get("name") if isinstance(meta, dict) else None
+        success = meta.get("success") if isinstance(meta, dict) else None
+
+        cleaned = content_str.strip()
+        if isinstance(name, str) and name:
+            prefix = f"[{name}]:"
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix) :].lstrip()
+
+        label = "observation"
+        if isinstance(name, str) and name:
+            label += f"[{name}]"
+        if success is True:
+            label += " (success)"
+        elif success is False:
+            label += " (error)"
+
+        return f"{label}: {cleaned}"
+
+    @staticmethod
+    def _format_runtime_scratchpad(vars: Optional[Dict[str, Any]]) -> str:
+        """Build a ReAct scratchpad from runtime-owned node traces.
+
+        Source of truth: `run.vars["_runtime"]["node_traces"]` (persisted by AbstractRuntime).
+        This avoids creating parallel persistence formats in agents/hosts.
+        """
+        if not isinstance(vars, dict):
+            return ""
+        runtime_ns = vars.get("_runtime")
+        if not isinstance(runtime_ns, dict):
+            return ""
+        traces = runtime_ns.get("node_traces")
+        if not isinstance(traces, dict) or not traces:
+            return ""
+
+        all_steps: List[Dict[str, Any]] = []
+        for node_trace in traces.values():
+            if not isinstance(node_trace, dict):
+                continue
+            steps = node_trace.get("steps")
+            if not isinstance(steps, list):
+                continue
+            for step in steps:
+                if isinstance(step, dict):
+                    all_steps.append(step)
+
+        if not all_steps:
+            return ""
+
+        all_steps.sort(key=lambda d: str(d.get("ts") or ""))
+
+        def _render(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value
+            try:
+                return json.dumps(value, ensure_ascii=False, indent=2)
+            except Exception:
+                return str(value)
+
+        last_thought: Optional[str] = None
+        blocks: List[str] = []
+
+        for step in all_steps:
+            effect = step.get("effect")
+            if not isinstance(effect, dict):
+                continue
+            etype = str(effect.get("type") or "")
+            status = str(step.get("status") or "")
+
+            if etype == "llm_call" and status == "completed":
+                result = step.get("result")
+                if isinstance(result, dict):
+                    content = result.get("content")
+                    if isinstance(content, str) and content.strip():
+                        last_thought = content
+                continue
+
+            if etype != "tool_calls":
+                continue
+
+            ts = str(step.get("ts") or "")
+            header = f"[tool_calls]{' ' + ts if ts else ''} ({status or 'unknown'})"
+            payload = effect.get("payload")
+            payload_dict = dict(payload) if isinstance(payload, dict) else {}
+            tool_calls = payload_dict.get("tool_calls")
+            action = _render(tool_calls) if tool_calls is not None else ""
+
+            result = step.get("result")
+            observation = _render(result)
+
+            parts: List[str] = [header]
+            if isinstance(last_thought, str) and last_thought.strip():
+                parts.append("Thought:")
+                parts.append(last_thought.strip())
+            if action.strip():
+                parts.append("Action:")
+                parts.append(action)
+            if observation.strip():
+                parts.append("Observation:")
+                parts.append(observation)
+            blocks.append("\n".join(parts).strip())
+
+        return "\n\n".join(blocks).strip()
+
     def __init__(
         self,
         *,
@@ -64,7 +183,9 @@ class ReActLogic:
         plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
         plan = str(plan_text).strip() if isinstance(plan_text, str) and plan_text.strip() else ""
 
-        history_text = "\n".join([f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages])
+        runtime_scratchpad = self._format_runtime_scratchpad(vars)
+
+        history_text = "\n".join([self._format_history_message(m) for m in messages])
         if not history_text:
             prompt = (
                 f"Task: {task}\n\n"
@@ -76,18 +197,28 @@ class ReActLogic:
                 "Do not claim you have no memory of it; it is provided to you here.\n\n"
                 f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
                 f"History:\n{history_text}\n\n"
+            )
+            if runtime_scratchpad:
+                prompt += f"Scratchpad (runtime; tool calls + results):\n{runtime_scratchpad}\n\n"
+            prompt += (
                 "Continue the conversation and work on the user's latest request.\n"
                 "Use tools when needed, or provide a final answer."
             )
+
+        if runtime_scratchpad and "Scratchpad (runtime; tool calls + results):" not in prompt:
+            prompt += f"\n\nScratchpad (runtime; tool calls + results):\n{runtime_scratchpad}\n"
 
         prompt += (
             "\n\nRules:\n"
             "- Be truthful: only claim actions that are supported by tool outputs in History.\n"
             "- Be autonomous: do not ask the user for confirmation to proceed. Keep going until the task is done.\n"
             "- Only ask the user a question when required information is missing.\n"
+            "- If the latest History entry is an observation, start by stating what you observed in 1 line.\n"
             "- Before calling a tool, write 1–3 short lines explaining what you will do and why.\n"
             "- After tool results, continue from the new information; do not repeat successful tool calls with the same args.\n"
+            "- Use the Scratchpad as reliable working memory; do not redo actions already listed there unless you explain why.\n"
             "- For file work, prefer file tools (write_file/edit_file) and verify with list_files/read_file.\n"
+            "- If the user asked you to create/update a file, do it with write_file/edit_file (do not ask for permission).\n"
             "- Do not prefix your messages with role labels like 'assistant:'.\n"
         )
 

@@ -616,6 +616,7 @@ def create_react_workflow(
                 success=success,
             )
             emit("observe", {"tool": name, "success": success, "result": rendered})
+
             context["messages"].append(
                 _new_message(
                     ctx,
