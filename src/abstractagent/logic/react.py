@@ -134,25 +134,6 @@ class ReActLogic:
                     if isinstance(args, dict):
                         tool_calls.append(ToolCall(name=name, arguments=dict(args), call_id=call_id))
 
-        # FALLBACK: Parse from content if no native tool calls
-        # Handles <|tool_call|>, <function_call>, ```tool_code, etc.
-        if not tool_calls and content:
-            from abstractcore.tools.parser import parse_tool_calls, detect_tool_calls, clean_tool_syntax
-            if detect_tool_calls(content):
-                # Pass model name for architecture-specific parsing
-                model_name = response.get("model")
-                tool_calls = parse_tool_calls(content, model_name=model_name)
-                # Clean tool call syntax from the assistant content so:
-                # - UI shows the human-readable "why" (if any)
-                # - History doesn't get polluted with tool tags that can cause repeats
-                if tool_calls:
-                    content = clean_tool_syntax(content, tool_calls)
-        elif tool_calls and content:
-            # Even when a provider returns native tool call fields, some OSS models also
-            # embed tool-call syntax in `content`. Clean it to avoid polluting history/UI.
-            from abstractcore.tools.parser import clean_tool_syntax
-            content = clean_tool_syntax(content, tool_calls)
-
         return content, tool_calls
 
     def format_observation(self, *, name: str, output: str, success: bool) -> str:
