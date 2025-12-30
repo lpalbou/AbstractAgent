@@ -695,8 +695,7 @@ def create_react_workflow(
 
         obs_blocks: list[str] = []
         for t in tool_msgs:
-            # Prevent prompt bloat from huge file reads.
-            obs_blocks.append(t if len(t) <= 2500 else (t[:2500] + "…"))
+            obs_blocks.append(t)
 
         observations = "\n\n".join(obs_blocks) if obs_blocks else "(no tool observations captured)"
         prompt = (

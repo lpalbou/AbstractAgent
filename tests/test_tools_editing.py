@@ -44,8 +44,7 @@ def test_edit_file_applies_unified_diff(tmp_path: Path) -> None:
 +there
 """
     out = edit_file(str(target), patch)
-    # abstractcore uses ✅ emoji prefix
-    assert "Updated" in out
+    assert out.startswith("Edited ")
     assert target.read_text(encoding="utf-8") == "hello\nthere\n"
 
 
@@ -79,4 +78,3 @@ def test_self_improve_writes_jsonl(tmp_path: Path, monkeypatch) -> None:
     assert data["target"] == "y"
     assert data["suggestion"] == "Add X"
     assert data["tags"] == {"k": "v"}
-

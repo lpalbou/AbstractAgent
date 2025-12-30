@@ -217,6 +217,8 @@ class ReActLogic:
             "\n\nRules:\n"
             "- Be truthful: only claim actions that are supported by tool outputs in History.\n"
             "- Be autonomous: do not ask the user for confirmation to proceed. Keep going until the task is done.\n"
+            "- Taking action / having an effect means calling a tool. If you want to create/edit files, run commands, fetch URLs, or search, you MUST call the appropriate tool.\n"
+            "- If you list next steps, immediately start executing them (with tools) as long as they are within the user's request.\n"
             "- Only ask the user a question when required information is missing.\n"
             "- If the latest History entry is an observation, start by stating what you observed in 1 line.\n"
             "- Before calling a tool, write 1–3 short lines explaining what you will do and why.\n"
