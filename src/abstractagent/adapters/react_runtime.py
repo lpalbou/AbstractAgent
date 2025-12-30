@@ -410,12 +410,13 @@ def create_react_workflow(
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
 
-        if content.strip():
-            context["messages"].append(_new_message(ctx, role="assistant", content=content))
-            if _flag(runtime_ns, "plan_mode", default=False):
-                updated = _extract_plan_update(content)
-                if isinstance(updated, str) and updated.strip():
-                    scratchpad["plan"] = updated.strip()
+        def _should_retry_for_missing_tool_call(text: str) -> bool:
+            if not isinstance(text, str) or not text.strip():
+                return False
+            lowered = text.lower()
+            # Some models echo our internal History formatting (e.g. "observation[web_search] (success): ...")
+            # which is not a real tool execution. Treat that as a strong signal we should re-prompt.
+            return "observation[" in lowered
 
         emit(
             "parse",
@@ -427,11 +428,55 @@ def create_react_workflow(
         )
         temp.pop("llm_response", None)
 
+        # Reset retry counter on any successful tool-call detection.
         if tool_calls:
+            scratchpad["tool_retry_count"] = 0
+
+        if tool_calls:
+            if content.strip():
+                context["messages"].append(_new_message(ctx, role="assistant", content=content))
+                if _flag(runtime_ns, "plan_mode", default=False):
+                    updated = _extract_plan_update(content)
+                    if isinstance(updated, str) and updated.strip():
+                        scratchpad["plan"] = updated.strip()
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
             return StepPlan(node_id="parse", next_node="act")
 
+        # If the model appears to have produced a fake "observation[tool]" transcript instead of
+        # calling tools, give it one corrective retry before treating the message as final.
+        if _should_retry_for_missing_tool_call(content):
+            try:
+                retries = int(scratchpad.get("tool_retry_count") or 0)
+            except Exception:
+                retries = 0
+            if retries < 2:
+                scratchpad["tool_retry_count"] = retries + 1
+                inbox = runtime_ns.get("inbox")
+                if not isinstance(inbox, list):
+                    inbox = []
+                    runtime_ns["inbox"] = inbox
+                inbox.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "You wrote an `observation[...]` line, but no tool was actually called.\n"
+                            "Do NOT fabricate tool outputs. If you need to search/fetch/read/write, CALL the tool now.\n"
+                            "Do not output `observation[...]` markers; those are context-only."
+                        ),
+                    }
+                )
+                emit("parse_retry_missing_tool_call", {"retries": retries + 1})
+                return StepPlan(node_id="parse", next_node="reason")
+
+        if content.strip():
+            context["messages"].append(_new_message(ctx, role="assistant", content=content))
+            if _flag(runtime_ns, "plan_mode", default=False):
+                updated = _extract_plan_update(content)
+                if isinstance(updated, str) and updated.strip():
+                    scratchpad["plan"] = updated.strip()
+
         temp["final_answer"] = content
+        scratchpad["tool_retry_count"] = 0
         # If we used tools, always run a final "synthesis" LLM pass to produce a
         # clean user-facing answer (models may otherwise echo tool transcript lines).
         if bool(scratchpad.get("used_tools")):
