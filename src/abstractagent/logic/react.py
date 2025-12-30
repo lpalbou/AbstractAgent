@@ -80,7 +80,7 @@ class ReActLogic:
             if isinstance(value, str):
                 return value
             try:
-                return json.dumps(value, ensure_ascii=False, indent=2)
+                return json.dumps(value, ensure_ascii=False, indent=2, default=str)
             except Exception:
                 return str(value)
 
@@ -178,7 +178,12 @@ class ReActLogic:
 
         # Get limits from vars if available, else use instance defaults
         limits = (vars or {}).get("_limits", {})
-        max_tokens = limits.get("max_tokens", self._max_tokens)
+        # IMPORTANT: `_limits.max_tokens` is the *context/budget* limit for the run, not
+        # an OpenAI `max_tokens` (output cap). Using it as output tokens can generate
+        # invalid provider payloads (e.g. max_tokens=262144) and trigger 400 responses.
+        #
+        # Output tokens are controlled via `_limits.max_output_tokens` (canonical).
+        max_tokens = limits.get("max_output_tokens", None)
         if max_tokens is not None:
             max_tokens = int(max_tokens)
 
@@ -191,33 +196,25 @@ class ReActLogic:
         runtime_scratchpad = self._format_runtime_scratchpad(vars)
 
         history_text = "\n".join([self._format_history_message(m) for m in messages])
-        if not history_text:
-            prompt = (
-                f"Task: {task}\n\n"
-                "Use the available tools to complete this task. When done, provide your final answer."
-            )
-        else:
-            prompt = (
-                "You have access to the conversation history below as context.\n"
-                "Do not claim you have no memory of it; it is provided to you here.\n\n"
-                f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
-                f"History:\n{history_text}\n\n"
-            )
-            if runtime_scratchpad:
-                prompt += f"Scratchpad (runtime; tool calls + results):\n{runtime_scratchpad}\n\n"
-            prompt += (
-                "Continue the conversation and work on the user's latest request.\n"
-                "Use tools when needed, or provide a final answer."
-            )
+        prompt = f"Iteration: {int(iteration)}/{int(max_iterations)}\n\nTask:\n{task}\n\n"
 
-        if runtime_scratchpad and "Scratchpad (runtime; tool calls + results):" not in prompt:
-            prompt += f"\n\nScratchpad (runtime; tool calls + results):\n{runtime_scratchpad}\n"
+        if history_text:
+            prompt += f"History:\n{history_text}\n\n"
+        if runtime_scratchpad:
+            prompt += f"Scratchpad (runtime; tool calls + results):\n{runtime_scratchpad}\n\n"
+        if guidance:
+            prompt += "[User guidance]: " + guidance + "\n\n"
+        if plan_mode and plan:
+            prompt += f"Current plan:\n{plan}\n\n"
 
-        prompt += (
-            "\n\nRules:\n"
-            "- Be truthful: only claim actions that are supported by tool outputs in History.\n"
+        # Keep long-lived agent rules in a separate system prompt for clarity and stability.
+        system_prompt = (
+            "You are an autonomous ReAct agent.\n"
+            "Taking action / having an effect means calling a tool.\n\n"
+            "Rules:\n"
+            "- Be truthful: only claim actions that are supported by tool outputs in History/Scratchpad.\n"
             "- Be autonomous: do not ask the user for confirmation to proceed. Keep going until the task is done.\n"
-            "- Taking action / having an effect means calling a tool. If you want to create/edit files, run commands, fetch URLs, or search, you MUST call the appropriate tool.\n"
+            "- If you want to create/edit files, run commands, fetch URLs, or search, you MUST call the appropriate tool.\n"
             "- If you list next steps, immediately start executing them (with tools) as long as they are within the user's request.\n"
             "- Never fabricate tool outputs. Tool results will appear in History/Scratchpad as tool observations.\n"
             "- Do not output lines that look like internal transcript markers (e.g. `observation[tool] ...`). Those are context-only.\n"
@@ -237,23 +234,19 @@ class ReActLogic:
         except Exception:
             tool_names = ""
         if tool_names:
-            prompt += f"\nAvailable tools: {tool_names}\n"
+            system_prompt += f"\nAvailable tools: {tool_names}\n"
 
-        if plan_mode and plan:
-            prompt += (
-                "\n\nPlan mode (enabled):\n"
-                "- Maintain and update the plan as you work (mark steps done, add/remove steps if needed).\n"
+        if plan_mode:
+            system_prompt += (
+                "\nPlan mode:\n"
+                "- Maintain and update the plan as you work.\n"
                 "- If the plan changes, include a final section at the END of your message:\n"
                 "  Plan Update:\n"
                 "  <markdown checklist>\n"
-                "- Do not stop until the plan is complete.\n\n"
-                f"Current plan:\n{plan}\n"
+                "- Do not stop until the plan is complete.\n"
             )
 
-        if guidance:
-            prompt += "\n\n[User guidance]: " + guidance
-
-        return LLMRequest(prompt=prompt, tools=self.tools, max_tokens=max_tokens)
+        return LLMRequest(prompt=prompt, system_prompt=system_prompt, tools=self.tools, max_tokens=max_tokens)
 
     def parse_response(self, response: Any) -> Tuple[str, List[ToolCall]]:
         if not isinstance(response, dict):

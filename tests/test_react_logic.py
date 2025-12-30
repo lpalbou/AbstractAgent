@@ -20,7 +20,8 @@ def test_build_request_includes_history_and_memory_instruction() -> None:
         vars={"_limits": {"max_history_messages": -1}},
     )
     assert "History:" in req.prompt
-    assert "Do not claim you have no memory" in req.prompt
+    assert isinstance(req.system_prompt, str) and req.system_prompt.strip()
+    assert "autonomous ReAct agent" in req.system_prompt
     assert "user: hi" in req.prompt
     assert "assistant: hello" in req.prompt
 

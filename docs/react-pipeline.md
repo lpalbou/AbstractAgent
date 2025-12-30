@@ -59,10 +59,11 @@ At a high level, each iteration follows:
 1) **Reason** (`EffectType.LLM_CALL`)
    - The adapter selects the active message window:
      - `ActiveContextPolicy.select_active_messages_for_llm_from_run(run)`
-   - It builds a single prompt string using the pure logic layer:
+   - It builds the LLM request using the pure logic layer:
      - `ReActLogic.build_request(...)` (`abstractagent/src/abstractagent/logic/react.py`)
    - It calls AbstractCore with:
-     - the prompt
+     - the **system prompt** (agent rules; stable across iterations)
+     - the **prompt** (task + history + runtime scratchpad)
      - the serialized tool specs (`ToolDefinition.to_dict()`), filtered by allowlist
      - optional provider/model overrides from `_runtime`
 
@@ -187,4 +188,3 @@ LangChain’s classic agent scratchpad formatting mirrors this:
 - explicit “Observation” surfaces for tool outputs (both in history rendering and in the injected scratchpad)
 - durable scratchpad that carries tool calls + tool results across iterations
 - the loop structure is aligned with Thought/Action/Observation interleaving (even though “Thought” is plain assistant text, not hidden)
-

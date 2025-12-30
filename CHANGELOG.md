@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Documentation: clarify that the interactive REPL moved to **AbstractCode**; `react-agent`/`python -m abstractagent.repl` are deprecated shims.
 - Observability: `on_step` tool-observation previews now include up to **1000 characters** (was 150), with an explicit truncation marker for larger outputs. Full tool outputs are still preserved in the agent message history.
+- ReAct prompt construction now **truncates large tool-call arguments** (e.g. `write_file` content) when building the runtime scratchpad, preventing prompt bloat and reducing stalls on local providers.
+
+### Fixed
+- Limits: ReAct/CodeAct now treat `_limits.max_tokens` as a **context/budget** limit and use `_limits.max_output_tokens` (if set) to cap OpenAI-style `max_tokens` (output). This prevents invalid LMStudio requests like `max_tokens=262144` which can return HTTP 400.
 
 ## [0.2.0] - 2025-12-17
 

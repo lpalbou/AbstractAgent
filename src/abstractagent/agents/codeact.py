@@ -92,6 +92,7 @@ class CodeActAgent(BaseAgent):
         plan_mode: Optional[bool] = None,
         review_mode: Optional[bool] = None,
         review_max_rounds: Optional[int] = None,
+        allowed_tools: Optional[List[str]] = None,
     ) -> str:
         task = str(task or "").strip()
         if not task:
@@ -124,6 +125,9 @@ class CodeActAgent(BaseAgent):
                 "warn_tokens_pct": 80,
             },
         }
+        if isinstance(allowed_tools, list):
+            normalized = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
+            vars["_runtime"]["allowed_tools"] = normalized
 
         run_id = self.runtime.start(
             workflow=self.workflow,

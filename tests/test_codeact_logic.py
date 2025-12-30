@@ -27,8 +27,9 @@ def test_build_request_includes_codeact_instructions() -> None:
         max_iterations=10,
         vars={"_limits": {"max_history_messages": 1}},
     )
-    assert "You are CodeAct" in req.prompt
-    assert "execute_python" in req.prompt
+    assert isinstance(req.system_prompt, str) and req.system_prompt.strip()
+    assert "You are CodeAct" in req.system_prompt
+    assert "execute_python" in req.system_prompt
     # History slicing is now handled by the runtime-owned ActiveContextPolicy.
     # Logic should treat the provided messages as the already-selected active view.
     assert "assistant: hello" in req.prompt

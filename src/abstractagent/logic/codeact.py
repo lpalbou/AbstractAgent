@@ -90,7 +90,9 @@ class CodeActLogic:
 
         # Get limits from vars if available, else use instance defaults
         limits = (vars or {}).get("_limits", {})
-        max_tokens = limits.get("max_tokens", self._max_tokens)
+        # IMPORTANT: `_limits.max_tokens` is the run's *context/budget* limit, not an
+        # OpenAI `max_tokens` output cap. Use `_limits.max_output_tokens` for output.
+        max_tokens = limits.get("max_output_tokens", None)
         if max_tokens is not None:
             max_tokens = int(max_tokens)
 
@@ -103,7 +105,15 @@ class CodeActLogic:
         history = messages if messages else []
         history_text = "\n".join([self._format_history_message(m) for m in history])
 
-        prompt = (
+        prompt = f"Iteration: {int(iteration)}/{int(max_iterations)}\n\nTask:\n{task}\n\n"
+        if history_text:
+            prompt += f"History:\n{history_text}\n\n"
+        if guidance:
+            prompt += f"[User guidance]: {guidance}\n\n"
+        if plan_mode and plan:
+            prompt += f"Current plan:\n{plan}\n\n"
+
+        system_prompt = (
             "You are CodeAct: you can solve tasks by writing and executing Python code.\n"
             "Use the tool `execute_python` to run Python snippets. Prefer small, focused scripts.\n"
             "Print any intermediate results you need.\n"
@@ -113,34 +123,20 @@ class CodeActLogic:
             "If the latest History entry is an observation, start by stating what you observed in 1 line.\n"
             "Be autonomous: do not ask the user for confirmation to proceed; keep going until the task is done.\n"
             "Only ask the user a question when required information is missing.\n"
-            "When you are confident, provide the final answer without calling tools.\n\n"
-            f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
-            f"Task: {task}\n\n"
+            "When you are confident, provide the final answer without calling tools.\n"
+            "If tool calling is unavailable, include a fenced ```python code block instead.\n"
         )
-        if history_text:
-            prompt += f"History:\n{history_text}\n\n"
-
-        if guidance:
-            prompt += f"[User guidance]: {guidance}\n\n"
-
-        if plan_mode and plan:
-            prompt += (
-                "Plan mode (enabled):\n"
-                "- Maintain and update the plan as you work (mark steps done, add/remove steps if needed).\n"
+        if plan_mode:
+            system_prompt += (
+                "\nPlan mode:\n"
+                "- Maintain and update the plan as you work.\n"
                 "- If the plan changes, include a final section at the END of your message:\n"
                 "  Plan Update:\n"
                 "  <markdown checklist>\n"
-                "- Do not stop until the plan is complete.\n\n"
-                f"Current plan:\n{plan}\n\n"
+                "- Do not stop until the plan is complete.\n"
             )
 
-        prompt += (
-            "If you need to run code, either:\n"
-            "- Call `execute_python` with the Python code, or\n"
-            "- If tool calling is unavailable, include a fenced ```python code block.\n"
-        )
-
-        return LLMRequest(prompt=prompt, tools=self.tools, max_tokens=max_tokens)
+        return LLMRequest(prompt=prompt, system_prompt=system_prompt, tools=self.tools, max_tokens=max_tokens)
 
     def parse_response(self, response: Any) -> Tuple[str, List[ToolCall]]:
         if not isinstance(response, dict):

@@ -259,8 +259,8 @@ def create_codeact_workflow(
         emit("plan_request", {"tools": allow})
 
         payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
-        sys = _system_prompt(runtime_ns)
-        if sys is not None:
+        sys = _system_prompt(runtime_ns) or req.system_prompt
+        if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
 
         return StepPlan(
