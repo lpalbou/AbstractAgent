@@ -499,6 +499,30 @@ def create_react_workflow(
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
 
+        def _sanitize_tool_call_content(text: str) -> str:
+            """Remove tool-transcript markers from assistant content before persisting to history.
+
+            Some OSS models may include internal transcript artifacts (e.g. fabricated
+            `observation[...]` lines) or embed the tool call itself inside the message
+            (`Action:` blocks). We keep only the user-facing prose that appears *before*
+            such markers so the runtime doesn't persist fabricated logs into context.
+            """
+            if not isinstance(text, str) or not text.strip():
+                return ""
+            out_lines: list[str] = []
+            for line in text.splitlines():
+                lowered = line.lstrip().lower()
+                if lowered.startswith("observation["):
+                    break
+                if lowered.startswith("action:"):
+                    break
+                if lowered.startswith("<|tool_call|>") or lowered.startswith("<tool_call>"):
+                    break
+                if lowered.startswith("```tool_call") or lowered.startswith("```tool_code"):
+                    break
+                out_lines.append(line)
+            return "\n".join(out_lines).rstrip()
+
         def _should_retry_for_missing_tool_call(text: str) -> bool:
             if not isinstance(text, str) or not text.strip():
                 return False
@@ -523,10 +547,11 @@ def create_react_workflow(
             scratchpad["tool_retry_minimal_used"] = False
 
         if tool_calls:
-            if content.strip():
-                context["messages"].append(_new_message(ctx, role="assistant", content=content))
+            clean = _sanitize_tool_call_content(content)
+            if clean.strip():
+                context["messages"].append(_new_message(ctx, role="assistant", content=clean))
                 if _flag(runtime_ns, "plan_mode", default=False):
-                    updated = _extract_plan_update(content)
+                    updated = _extract_plan_update(clean)
                     if isinstance(updated, str) and updated.strip():
                         scratchpad["plan"] = updated.strip()
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
