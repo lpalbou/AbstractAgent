@@ -13,6 +13,7 @@ from abstractruntime.memory.active_context import ActiveContextPolicy
 from abstractruntime.memory.active_memory import render_active_memory_split_for_llm_request
 
 from ..logic.react import ReActLogic
+from .memory_delta import extract_active_memory_delta
 
 
 def _new_message(
@@ -369,7 +370,33 @@ def create_react_workflow(
             guidance = " | ".join([m for m in inbox_messages if m])
             runtime_ns["inbox"] = []
 
-        mem_split = render_active_memory_split_for_llm_request(run.vars, include_tools_summary=True)
+        # Use AbstractCore token estimation for Active Memory fitting when available so
+        # prompt composition + `/memory` token metrics stay in the same ballpark.
+        try:
+            from abstractcore.utils.token_utils import TokenUtils  # type: ignore
+        except Exception:  # pragma: no cover
+            TokenUtils = None  # type: ignore[assignment]
+
+        eff_model_for_tokens = (
+            str(model).strip()
+            if isinstance(model, str) and str(model).strip()
+            else str(runtime_ns.get("model") or "").strip()
+        )
+
+        def _count_tokens(text: str) -> int:
+            s = str(text or "")
+            if not s:
+                return 0
+            if TokenUtils is None:
+                return max(1, len(s) // 4)
+            try:
+                return max(0, int(TokenUtils.estimate_tokens(s, model=eff_model_for_tokens)))
+            except Exception:
+                return max(1, len(s) // 4)
+
+        mem_split = render_active_memory_split_for_llm_request(
+            run.vars, include_tools_summary=True, token_counter=_count_tokens
+        )
         active_memory = str(mem_split.get("user_memory") or "")
         system_memory = str(mem_split.get("system_memory") or "")
         req = logic.build_request(
@@ -433,7 +460,32 @@ def create_react_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
-        mem_split = render_active_memory_split_for_llm_request(run.vars, include_tools_summary=True)
+        # Keep token fitting consistent with normal calls.
+        try:
+            from abstractcore.utils.token_utils import TokenUtils  # type: ignore
+        except Exception:  # pragma: no cover
+            TokenUtils = None  # type: ignore[assignment]
+
+        eff_model_for_tokens = (
+            str(model).strip()
+            if isinstance(model, str) and str(model).strip()
+            else str(runtime_ns.get("model") or "").strip()
+        )
+
+        def _count_tokens(text: str) -> int:
+            s = str(text or "")
+            if not s:
+                return 0
+            if TokenUtils is None:
+                return max(1, len(s) // 4)
+            try:
+                return max(0, int(TokenUtils.estimate_tokens(s, model=eff_model_for_tokens)))
+            except Exception:
+                return max(1, len(s) // 4)
+
+        mem_split = render_active_memory_split_for_llm_request(
+            run.vars, include_tools_summary=True, token_counter=_count_tokens
+        )
         system_memory = str(mem_split.get("system_memory") or "")
         # Reuse the canonical agent rules from ReActLogic (but do not include History/Scratchpad in prompt).
         sys_req = logic.build_request(
@@ -498,6 +550,20 @@ def create_react_workflow(
         context, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
+        delta_result: Optional[Dict[str, Any]] = None
+
+        # Apply structured Active Memory deltas (if present) and remove them from user-visible content.
+        try:
+            content, delta = extract_active_memory_delta(content)
+            # Only apply deltas when the model is NOT emitting tool calls. Tool-call turns are
+            # usually incomplete and may contain formatting artifacts; we still strip the delta
+            # block from content for safety, but defer mutation until a non-tool response.
+            if not tool_calls and isinstance(delta, dict) and delta:
+                from abstractruntime.memory.active_memory import apply_active_memory_delta
+
+                delta_result = apply_active_memory_delta(run.vars, delta=delta)
+        except Exception:
+            delta_result = None
 
         def _sanitize_tool_call_content(text: str) -> str:
             """Remove tool-transcript markers from assistant content before persisting to history.
@@ -539,6 +605,8 @@ def create_react_workflow(
                 "tool_calls": [{"name": tc.name, "arguments": tc.arguments, "call_id": tc.call_id} for tc in tool_calls],
             },
         )
+        if isinstance(delta_result, dict) and delta_result.get("ok"):
+            emit("active_memory_delta", {"applied": delta_result.get("applied")})
         temp.pop("llm_response", None)
 
         # Reset retry counter on any successful tool-call detection.
@@ -618,7 +686,7 @@ def create_react_workflow(
         return StepPlan(node_id="parse", next_node="maybe_review")
 
     def act_node(run: RunState, ctx) -> StepPlan:
-        _, _, runtime_ns, temp, _ = ensure_react_vars(run)
+        _, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
         tool_calls = temp.get("pending_tool_calls", [])
         if not isinstance(tool_calls, list):
             tool_calls = []
@@ -627,7 +695,14 @@ def create_react_workflow(
             return StepPlan(node_id="act", next_node="reason")
 
         allow = _effective_allowlist(runtime_ns)
-        builtin_effect_tools = {"ask_user", "recall_memory", "inspect_vars", "remember", "compact_memory"}
+        builtin_effect_tools = {
+            "ask_user",
+            "recall_memory",
+            "inspect_vars",
+            "remember",
+            "compact_memory",
+            "compact_active_memory",
+        }
 
         # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
         for i, tc in enumerate(tool_calls):
@@ -737,6 +812,141 @@ def create_react_workflow(
                     next_node="observe",
                 )
 
+            if name == "compact_active_memory":
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                payload = dict(args) if isinstance(args, dict) else {}
+                payload.setdefault("tool_name", "compact_active_memory")
+                payload.setdefault("call_id", tc.get("call_id") or "memory")
+                emit(
+                    "memory_compact_structured",
+                    {"components": payload.get("components"), "preserve": payload.get("preserve")},
+                )
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.MEMORY_COMPACT_STRUCTURED,
+                        payload=payload,
+                        result_key="_temp.tool_results",
+                    ),
+                    next_node="observe",
+                )
+
+        def _normalized_tool_calls_for_signature(raw_calls: List[Any]) -> list[dict[str, Any]]:
+            normalized: list[dict[str, Any]] = []
+            for tc in raw_calls:
+                if isinstance(tc, ToolCall):
+                    name = str(tc.name or "")
+                    arguments = tc.arguments
+                elif isinstance(tc, dict):
+                    name = str(tc.get("name", "") or "")
+                    arguments = tc.get("arguments") or {}
+                else:
+                    continue
+
+                args_dict: dict[str, Any] = {}
+                if isinstance(arguments, dict):
+                    args_dict = dict(arguments)
+                elif isinstance(arguments, str) and arguments.strip():
+                    try:
+                        parsed = json.loads(arguments)
+                        if isinstance(parsed, dict):
+                            args_dict = dict(parsed)
+                    except Exception:
+                        args_dict = {}
+
+                normalized.append({"name": name, "arguments": args_dict})
+            return normalized
+
+        def _tool_calls_signature(raw_calls: List[Any]) -> str:
+            normalized = _normalized_tool_calls_for_signature(raw_calls)
+            payload = json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            return hashlib.sha256(payload).hexdigest()
+
+        def _tool_loop_threshold(normalized_calls: list[dict[str, Any]]) -> int:
+            # File mutation tools are deterministic; repeating identical calls is almost always a model loop.
+            deterministic_mutations = {"edit_file", "write_file"}
+            names = [str(c.get("name") or "") for c in normalized_calls]
+            if names and all(n in deterministic_mutations for n in names):
+                return 2
+            return 3
+
+        # Tool-loop guard: block repeating identical tool calls (common OSS model failure mode).
+        try:
+            normalized_calls = _normalized_tool_calls_for_signature(tool_calls)
+            sig = _tool_calls_signature(tool_calls)
+            threshold = _tool_loop_threshold(normalized_calls)
+
+            loop_guard = scratchpad.get("tool_loop_guard")
+            if not isinstance(loop_guard, dict):
+                loop_guard = {}
+            prev_sig = loop_guard.get("sig")
+            prev_count = loop_guard.get("count")
+            try:
+                prev_count_int = int(prev_count or 0)
+            except Exception:
+                prev_count_int = 0
+
+            count = prev_count_int + 1 if isinstance(prev_sig, str) and prev_sig == sig else 1
+            loop_guard.update(
+                {
+                    "sig": sig,
+                    "count": count,
+                    "tool_names": [c.get("name") for c in normalized_calls if isinstance(c, dict)],
+                }
+            )
+            scratchpad["tool_loop_guard"] = loop_guard
+            temp["_tool_calls_sig"] = sig
+
+            if count >= threshold and normalized_calls:
+                last_error = loop_guard.get("last_error")
+                if not isinstance(last_error, str):
+                    last_error = ""
+                hint = (
+                    "Tool loop guard: blocked repeated identical tool call(s).\n"
+                    "Next step: adjust arguments based on the last tool output. "
+                    "For edit_file failures, re-read the file and widen/remove start_line/end_line or change the pattern/regex.\n"
+                )
+                if last_error.strip():
+                    hint += f"\nPrevious tool error:\n{last_error.strip()}\n"
+
+                inbox = runtime_ns.get("inbox")
+                if not isinstance(inbox, list):
+                    inbox = []
+                    runtime_ns["inbox"] = inbox
+                inbox.append({"role": "system", "content": hint.strip()})
+
+                blocked_results: list[dict[str, Any]] = []
+                for idx, tc in enumerate(tool_calls, start=1):
+                    if isinstance(tc, ToolCall):
+                        name = str(tc.name or "")
+                        call_id_raw = tc.call_id
+                    elif isinstance(tc, dict):
+                        name = str(tc.get("name", "") or "")
+                        call_id_raw = tc.get("call_id")
+                    else:
+                        name = ""
+                        call_id_raw = None
+                    call_id = str(call_id_raw).strip() if call_id_raw is not None else ""
+                    if not call_id:
+                        call_id = str(idx)
+                    blocked_results.append(
+                        {
+                            "call_id": call_id,
+                            "name": name,
+                            "success": False,
+                            "output": None,
+                            "error": "Duplicate tool call blocked (tool loop guard).",
+                        }
+                    )
+
+                temp["pending_tool_calls"] = []
+                temp["tool_results"] = {"mode": "executed", "results": blocked_results}
+                emit("act_blocked_loop_guard", {"count": count, "threshold": threshold, "tools": [r.get("name") for r in blocked_results]})
+                return StepPlan(node_id="act", next_node="observe")
+        except Exception:
+            # Tool loop guard must be best-effort; never block tool execution due to guard errors.
+            pass
+
         for i, tc in enumerate(tool_calls, start=1):
             if isinstance(tc, dict):
                 call_id_raw = tc.get("call_id")
@@ -797,6 +1007,26 @@ def create_react_workflow(
             results = []
         if results:
             scratchpad["used_tools"] = True
+
+        # Persist lightweight tool-loop context to help the agent avoid repeating failures.
+        sig = temp.pop("_tool_calls_sig", None)
+        if isinstance(sig, str) and sig.strip() and results:
+            loop_guard = scratchpad.get("tool_loop_guard")
+            if isinstance(loop_guard, dict) and str(loop_guard.get("sig") or "") == sig:
+                any_failure = False
+                first_error = ""
+                for r in results:
+                    if not isinstance(r, dict):
+                        continue
+                    if bool(r.get("success")) is True:
+                        continue
+                    any_failure = True
+                    err = r.get("error") or r.get("output") or ""
+                    if isinstance(err, str) and err.strip() and not first_error:
+                        first_error = err.strip()
+                loop_guard["last_success"] = not any_failure
+                loop_guard["last_error"] = first_error
+                scratchpad["tool_loop_guard"] = loop_guard
 
         for r in results:
             if not isinstance(r, dict):

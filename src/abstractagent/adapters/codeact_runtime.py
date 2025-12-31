@@ -13,6 +13,7 @@ from abstractruntime.memory.active_context import ActiveContextPolicy
 from abstractruntime.memory.active_memory import render_active_memory_split_for_llm_request
 
 from ..logic.codeact import CodeActLogic
+from .memory_delta import extract_active_memory_delta
 
 
 def _new_message(
@@ -331,7 +332,30 @@ def create_codeact_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
-        mem_split = render_active_memory_split_for_llm_request(run.vars, include_tools_summary=True)
+        # Use AbstractCore token estimation for Active Memory fitting when available so
+        # prompt composition + `/memory` token metrics stay in the same ballpark.
+        try:
+            from abstractcore.utils.token_utils import TokenUtils  # type: ignore
+        except Exception:  # pragma: no cover
+            TokenUtils = None  # type: ignore[assignment]
+
+        # CodeAct workflow does not capture provider/model as closure vars; rely on runtime vars.
+        eff_model_for_tokens = str(runtime_ns.get("model") or "").strip()
+
+        def _count_tokens(text: str) -> int:
+            s = str(text or "")
+            if not s:
+                return 0
+            if TokenUtils is None:
+                return max(1, len(s) // 4)
+            try:
+                return max(0, int(TokenUtils.estimate_tokens(s, model=eff_model_for_tokens)))
+            except Exception:
+                return max(1, len(s) // 4)
+
+        mem_split = render_active_memory_split_for_llm_request(
+            run.vars, include_tools_summary=True, token_counter=_count_tokens
+        )
         active_memory = str(mem_split.get("user_memory") or "")
         system_memory = str(mem_split.get("system_memory") or "")
         req = logic.build_request(
@@ -368,6 +392,19 @@ def create_codeact_workflow(
         context, scratchpad, runtime_ns, temp, _ = ensure_codeact_vars(run)
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
+        delta_result: Optional[Dict[str, Any]] = None
+
+        # Apply structured Active Memory deltas (if present) and remove them from user-visible content.
+        try:
+            content, delta = extract_active_memory_delta(content)
+            # Only apply deltas when the model is NOT emitting tool calls. Tool-call turns are
+            # usually incomplete; we still strip the delta block from content for safety.
+            if not tool_calls and isinstance(delta, dict) and delta:
+                from abstractruntime.memory.active_memory import apply_active_memory_delta
+
+                delta_result = apply_active_memory_delta(run.vars, delta=delta)
+        except Exception:
+            delta_result = None
 
         if content:
             context["messages"].append(_new_message(ctx, role="assistant", content=content))
@@ -378,6 +415,8 @@ def create_codeact_workflow(
 
         temp.pop("llm_response", None)
         emit("parse", {"has_tool_calls": bool(tool_calls), "content_preview": (content[:100] if content else "(no content)")})
+        if isinstance(delta_result, dict) and delta_result.get("ok"):
+            emit("active_memory_delta", {"applied": delta_result.get("applied")})
 
         if tool_calls:
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
@@ -400,12 +439,39 @@ def create_codeact_workflow(
         if not tool_calls:
             return StepPlan(node_id="act", next_node="reason")
 
+        allow = _effective_allowlist(runtime_ns)
+        builtin_effect_tools = {
+            "ask_user",
+            "recall_memory",
+            "inspect_vars",
+            "remember",
+            "compact_memory",
+            "compact_active_memory",
+        }
+
         # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
         for i, tc in enumerate(tool_calls):
             if not isinstance(tc, dict):
                 continue
             name = tc.get("name")
             args = tc.get("arguments") or {}
+
+            if isinstance(name, str) and name in builtin_effect_tools:
+                if name not in allow:
+                    temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                    temp["tool_results"] = {
+                        "results": [
+                            {
+                                "call_id": str(tc.get("call_id") or ""),
+                                "name": name,
+                                "success": False,
+                                "output": None,
+                                "error": f"Tool '{name}' is not allowed for this agent",
+                            }
+                        ]
+                    }
+                    emit("act_blocked", {"tool": name})
+                    return StepPlan(node_id="act", next_node="observe")
 
             if name == "ask_user":
                 question = str(args.get("question") or "Please provide input:")
@@ -491,6 +557,25 @@ def create_codeact_workflow(
                     next_node="observe",
                 )
 
+            if name == "compact_active_memory":
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                payload = dict(args) if isinstance(args, dict) else {}
+                payload.setdefault("tool_name", "compact_active_memory")
+                payload.setdefault("call_id", tc.get("call_id") or "memory")
+                emit(
+                    "memory_compact_structured",
+                    {"components": payload.get("components"), "preserve": payload.get("preserve")},
+                )
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.MEMORY_COMPACT_STRUCTURED,
+                        payload=payload,
+                        result_key="_temp.tool_results",
+                    ),
+                    next_node="observe",
+                )
+
         for i, tc in enumerate(tool_calls, start=1):
             if isinstance(tc, dict):
                 call_id_raw = tc.get("call_id")
@@ -518,7 +603,6 @@ def create_codeact_workflow(
                     call_id = str(i)
                 formatted_calls.append({"name": tc.name, "arguments": tc.arguments, "call_id": call_id})
 
-        allow = _effective_allowlist(runtime_ns)
         return StepPlan(
             node_id="act",
             effect=Effect(

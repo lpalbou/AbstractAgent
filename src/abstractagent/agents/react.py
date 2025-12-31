@@ -19,7 +19,14 @@ from abstractruntime import RunState, Runtime, WorkflowSpec
 
 from .base import BaseAgent
 from ..adapters.react_runtime import create_react_workflow
-from ..logic.builtins import ASK_USER_TOOL, COMPACT_MEMORY_TOOL, INSPECT_VARS_TOOL, RECALL_MEMORY_TOOL, REMEMBER_TOOL
+from ..logic.builtins import (
+    ASK_USER_TOOL,
+    COMPACT_ACTIVE_MEMORY_TOOL,
+    COMPACT_MEMORY_TOOL,
+    INSPECT_VARS_TOOL,
+    RECALL_MEMORY_TOOL,
+    REMEMBER_TOOL,
+)
 from ..logic.react import ReActLogic
 
 
@@ -87,7 +94,15 @@ class ReactAgent(BaseAgent):
     def _create_workflow(self) -> WorkflowSpec:
         tool_defs = _tool_definitions_from_callables(self.tools)
         # Built-in ask_user is a schema-only tool (handled via ASK_USER effect in the adapter).
-        tool_defs = [ASK_USER_TOOL, RECALL_MEMORY_TOOL, INSPECT_VARS_TOOL, REMEMBER_TOOL, COMPACT_MEMORY_TOOL, *tool_defs]
+        tool_defs = [
+            ASK_USER_TOOL,
+            RECALL_MEMORY_TOOL,
+            INSPECT_VARS_TOOL,
+            REMEMBER_TOOL,
+            COMPACT_MEMORY_TOOL,
+            COMPACT_ACTIVE_MEMORY_TOOL,
+            *tool_defs,
+        ]
 
         logic = ReActLogic(
             tools=tool_defs,
@@ -154,6 +169,14 @@ class ReactAgent(BaseAgent):
         if isinstance(allowed_tools, list):
             normalized = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
             vars["_runtime"]["allowed_tools"] = normalized
+
+        # Seed Structured Active Memory with the top-level task so Current Tasks is never empty.
+        try:
+            from abstractruntime.memory.active_memory import upsert_task
+
+            upsert_task(vars, title=task)
+        except Exception:
+            pass
 
         run_id = self.runtime.start(
             workflow=self.workflow,

@@ -205,3 +205,33 @@ COMPACT_MEMORY_TOOL = ToolDefinition(
         "When the active context is getting too large and you need to reduce it while keeping the full sources recoverable."
     ),
 )
+
+COMPACT_ACTIVE_MEMORY_TOOL = ToolDefinition(
+    name="compact_active_memory",
+    description=(
+        "Compact Structured Active Memory (current tasks/context/insights/history) while preserving provenance. "
+        "This archives overflow items per component into a span (ArtifactStore) and appends a Key History event "
+        "with `span_id=...` so you can later recall the original items via recall_memory."
+    ),
+    parameters={
+        "components": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Optional list of components to compact. Supported: "
+                "current_tasks, current_context, critical_insights, key_history."
+            ),
+        },
+        "preserve": {
+            "type": "object",
+            "description": (
+                "Optional per-component keep counts (keep newest N items). "
+                "Example: {\"key_history\": 50, \"critical_insights\": 30}."
+            ),
+        },
+    },
+    when_to_use=(
+        "When Active Memory lists (especially critical_insights/key_history) are growing too large and you want "
+        "to archive older items into a span with a durable handle (span_id)."
+    ),
+)
