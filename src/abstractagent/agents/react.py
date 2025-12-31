@@ -54,7 +54,7 @@ class ReactAgent(BaseAgent):
         on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         max_iterations: int = 25,
         max_history_messages: int = -1,
-        max_tokens: Optional[int] = 32768,
+        max_tokens: Optional[int] = None,
         plan_mode: bool = False,
         review_mode: bool = False,
         review_max_rounds: int = 1,
@@ -116,6 +116,28 @@ class ReactAgent(BaseAgent):
         if eff_review_max_rounds < 0:
             eff_review_max_rounds = 0
 
+        # Base limits come from the Runtime config so model capabilities (max context)
+        # are respected by default, unless explicitly overridden by the agent/session.
+        try:
+            base_limits = dict(self.runtime.config.to_limits_dict())
+        except Exception:
+            base_limits = {}
+        limits: Dict[str, Any] = dict(base_limits)
+        limits.setdefault("warn_iterations_pct", 80)
+        limits.setdefault("warn_tokens_pct", 80)
+        limits["max_iterations"] = int(self._max_iterations)
+        limits["current_iteration"] = 0
+        limits["max_history_messages"] = int(self._max_history_messages)
+        limits["estimated_tokens_used"] = 0
+        try:
+            max_tokens_override = int(self._max_tokens) if self._max_tokens is not None else None
+        except Exception:
+            max_tokens_override = None
+        if isinstance(max_tokens_override, int) and max_tokens_override > 0:
+            limits["max_tokens"] = max_tokens_override
+        if not isinstance(limits.get("max_tokens"), int) or int(limits.get("max_tokens") or 0) <= 0:
+            limits["max_tokens"] = 32768
+
         vars: Dict[str, Any] = {
             "context": {"task": task, "messages": _copy_messages(self.session_messages)},
             "scratchpad": {"iteration": 0, "max_iterations": int(self._max_iterations)},
@@ -127,15 +149,7 @@ class ReactAgent(BaseAgent):
             },
             "_temp": {},
             # Canonical _limits namespace for runtime awareness
-            "_limits": {
-                "max_iterations": int(self._max_iterations),
-                "current_iteration": 0,
-                "max_tokens": self._max_tokens,
-                "max_history_messages": int(self._max_history_messages),
-                "estimated_tokens_used": 0,
-                "warn_iterations_pct": 80,
-                "warn_tokens_pct": 80,
-            },
+            "_limits": limits,
         }
         if isinstance(allowed_tools, list):
             normalized = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
@@ -195,7 +209,7 @@ def create_react_agent(
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     max_iterations: int = 25,
     max_history_messages: int = -1,
-    max_tokens: Optional[int] = 32768,
+    max_tokens: Optional[int] = None,
     plan_mode: bool = False,
     review_mode: bool = False,
     review_max_rounds: int = 1,

@@ -10,6 +10,7 @@ from abstractcore.tools import ToolCall, ToolDefinition
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
+from abstractruntime.memory.active_memory import render_active_memory_split_for_llm_request
 
 from ..logic.codeact import CodeActLogic
 
@@ -259,7 +260,7 @@ def create_codeact_workflow(
         emit("plan_request", {"tools": allow})
 
         payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
-        sys = _system_prompt(runtime_ns) or req.system_prompt
+        sys = _system_prompt(runtime_ns)
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
 
@@ -322,10 +323,23 @@ def create_codeact_workflow(
 
         messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
+        # Refresh tool metadata BEFORE rendering Active Memory so `Tools (session)` is accurate.
+        allow = _effective_allowlist(runtime_ns)
+        allowed_defs = _allowed_tool_defs(allow)
+        tool_specs = [t.to_dict() for t in allowed_defs]
+        runtime_ns["tool_specs"] = tool_specs
+        runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
+        runtime_ns.setdefault("allowed_tools", allow)
+
+        mem_split = render_active_memory_split_for_llm_request(run.vars, include_tools_summary=True)
+        active_memory = str(mem_split.get("user_memory") or "")
+        system_memory = str(mem_split.get("system_memory") or "")
         req = logic.build_request(
             task=str(context.get("task", "") or ""),
             messages=messages_view,
             guidance=guidance,
+            active_memory=active_memory,
+            system_memory=system_memory,
             iteration=iteration + 1,
             max_iterations=max_iterations,
             vars=run.vars,  # Pass vars for _limits access
@@ -333,11 +347,9 @@ def create_codeact_workflow(
 
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
-        allow = _effective_allowlist(runtime_ns)
-        allowed_defs = _allowed_tool_defs(allow)
-        payload: Dict[str, Any] = {"prompt": req.prompt, "tools": [t.to_dict() for t in allowed_defs]}
-        sys = _system_prompt(runtime_ns)
-        if sys is not None:
+        payload: Dict[str, Any] = {"prompt": req.prompt, "tools": list(tool_specs)}
+        sys = _system_prompt(runtime_ns) or req.system_prompt
+        if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
         if req.max_tokens is not None:
             payload["params"] = {"max_tokens": req.max_tokens}

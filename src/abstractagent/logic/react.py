@@ -158,6 +158,8 @@ class ReActLogic:
         task: str,
         messages: List[Dict[str, Any]],
         guidance: str = "",
+        active_memory: str = "",
+        system_memory: str = "",
         iteration: int = 1,
         max_iterations: int = 20,
         vars: Optional[Dict[str, Any]] = None,
@@ -168,6 +170,8 @@ class ReActLogic:
             task: The task to perform
             messages: Conversation history
             guidance: Optional guidance text to inject
+            active_memory: "User prompt memory" (current tasks/context/insights/history).
+            system_memory: "System prompt memory" (persona/memory organization/tools).
             iteration: Current iteration number
             max_iterations: Maximum allowed iterations
             vars: Optional run.vars dict. If provided, limits are read from
@@ -197,6 +201,10 @@ class ReActLogic:
 
         history_text = "\n".join([self._format_history_message(m) for m in messages])
         prompt = f"Iteration: {int(iteration)}/{int(max_iterations)}\n\nTask:\n{task}\n\n"
+
+        active_memory = str(active_memory or "").strip()
+        if active_memory:
+            prompt += f"Active Memory:\n{active_memory}\n\n"
 
         if history_text:
             prompt += f"History:\n{history_text}\n\n"
@@ -229,8 +237,20 @@ class ReActLogic:
             "- Do not prefix your messages with role labels like 'assistant:'.\n"
         )
 
+        system_memory = str(system_memory or "").strip()
+        if system_memory:
+            system_prompt = f"{system_memory}\n\n{system_prompt}".strip()
+
+        # Prefer the runtime allowlist when present so the system prompt stays consistent
+        # with AbstractCode `/tools` (and with the tool specs actually sent to the model).
         try:
-            tool_names = ", ".join([t.name for t in self._tools if getattr(t, "name", None)])
+            runtime_ns = (vars or {}).get("_runtime", {}) if isinstance(vars, dict) else {}
+            allowed = runtime_ns.get("allowed_tools") if isinstance(runtime_ns, dict) else None
+            if isinstance(allowed, list) and allowed:
+                normalized = [str(t).strip() for t in allowed if isinstance(t, str) and t.strip()]
+                tool_names = ", ".join(normalized)
+            else:
+                tool_names = ", ".join([t.name for t in self._tools if getattr(t, "name", None)])
         except Exception:
             tool_names = ""
         if tool_names:

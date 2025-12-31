@@ -10,6 +10,7 @@ from abstractcore.tools import ToolCall
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
+from abstractruntime.memory.active_memory import render_active_memory_split_for_llm_request
 
 from ..logic.react import ReActLogic
 
@@ -290,7 +291,7 @@ def create_react_workflow(
         emit("plan_request", {"tools": allow})
 
         payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
-        sys = _system_prompt(runtime_ns) or req.system_prompt
+        sys = _system_prompt(runtime_ns)
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
@@ -353,6 +354,14 @@ def create_react_workflow(
         task = str(context.get("task", "") or "")
         messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
+        # Refresh tool metadata BEFORE rendering Active Memory so `Tools (session)` is accurate.
+        allow = _effective_allowlist(runtime_ns)
+        allowed_defs = _allowed_tool_defs(allow)
+        tool_specs = [t.to_dict() for t in allowed_defs]
+        runtime_ns["tool_specs"] = tool_specs
+        runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
+        runtime_ns.setdefault("allowed_tools", allow)
+
         inbox = runtime_ns.get("inbox", [])
         guidance = ""
         if isinstance(inbox, list) and inbox:
@@ -360,10 +369,15 @@ def create_react_workflow(
             guidance = " | ".join([m for m in inbox_messages if m])
             runtime_ns["inbox"] = []
 
+        mem_split = render_active_memory_split_for_llm_request(run.vars, include_tools_summary=True)
+        active_memory = str(mem_split.get("user_memory") or "")
+        system_memory = str(mem_split.get("system_memory") or "")
         req = logic.build_request(
             task=task,
             messages=messages_view,
             guidance=guidance,
+            active_memory=active_memory,
+            system_memory=system_memory,
             iteration=iteration + 1,
             max_iterations=max_iterations,
             vars=run.vars,  # Pass vars for _limits access
@@ -372,13 +386,11 @@ def create_react_workflow(
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
         payload = {"prompt": req.prompt}
-        allow = _effective_allowlist(runtime_ns)
-        allowed_defs = _allowed_tool_defs(allow)
-        tools_payload = [t.to_dict() for t in allowed_defs]
+        tools_payload = list(tool_specs)
         if tools_payload:
             payload["tools"] = tools_payload
-        sys = _system_prompt(runtime_ns)
-        if sys is not None:
+        sys = _system_prompt(runtime_ns) or req.system_prompt
+        if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
         # Provider/model can be configured statically (create_react_workflow args)
         # or injected dynamically through durable vars in `_runtime` (Visual Agent pins).
@@ -397,6 +409,83 @@ def create_react_workflow(
 
         return StepPlan(
             node_id="reason",
+            effect=Effect(
+                type=EffectType.LLM_CALL,
+                payload=payload,
+                result_key="_temp.llm_response",
+            ),
+            next_node="parse",
+        )
+
+    def tool_retry_minimal_node(run: RunState, ctx) -> StepPlan:
+        """Recovery path when the model fabricates `observation[...]` logs instead of calling tools.
+
+        This intentionally sends a minimal prompt (no History/Scratchpad) to reduce
+        long-context contamination and force either a real tool call or a direct answer.
+        """
+        context, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
+        task = str(context.get("task", "") or "")
+
+        allow = _effective_allowlist(runtime_ns)
+        allowed_defs = _allowed_tool_defs(allow)
+        tool_specs = [t.to_dict() for t in allowed_defs]
+        runtime_ns["tool_specs"] = tool_specs
+        runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
+        runtime_ns.setdefault("allowed_tools", allow)
+
+        mem_split = render_active_memory_split_for_llm_request(run.vars, include_tools_summary=True)
+        system_memory = str(mem_split.get("system_memory") or "")
+        # Reuse the canonical agent rules from ReActLogic (but do not include History/Scratchpad in prompt).
+        sys_req = logic.build_request(
+            task=task,
+            messages=[],
+            guidance="",
+            active_memory="",
+            system_memory=system_memory,
+            iteration=0,
+            max_iterations=0,
+            vars=run.vars,
+        )
+
+        bad_excerpt = str(temp.get("tool_retry_bad_content") or "").strip()
+        temp.pop("tool_retry_bad_content", None)
+        if len(bad_excerpt) > 240:
+            bad_excerpt = bad_excerpt[:240].rstrip() + "…"
+
+        prompt = (
+            "Task:\n"
+            f"{task}\n\n"
+            "Your previous message was invalid: it contained fabricated `observation[...]` tool logs, but no tool was called.\n\n"
+            "Now do ONE of the following:\n"
+            "1) If you need more information to answer correctly, CALL ONE TOOL now using the required tool call format.\n"
+            "2) If you can answer without tools, answer directly WITHOUT mentioning any tool calls or observations.\n\n"
+            "Rules:\n"
+            "- Do NOT write `observation[` anywhere.\n"
+            "- Do NOT fabricate tool results.\n"
+            "- If you call a tool, output ONLY the tool call (no extra text).\n"
+        )
+        if bad_excerpt:
+            prompt += f"\nBad output excerpt (do not copy):\n{bad_excerpt}\n"
+
+        payload: Dict[str, Any] = {"prompt": prompt}
+        if tool_specs:
+            payload["tools"] = tool_specs
+        sys = _system_prompt(runtime_ns) or sys_req.system_prompt
+        if isinstance(sys, str) and sys.strip():
+            payload["system_prompt"] = sys
+
+        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
+        if isinstance(eff_provider, str) and eff_provider.strip():
+            payload["provider"] = eff_provider.strip()
+        if isinstance(eff_model, str) and eff_model.strip():
+            payload["model"] = eff_model.strip()
+
+        payload["params"] = {"temperature": 0.2}
+
+        emit("tool_retry_minimal", {"tools": allow, "has_excerpt": bool(bad_excerpt)})
+        return StepPlan(
+            node_id="tool_retry_minimal",
             effect=Effect(
                 type=EffectType.LLM_CALL,
                 payload=payload,
@@ -431,6 +520,7 @@ def create_react_workflow(
         # Reset retry counter on any successful tool-call detection.
         if tool_calls:
             scratchpad["tool_retry_count"] = 0
+            scratchpad["tool_retry_minimal_used"] = False
 
         if tool_calls:
             if content.strip():
@@ -460,13 +550,32 @@ def create_react_workflow(
                         "role": "system",
                         "content": (
                             "You wrote an `observation[...]` line, but no tool was actually called.\n"
-                            "Do NOT fabricate tool outputs. If you need to search/fetch/read/write, CALL the tool now.\n"
-                            "Do not output `observation[...]` markers; those are context-only."
+                            "Do NOT fabricate tool outputs.\n"
+                            "If you need to search/fetch/read/write, CALL a tool now using the required tool call format.\n"
+                            "Never output `observation[...]` markers; those are context-only."
                         ),
                     }
                 )
                 emit("parse_retry_missing_tool_call", {"retries": retries + 1})
                 return StepPlan(node_id="parse", next_node="reason")
+
+            # If the model still fails after retries, attempt a single minimal-context recovery call
+            # instead of accepting a fabricated transcript as the final answer.
+            if not bool(scratchpad.get("tool_retry_minimal_used")):
+                scratchpad["tool_retry_minimal_used"] = True
+                scratchpad["tool_retry_count"] = 0
+                temp["tool_retry_bad_content"] = content
+                emit("parse_retry_minimal_context", {"retries": retries})
+                return StepPlan(node_id="parse", next_node="tool_retry_minimal")
+
+            safe = (
+                "I can't proceed safely: the model repeatedly produced fabricated `observation[...]` tool logs instead of calling tools.\n"
+                "Please retry, reduce context, or switch models."
+            )
+            context["messages"].append(_new_message(ctx, role="assistant", content=safe, metadata={"kind": "error"}))
+            temp["final_answer"] = safe
+            scratchpad["tool_retry_count"] = 0
+            return StepPlan(node_id="parse", next_node="maybe_review")
 
         if content.strip():
             context["messages"].append(_new_message(ctx, role="assistant", content=content))
@@ -993,6 +1102,7 @@ def create_react_workflow(
             "plan": plan_node,
             "plan_parse": plan_parse_node,
             "reason": reason_node,
+            "tool_retry_minimal": tool_retry_minimal_node,
             "parse": parse_node,
             "act": act_node,
             "observe": observe_node,

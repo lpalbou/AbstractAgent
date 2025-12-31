@@ -70,6 +70,8 @@ class CodeActLogic:
         task: str,
         messages: List[Dict[str, Any]],
         guidance: str = "",
+        active_memory: str = "",
+        system_memory: str = "",
         iteration: int = 1,
         max_iterations: int = 20,
         vars: Optional[Dict[str, Any]] = None,
@@ -80,6 +82,8 @@ class CodeActLogic:
             task: The task to perform
             messages: Conversation history
             guidance: Optional guidance text to inject
+            active_memory: "User prompt memory" (current tasks/context/insights/history).
+            system_memory: "System prompt memory" (persona/memory organization/tools).
             iteration: Current iteration number
             max_iterations: Maximum allowed iterations
             vars: Optional run.vars dict. If provided, limits are read from
@@ -106,6 +110,9 @@ class CodeActLogic:
         history_text = "\n".join([self._format_history_message(m) for m in history])
 
         prompt = f"Iteration: {int(iteration)}/{int(max_iterations)}\n\nTask:\n{task}\n\n"
+        active_memory = str(active_memory or "").strip()
+        if active_memory:
+            prompt += f"Active Memory:\n{active_memory}\n\n"
         if history_text:
             prompt += f"History:\n{history_text}\n\n"
         if guidance:
@@ -126,6 +133,9 @@ class CodeActLogic:
             "When you are confident, provide the final answer without calling tools.\n"
             "If tool calling is unavailable, include a fenced ```python code block instead.\n"
         )
+        system_memory = str(system_memory or "").strip()
+        if system_memory:
+            system_prompt = f"{system_memory}\n\n{system_prompt}".strip()
         if plan_mode:
             system_prompt += (
                 "\nPlan mode:\n"
