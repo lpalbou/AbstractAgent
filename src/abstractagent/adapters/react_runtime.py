@@ -903,8 +903,18 @@ def create_react_workflow(
                     last_error = ""
                 hint = (
                     "Tool loop guard: blocked repeated identical tool call(s).\n"
-                    "Next step: adjust arguments based on the last tool output. "
-                    "For edit_file failures, re-read the file and widen/remove start_line/end_line or change the pattern/regex.\n"
+                    "Next step: do NOT repeat the same call. Adjust strategy based on the last tool output.\n"
+                    "\n"
+                    "Editing best practice (SOTA): search_files → read_file → small edit/patch.\n"
+                    "\n"
+                    "For edit_file failures:\n"
+                    "- Use search_files() to find the exact line(s), then read_file() around them.\n"
+                    "- Keep pattern small/unique (often 1–5 lines) and set max_replacements=1.\n"
+                    "- Bound the edit with start_line/end_line when possible.\n"
+                    "- For multi-line code blocks, prefer unified diff mode (replacement=None) or preview_only=True.\n"
+                    "\n"
+                    "For write_file:\n"
+                    "- Only use it when you intend to overwrite the ENTIRE file with complete content.\n"
                 )
                 if last_error.strip():
                     hint += f"\nPrevious tool error:\n{last_error.strip()}\n"
