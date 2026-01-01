@@ -445,6 +445,7 @@ def create_codeact_workflow(
             "recall_memory",
             "inspect_vars",
             "remember",
+            "remember_note",
             "compact_memory",
             "compact_active_memory",
         }
@@ -532,6 +533,22 @@ def create_codeact_workflow(
                     node_id="act",
                     effect=Effect(
                         type=EffectType.MEMORY_TAG,
+                        payload=payload,
+                        result_key="_temp.tool_results",
+                    ),
+                    next_node="observe",
+                )
+
+            if name == "remember_note":
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                payload = dict(args) if isinstance(args, dict) else {}
+                payload.setdefault("tool_name", "remember_note")
+                payload.setdefault("call_id", tc.get("call_id") or "memory")
+                emit("memory_note", {"note": payload.get("note"), "tags": payload.get("tags")})
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.MEMORY_NOTE,
                         payload=payload,
                         result_key="_temp.tool_results",
                     ),
@@ -657,9 +674,21 @@ def create_codeact_workflow(
             success = bool(r.get("success"))
             output = r.get("output", "")
             error = r.get("error", "")
+            # Prefer a tool-supplied human/LLM-friendly rendering when present.
+            def _display(v: Any) -> str:
+                if isinstance(v, dict):
+                    rendered = v.get("rendered")
+                    if isinstance(rendered, str) and rendered.strip():
+                        return rendered.strip()
+                return "" if v is None else str(v)
+
+            display = _display(output)
+            if not success:
+                # Preserve structured outputs for provenance, but show a clean string to the LLM/UI.
+                display = _display(output) if isinstance(output, dict) else str(error or output)
             rendered = logic.format_observation(
                 name=name,
-                output=(output if success else (error or output)),
+                output=display,
                 success=success,
             )
             # Observability: avoid truncating normal tool results in step events.

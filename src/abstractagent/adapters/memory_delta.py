@@ -19,42 +19,44 @@ def extract_active_memory_delta(text: str) -> Tuple[str, Optional[Dict[str, Any]
       (clean_text, delta_dict_or_none)
 
     Notes:
-    - Uses the LAST matching fence in the message.
-    - Removes the entire fenced block from the returned text.
-    - If JSON parsing fails, returns the original text and None.
+    - Removes ALL matching delta fenced blocks from the returned text (never shown to user).
+    - Parses the LAST valid JSON dict among the removed blocks (best-effort).
+    - If no valid dict parses, returns (clean_text, None).
     """
     raw = "" if text is None else str(text)
     if not raw.strip():
         return raw, None
 
     lines = raw.splitlines()
-    start_idx: Optional[int] = None
-    for i, line in enumerate(lines):
-        if line.strip().lower() in _DELTA_FENCES:
-            start_idx = i
-    if start_idx is None:
-        return raw, None
+    cleaned_lines: list[str] = []
 
-    end_idx: Optional[int] = None
-    for j in range(start_idx + 1, len(lines)):
-        if lines[j].strip() == "```":
-            end_idx = j
-            break
-    if end_idx is None:
-        return raw, None
+    last_valid: Optional[Dict[str, Any]] = None
 
-    payload = "\n".join(lines[start_idx + 1 : end_idx]).strip()
-    if not payload:
-        delta: Any = {}
-    else:
-        try:
-            delta = json.loads(payload)
-        except Exception:
-            return raw, None
-    if not isinstance(delta, dict):
-        return raw, None
+    i = 0
+    while i < len(lines):
+        if lines[i].strip().lower() not in _DELTA_FENCES:
+            cleaned_lines.append(lines[i])
+            i += 1
+            continue
 
-    new_lines = lines[:start_idx] + lines[end_idx + 1 :]
-    cleaned = "\n".join(new_lines).rstrip()
-    return cleaned, dict(delta)
+        # Found a delta fence. Consume until closing ``` or EOF.
+        j = i + 1
+        while j < len(lines) and lines[j].strip() != "```":
+            j += 1
 
+        payload_lines = lines[i + 1 : j]
+        payload = "\n".join(payload_lines).strip()
+        if payload:
+            try:
+                parsed = json.loads(payload)
+                if isinstance(parsed, dict):
+                    last_valid = dict(parsed)
+            except Exception:
+                # Ignore parsing errors; we still strip the block from user-visible content.
+                pass
+
+        # Skip the closing fence line if present.
+        i = j + 1 if j < len(lines) else len(lines)
+
+    cleaned = "\n".join(cleaned_lines).rstrip()
+    return cleaned, last_valid
