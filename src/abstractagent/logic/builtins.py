@@ -77,6 +77,11 @@ RECALL_MEMORY_TOOL = ToolDefinition(
             "description": "Maximum total messages to render in the recall output across all spans (-1 = no truncation).",
             "default": -1,
         },
+        "scope": {
+            "type": "string",
+            "description": "Memory scope to query: run | session | global | all (default run).",
+            "default": "run",
+        },
     },
     when_to_use="Use after compaction or when you need exact details from earlier context.",
 )
@@ -158,6 +163,11 @@ REMEMBER_NOTE_TOOL = ToolDefinition(
                 "Example: {\"span_ids\":[\"span_...\"], \"message_ids\":[\"msg_...\"]}"
             ),
             "default": None,
+        },
+        "scope": {
+            "type": "string",
+            "description": "Where to store this note: run | session | global (default run).",
+            "default": "run",
         },
     },
     when_to_use=(

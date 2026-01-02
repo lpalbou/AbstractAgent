@@ -22,6 +22,13 @@ import pytest
 from abstractcore.tools.core import tool
 
 
+if str(os.getenv("ABSTRACTAGENT_RUN_INTEGRATION_TESTS") or "").strip().lower() not in {"1", "true", "yes"}:
+    pytest.skip(
+        "Skipping real-LLM integration tests (set ABSTRACTAGENT_RUN_INTEGRATION_TESTS=1 to enable).",
+        allow_module_level=True,
+    )
+
+
 def _llm_config() -> Tuple[str, str, Dict[str, Any]]:
     provider = os.getenv("ABSTRACTAGENT_TEST_PROVIDER", "ollama")
     model = os.getenv("ABSTRACTAGENT_TEST_MODEL", "qwen3:4b-instruct-2507-q4_K_M")

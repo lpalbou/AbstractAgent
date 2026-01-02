@@ -130,14 +130,14 @@ def _summarize_tool_usage(events: List[ToolCallEvent]) -> Dict[str, Any]:
         if e.name == "read_file":
             should_entire = e.arguments.get("should_read_entire_file", True)
             start = (
-                e.arguments.get("start_line_one_indexed")
-                if e.arguments.get("start_line_one_indexed") is not None
-                else e.arguments.get("start_line", e.arguments.get("start", 1))
+                e.arguments.get("start_line")
+                if e.arguments.get("start_line") is not None
+                else e.arguments.get("start_line_one_indexed", e.arguments.get("start", 1))
             )
             end = (
-                e.arguments.get("end_line_one_indexed_inclusive")
-                if e.arguments.get("end_line_one_indexed_inclusive") is not None
-                else e.arguments.get("end_line", e.arguments.get("end"))
+                e.arguments.get("end_line")
+                if e.arguments.get("end_line") is not None
+                else e.arguments.get("end_line_one_indexed_inclusive", e.arguments.get("end"))
             )
             try:
                 start_i = int(start or 1)
@@ -218,7 +218,7 @@ def _make_python_scenario() -> Scenario:
             "Constraints:\n"
             "- Do NOT try to read the entire file (it is >400 lines; read_file(full) will refuse).\n"
             "- Use analyze_code() first to locate the Player definition.\n"
-            "- Then use read_file(start/end) around the relevant blocks.\n"
+            "- Then use read_file(start_line/end_line) around the relevant blocks.\n"
             "- Apply small, surgical edit_file() calls (short patterns; max_replacements=1).\n\n"
             "Expected fix:\n"
             "- Player.__init__ should accept an optional color parameter and set self.color\n"
@@ -289,7 +289,7 @@ def _make_js_scenario() -> Scenario:
             f"Target file: {ctx['file_path']}\n\n"
             "Constraints:\n"
             "- Use analyze_code() first to locate greet/run.\n"
-            "- Use read_file(start/end) around the run() function.\n"
+            "- Use read_file(start_line/end_line) around the run() function.\n"
             "- Make a minimal edit_file() change: call greet('world') instead of greets('world').\n"
         )
 

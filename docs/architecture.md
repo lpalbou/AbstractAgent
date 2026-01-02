@@ -1,6 +1,6 @@
 # AbstractAgent — Architecture (Current)
 
-> Updated: 2025-12-27  
+> Updated: 2026-01-02  
 > Scope: this describes **what is implemented today** in this monorepo (no “future” design claims).
 
 AbstractAgent is the **agent-pattern library** of the AbstractFramework. It provides portable agent behaviors implemented as:
@@ -47,7 +47,7 @@ Both ReAct and CodeAct store conversation history under `context["messages"]` as
 - `reason` → `EffectType.LLM_CALL` with `{prompt, tools?, system_prompt?, provider?, model?, params}`
 - `parse` → parse tool calls (native or fallback parse-from-content); decide next step
 - `act` → either:
-  - schema-only built-ins → `ASK_USER` / `MEMORY_QUERY` / `MEMORY_TAG` / `MEMORY_COMPACT`, or
+  - schema-only built-ins → `ASK_USER` / `MEMORY_QUERY` / `MEMORY_TAG` / `MEMORY_NOTE` / `MEMORY_COMPACT`, or
   - regular tool calls → `TOOL_CALLS`
 - `observe` → append tool observations to `context.messages`, then loop
 - `finalize` / `finalize_parse` → optional final synthesis pass if tools were used
@@ -80,7 +80,11 @@ CodeAct is ReAct-like, but the primary action is executing Python:
 - the model can call tools like `execute_python`, or include fenced ` ```python ... ``` ` blocks
 - the adapter translates code execution into `EffectType.TOOL_CALLS` with a single call to `execute_python`
 
-It supports the same schema-only built-ins as ReAct (`ask_user`, `recall_memory`, `remember`, `compact_memory`) via runtime effects.
+It supports the same schema-only built-ins as ReAct (`ask_user`, `recall_memory`, `remember`, `remember_note`, `compact_memory`) via runtime effects.
+
+Notes:
+- `recall_memory` supports `scope` routing (`run|session|global|all`) for cross-subrun recall without extra host glue.
+- `remember_note` supports `scope` routing (`run|session|global`) for durable note storage into session/global indexes.
 
 ## BaseAgent API (Durable lifecycle)
 
