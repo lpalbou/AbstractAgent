@@ -328,6 +328,9 @@ def create_codeact_workflow(
         allow = _effective_allowlist(runtime_ns)
         allowed_defs = _allowed_tool_defs(allow)
         tool_specs = [t.to_dict() for t in allowed_defs]
+        include_examples = bool(runtime_ns.get("tool_prompt_examples", True))
+        if not include_examples:
+            tool_specs = [{k: v for k, v in spec.items() if k != "examples"} for spec in tool_specs if isinstance(spec, dict)]
         runtime_ns["tool_specs"] = tool_specs
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)

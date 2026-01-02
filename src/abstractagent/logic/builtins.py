@@ -9,10 +9,7 @@ from abstractcore.tools import ToolDefinition
 
 ASK_USER_TOOL = ToolDefinition(
     name="ask_user",
-    description=(
-        "Ask the user a question when you need clarification or input. "
-        "Use this when the task is ambiguous or you need the user to make a choice."
-    ),
+    description="Ask the user a question.",
     parameters={
         "question": {
             "type": "string",
@@ -22,18 +19,15 @@ ASK_USER_TOOL = ToolDefinition(
             "type": "array",
             "items": {"type": "string"},
             "description": "Optional list of choices for the user to pick from",
+            "default": None,
         },
     },
-    when_to_use="When the task is ambiguous or you need user input to proceed",
+    when_to_use="Use when the task is ambiguous or you need user input to proceed.",
 )
 
 RECALL_MEMORY_TOOL = ToolDefinition(
     name="recall_memory",
-    description=(
-        "Recall original memory from archived spans with provenance. "
-        "Use this to reconstruct details after compaction or when you need exact prior context. "
-        "Prefer recalling by span_id when available."
-    ),
+    description="Recall archived memory spans with provenance (by span_id/query/tags/time range).",
     parameters={
         "span_id": {
             "type": "string",
@@ -41,22 +35,27 @@ RECALL_MEMORY_TOOL = ToolDefinition(
                 "Optional span identifier (artifact id) or 1-based index into archived spans. "
                 "If a summary includes span_id=..., use that exact value."
             ),
+            "default": None,
         },
         "query": {
             "type": "string",
             "description": "Optional keyword query (topic/person/etc). Performs metadata-first search with bounded deep scan over archived messages.",
+            "default": None,
         },
         "since": {
             "type": "string",
             "description": "Optional ISO8601 start timestamp for time-range filtering.",
+            "default": None,
         },
         "until": {
             "type": "string",
             "description": "Optional ISO8601 end timestamp for time-range filtering.",
+            "default": None,
         },
         "tags": {
             "type": "object",
             "description": "Optional metadata tag filters (e.g., {\"topic\":\"api\",\"person\":\"alice\"}).",
+            "default": None,
         },
         "limit_spans": {
             "type": "integer",
@@ -79,19 +78,12 @@ RECALL_MEMORY_TOOL = ToolDefinition(
             "default": -1,
         },
     },
-    when_to_use=(
-        "When conversation history was compacted/summarized and you need the original messages, "
-        "or when you need exact details from prior discussions."
-    ),
+    when_to_use="Use after compaction or when you need exact details from earlier context.",
 )
 
 INSPECT_VARS_TOOL = ToolDefinition(
     name="inspect_vars",
-    description=(
-        "Inspect durable run state variables (especially scratchpad) by path. "
-        "Use this for progressive recall/debugging when you need to see what the workflow/agent stored "
-        "outside of the active conversation context."
-    ),
+    description="Inspect durable run-state variables by path (e.g., scratchpad/runtime vars).",
     parameters={
         "path": {
             "type": "string",
@@ -109,20 +101,17 @@ INSPECT_VARS_TOOL = ToolDefinition(
         "target_run_id": {
             "type": "string",
             "description": "Optional run id to inspect (defaults to the current run).",
+            "default": None,
         },
     },
     when_to_use=(
-        "When you need to inspect scratchpad/runtime vars for debugging or progressive recall. "
-        "Prefer keys_only=true first to discover available fields, then retrieve a deeper path."
+        "Use to debug or inspect scratchpad/runtime vars (prefer keys_only=true first)."
     ),
 )
 
 REMEMBER_TOOL = ToolDefinition(
     name="remember",
-    description=(
-        "Remember something by applying durable tags (topic/person/etc) to an archived memory span. "
-        "Use this after compaction when you want to reliably find the span later via recall_memory(tags=...)."
-    ),
+    description="Tag an archived memory span for later recall.",
     parameters={
         "span_id": {
             "type": "string",
@@ -145,16 +134,13 @@ REMEMBER_TOOL = ToolDefinition(
         },
     },
     when_to_use=(
-        "When you want to label a recalled/compacted span with durable metadata so you can find it later by tags."
+        "Use when you want to label a recalled/compacted span with durable tags."
     ),
 )
 
 REMEMBER_NOTE_TOOL = ToolDefinition(
     name="remember_note",
-    description=(
-        "Store a durable memory note (decision/fact) with optional tags and provenance sources. "
-        "Use this to remember something memorable without requiring compaction."
-    ),
+    description="Store a durable memory note (decision/fact) with optional tags and sources.",
     parameters={
         "note": {
             "type": "string",
@@ -163,6 +149,7 @@ REMEMBER_NOTE_TOOL = ToolDefinition(
         "tags": {
             "type": "object",
             "description": "Optional tags (dict[str,str]) to help recall later, e.g. {\"topic\":\"api\",\"person\":\"alice\"}.",
+            "default": None,
         },
         "sources": {
             "type": "object",
@@ -170,6 +157,7 @@ REMEMBER_NOTE_TOOL = ToolDefinition(
                 "Optional provenance sources for this note. Use span_ids/message_ids when available.\n"
                 "Example: {\"span_ids\":[\"span_...\"], \"message_ids\":[\"msg_...\"]}"
             ),
+            "default": None,
         },
     },
     when_to_use=(
@@ -180,11 +168,7 @@ REMEMBER_NOTE_TOOL = ToolDefinition(
 
 COMPACT_MEMORY_TOOL = ToolDefinition(
     name="compact_memory",
-    description=(
-        "Compact older conversation context to reduce active memory usage while preserving provenance. "
-        "This archives older messages into a span (ArtifactStore) and inserts a system summary that includes "
-        "`span_id=...` so you can later reconstruct details via recall_memory."
-    ),
+    description="Compact older conversation context into an archived span and insert a summary handle.",
     parameters={
         "preserve_recent": {
             "type": "integer",
@@ -199,20 +183,15 @@ COMPACT_MEMORY_TOOL = ToolDefinition(
         "focus": {
             "type": "string",
             "description": "Optional focus/topic to prioritize in the summary.",
+            "default": None,
         },
     },
-    when_to_use=(
-        "When the active context is getting too large and you need to reduce it while keeping the full sources recoverable."
-    ),
+    when_to_use="Use when the active context is too large and you need to reduce it while keeping provenance.",
 )
 
 COMPACT_ACTIVE_MEMORY_TOOL = ToolDefinition(
     name="compact_active_memory",
-    description=(
-        "Compact Structured Active Memory (current tasks/context/insights/history) while preserving provenance. "
-        "This archives overflow items per component into a span (ArtifactStore) and appends a Key History event "
-        "with `span_id=...` so you can later recall the original items via recall_memory."
-    ),
+    description="Compact Active Memory lists into an archived span (preserving provenance).",
     parameters={
         "components": {
             "type": "array",
@@ -221,6 +200,7 @@ COMPACT_ACTIVE_MEMORY_TOOL = ToolDefinition(
                 "Optional list of components to compact. Supported: "
                 "current_tasks, current_context, critical_insights, key_history."
             ),
+            "default": None,
         },
         "preserve": {
             "type": "object",
@@ -228,10 +208,10 @@ COMPACT_ACTIVE_MEMORY_TOOL = ToolDefinition(
                 "Optional per-component keep counts (keep newest N items). "
                 "Example: {\"key_history\": 50, \"critical_insights\": 30}."
             ),
+            "default": None,
         },
     },
     when_to_use=(
-        "When Active Memory lists (especially critical_insights/key_history) are growing too large and you want "
-        "to archive older items into a span with a durable handle (span_id)."
+        "Use when Active Memory lists are growing too large and you need to archive older items."
     ),
 )

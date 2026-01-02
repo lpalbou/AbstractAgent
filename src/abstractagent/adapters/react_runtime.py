@@ -359,6 +359,9 @@ def create_react_workflow(
         allow = _effective_allowlist(runtime_ns)
         allowed_defs = _allowed_tool_defs(allow)
         tool_specs = [t.to_dict() for t in allowed_defs]
+        include_examples = bool(runtime_ns.get("tool_prompt_examples", True))
+        if not include_examples:
+            tool_specs = [{k: v for k, v in spec.items() if k != "examples"} for spec in tool_specs if isinstance(spec, dict)]
         runtime_ns["tool_specs"] = tool_specs
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
@@ -456,6 +459,9 @@ def create_react_workflow(
         allow = _effective_allowlist(runtime_ns)
         allowed_defs = _allowed_tool_defs(allow)
         tool_specs = [t.to_dict() for t in allowed_defs]
+        include_examples = bool(runtime_ns.get("tool_prompt_examples", True))
+        if not include_examples:
+            tool_specs = [{k: v for k, v in spec.items() if k != "examples"} for spec in tool_specs if isinstance(spec, dict)]
         runtime_ns["tool_specs"] = tool_specs
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
@@ -509,12 +515,13 @@ def create_react_workflow(
             f"{task}\n\n"
             "Your previous message was invalid: it contained fabricated `observation[...]` tool logs, but no tool was called.\n\n"
             "Now do ONE of the following:\n"
-            "1) If you need more information to answer correctly, CALL ONE TOOL now using the required tool call format.\n"
+            "1) If you need more information to answer correctly, CALL ONE OR MORE TOOLS now using the required tool call format.\n"
             "2) If you can answer without tools, answer directly WITHOUT mentioning any tool calls or observations.\n\n"
             "Rules:\n"
             "- Do NOT write `observation[` anywhere.\n"
             "- Do NOT fabricate tool results.\n"
-            "- If you call a tool, output ONLY the tool call (no extra text).\n"
+            "- If you call tools, output ONLY tool call block(s) (no extra text).\n"
+            "- You MAY batch multiple tool calls by repeating the tool-call block once per call (prefer independent calls).\n"
         )
         if bad_excerpt:
             prompt += f"\nBad output excerpt (do not copy):\n{bad_excerpt}\n"
