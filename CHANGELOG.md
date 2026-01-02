@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Observability: `on_step` tool-observation previews now include up to **1000 characters** (was 150), with an explicit truncation marker for larger outputs. Full tool outputs are still preserved in the agent message history.
 - ReAct prompt construction now **truncates large tool-call arguments** (e.g. `write_file` content) when building the runtime scratchpad, preventing prompt bloat and reducing stalls on local providers.
 - Tool observations now prefer a tool-supplied `rendered` string (when present) so tools can return structured outputs for provenance without polluting LLM-visible history.
+- Built-in memory tool schemas are richer:
+  - `recall_memory` now supports `tags_mode`, `usernames`, and `locations` (metadata-first filtering).
+  - `remember_note` now supports an optional `location` field.
 
 ### Fixed
 - Limits: ReAct/CodeAct now treat `_limits.max_tokens` as a **context/budget** limit and use `_limits.max_output_tokens` (if set) to cap OpenAI-style `max_tokens` (output). This prevents invalid LMStudio requests like `max_tokens=262144` which can return HTTP 400.

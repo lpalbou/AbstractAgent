@@ -946,6 +946,14 @@ def create_react_workflow(
             temp["_tool_calls_sig"] = sig
 
             if count >= threshold and normalized_calls:
+                cached_results_raw = loop_guard.get("last_results")
+                cached_results: list[dict[str, Any]] = []
+                if isinstance(cached_results_raw, list):
+                    for item in cached_results_raw:
+                        if isinstance(item, dict):
+                            cached_results.append(dict(item))
+                has_cached_results = bool(cached_results)
+
                 last_success = loop_guard.get("last_success")
                 if not isinstance(last_success, bool):
                     last_success = None
@@ -968,8 +976,12 @@ def create_react_workflow(
                 previous_context = "\n".join(previous_lines).strip()
 
                 hint = (
-                    "Tool loop guard: blocked repeated identical tool call(s).\n"
-                    "Next step: do NOT repeat the same call. Adjust strategy based on the last tool output.\n"
+                    (
+                        "Tool loop guard: deduped repeated identical tool call(s) (returned cached output).\n"
+                        if has_cached_results
+                        else "Tool loop guard: blocked repeated identical tool call(s).\n"
+                    )
+                    + "Next step: do NOT repeat the same call. Adjust strategy based on the last tool output.\n"
                     "\n"
                     "Editing best practice (SOTA): search_files → read_file → small edit/patch.\n"
                     "\n"
@@ -1005,6 +1017,22 @@ def create_react_workflow(
                     call_id = str(call_id_raw).strip() if call_id_raw is not None else ""
                     if not call_id:
                         call_id = str(idx)
+                    cached: Optional[dict[str, Any]] = cached_results[idx - 1] if idx - 1 < len(cached_results) else None
+                    if has_cached_results and isinstance(cached, dict):
+                        cached_success = bool(cached.get("success"))
+                        cached_output = cached.get("output")
+                        cached_error = cached.get("error")
+                        blocked_results.append(
+                            {
+                                "call_id": call_id,
+                                "name": name,
+                                "success": cached_success,
+                                "output": cached_output,
+                                "error": None if cached_success else str(cached_error or "Tool failed"),
+                            }
+                        )
+                        continue
+
                     blocked_error = "Duplicate tool call blocked (tool loop guard)."
                     if idx == 1 and previous_context:
                         blocked_error = f"{blocked_error}\n{previous_context}"
@@ -1019,8 +1047,16 @@ def create_react_workflow(
                     )
 
                 temp["pending_tool_calls"] = []
-                temp["tool_results"] = {"mode": "executed", "results": blocked_results}
-                emit("act_blocked_loop_guard", {"count": count, "threshold": threshold, "tools": [r.get("name") for r in blocked_results]})
+                temp["tool_results"] = {"mode": "executed", "results": blocked_results, "deduped": has_cached_results}
+                emit(
+                    "act_blocked_loop_guard",
+                    {
+                        "count": count,
+                        "threshold": threshold,
+                        "tools": [r.get("name") for r in blocked_results],
+                        "deduped": has_cached_results,
+                    },
+                )
                 return StepPlan(node_id="act", next_node="observe")
         except Exception:
             # Tool loop guard must be best-effort; never block tool execution due to guard errors.
@@ -1106,6 +1142,34 @@ def create_react_workflow(
                 return "…"
             return s[: max_chars - 1] + "…"
 
+        def _jsonable(value: Any) -> Any:
+            if value is None:
+                return None
+            if isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, dict):
+                return {str(k): _jsonable(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_jsonable(v) for v in value]
+            try:
+                json.dumps(value)
+                return value
+            except Exception:
+                return str(value)
+
+        def _shrink(value: Any, *, max_str: int = 8192, max_list: int = 250) -> Any:
+            if isinstance(value, str):
+                return _truncate(value, max_chars=max_str)
+            if isinstance(value, list):
+                if len(value) > max_list:
+                    out = [_shrink(v, max_str=max_str, max_list=max_list) for v in value[:max_list]]
+                    out.append("…")
+                    return out
+                return [_shrink(v, max_str=max_str, max_list=max_list) for v in value]
+            if isinstance(value, dict):
+                return {str(k): _shrink(v, max_str=max_str, max_list=max_list) for k, v in value.items()}
+            return value
+
         # Persist lightweight tool-loop context to help the agent avoid repeating failures.
         sig = temp.pop("_tool_calls_sig", None)
         result_dicts = [r for r in results if isinstance(r, dict)]
@@ -1116,6 +1180,7 @@ def create_react_workflow(
                 first_error = ""
                 summary_parts: list[str] = []
                 multi = len(result_dicts) > 1
+                cached: list[dict[str, Any]] = []
                 for r in result_dicts:
                     name = str(r.get("name", "tool") or "tool")
                     success = bool(r.get("success"))
@@ -1137,6 +1202,15 @@ def create_react_workflow(
                     else:
                         summary_parts.append(head)
 
+                    cached.append(
+                        {
+                            "name": name,
+                            "success": success,
+                            "output": _shrink(_jsonable(output)),
+                            "error": _truncate(str(error or ""), max_chars=2000),
+                        }
+                    )
+
                 last_summary = summary_parts[0] if summary_parts else ""
                 if multi:
                     last_summary = " | ".join([p for p in summary_parts if p])
@@ -1144,6 +1218,7 @@ def create_react_workflow(
                 loop_guard["last_success"] = not any_failure
                 loop_guard["last_error"] = first_error
                 loop_guard["last_summary"] = last_summary
+                loop_guard["last_results"] = cached
                 scratchpad["tool_loop_guard"] = loop_guard
 
         for r in results:

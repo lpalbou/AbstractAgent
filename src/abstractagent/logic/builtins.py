@@ -54,7 +54,38 @@ RECALL_MEMORY_TOOL = ToolDefinition(
         },
         "tags": {
             "type": "object",
-            "description": "Optional metadata tag filters (e.g., {\"topic\":\"api\",\"person\":\"alice\"}).",
+            "description": (
+                "Optional metadata tag filters.\n"
+                "- Values may be a string or a list of strings.\n"
+                "- Example: {\"topic\":\"api\",\"person\":[\"alice\",\"bob\"]}\n"
+                "Use tags_mode to control AND/OR across tag keys."
+            ),
+            "default": None,
+        },
+        "tags_mode": {
+            "type": "string",
+            "description": (
+                "How to combine tag keys: all (AND across keys) | any (OR across keys). "
+                "Within a key, list values are treated as OR."
+            ),
+            "default": "all",
+        },
+        "usernames": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Optional author filter (actor ids / usernames). Matches spans created_by case-insensitively. "
+                "Semantics: OR (any listed author)."
+            ),
+            "default": None,
+        },
+        "locations": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Optional location filter. Matches spans by explicit location metadata (or tags.location). "
+                "Semantics: OR (any listed location)."
+            ),
             "default": None,
         },
         "limit_spans": {
@@ -162,6 +193,11 @@ REMEMBER_NOTE_TOOL = ToolDefinition(
                 "Optional provenance sources for this note. Use span_ids/message_ids when available.\n"
                 "Example: {\"span_ids\":[\"span_...\"], \"message_ids\":[\"msg_...\"]}"
             ),
+            "default": None,
+        },
+        "location": {
+            "type": "string",
+            "description": "Optional location for this memory note (user perspective).",
             "default": None,
         },
         "scope": {
