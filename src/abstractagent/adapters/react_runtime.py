@@ -922,9 +922,27 @@ def create_react_workflow(
             temp["_tool_calls_sig"] = sig
 
             if count >= threshold and normalized_calls:
+                last_success = loop_guard.get("last_success")
+                if not isinstance(last_success, bool):
+                    last_success = None
+                last_summary = loop_guard.get("last_summary")
+                if not isinstance(last_summary, str):
+                    last_summary = ""
                 last_error = loop_guard.get("last_error")
                 if not isinstance(last_error, str):
                     last_error = ""
+
+                previous_lines: list[str] = []
+                if last_success is True:
+                    previous_lines.append("Previous identical call: succeeded.")
+                elif last_success is False:
+                    previous_lines.append("Previous identical call: failed.")
+                if last_summary.strip():
+                    previous_lines.append(f"Previous result summary:\n{last_summary.strip()}")
+                elif last_error.strip():
+                    previous_lines.append(f"Previous tool error:\n{last_error.strip()}")
+                previous_context = "\n".join(previous_lines).strip()
+
                 hint = (
                     "Tool loop guard: blocked repeated identical tool call(s).\n"
                     "Next step: do NOT repeat the same call. Adjust strategy based on the last tool output.\n"
@@ -940,8 +958,8 @@ def create_react_workflow(
                     "For write_file:\n"
                     "- Only use it when you intend to overwrite the ENTIRE file with complete content.\n"
                 )
-                if last_error.strip():
-                    hint += f"\nPrevious tool error:\n{last_error.strip()}\n"
+                if previous_context:
+                    hint += f"\n{previous_context}\n"
 
                 inbox = runtime_ns.get("inbox")
                 if not isinstance(inbox, list):
@@ -963,13 +981,16 @@ def create_react_workflow(
                     call_id = str(call_id_raw).strip() if call_id_raw is not None else ""
                     if not call_id:
                         call_id = str(idx)
+                    blocked_error = "Duplicate tool call blocked (tool loop guard)."
+                    if idx == 1 and previous_context:
+                        blocked_error = f"{blocked_error}\n{previous_context}"
                     blocked_results.append(
                         {
                             "call_id": call_id,
                             "name": name,
                             "success": False,
                             "output": None,
-                            "error": "Duplicate tool call blocked (tool loop guard).",
+                            "error": blocked_error,
                         }
                     )
 
@@ -1042,24 +1063,63 @@ def create_react_workflow(
         if results:
             scratchpad["used_tools"] = True
 
+        # Prefer a tool-supplied human/LLM-friendly rendering when present.
+        def _display(v: Any) -> str:
+            if isinstance(v, dict):
+                rendered = v.get("rendered")
+                if isinstance(rendered, str) and rendered.strip():
+                    return rendered.strip()
+            return "" if v is None else str(v)
+
+        def _first_line(text: str) -> str:
+            return (str(text or "").splitlines() or [""])[0].strip()
+
+        def _truncate(text: str, *, max_chars: int) -> str:
+            s = str(text or "")
+            if len(s) <= max_chars:
+                return s
+            if max_chars <= 1:
+                return "…"
+            return s[: max_chars - 1] + "…"
+
         # Persist lightweight tool-loop context to help the agent avoid repeating failures.
         sig = temp.pop("_tool_calls_sig", None)
-        if isinstance(sig, str) and sig.strip() and results:
+        result_dicts = [r for r in results if isinstance(r, dict)]
+        if isinstance(sig, str) and sig.strip() and result_dicts:
             loop_guard = scratchpad.get("tool_loop_guard")
             if isinstance(loop_guard, dict) and str(loop_guard.get("sig") or "") == sig:
                 any_failure = False
                 first_error = ""
-                for r in results:
-                    if not isinstance(r, dict):
-                        continue
-                    if bool(r.get("success")) is True:
-                        continue
-                    any_failure = True
-                    err = r.get("error") or r.get("output") or ""
-                    if isinstance(err, str) and err.strip() and not first_error:
-                        first_error = err.strip()
+                summary_parts: list[str] = []
+                multi = len(result_dicts) > 1
+                for r in result_dicts:
+                    name = str(r.get("name", "tool") or "tool")
+                    success = bool(r.get("success"))
+                    output = r.get("output", "")
+                    error = r.get("error", "")
+
+                    display = _display(output)
+                    if not success:
+                        any_failure = True
+                        # Preserve structured outputs for provenance, but show a clean string to the LLM/UI.
+                        display = _display(output) if isinstance(output, dict) else str(error or output)
+
+                    head = _first_line(display)
+                    if not success and head and not first_error:
+                        first_error = head
+                    if multi:
+                        tag = "ok" if success else "error"
+                        summary_parts.append(f"{name}: {tag} — {head}".strip())
+                    else:
+                        summary_parts.append(head)
+
+                last_summary = summary_parts[0] if summary_parts else ""
+                if multi:
+                    last_summary = " | ".join([p for p in summary_parts if p])
+                last_summary = _truncate(last_summary, max_chars=500)
                 loop_guard["last_success"] = not any_failure
                 loop_guard["last_error"] = first_error
+                loop_guard["last_summary"] = last_summary
                 scratchpad["tool_loop_guard"] = loop_guard
 
         for r in results:
@@ -1069,14 +1129,6 @@ def create_react_workflow(
             success = bool(r.get("success"))
             output = r.get("output", "")
             error = r.get("error", "")
-            # Prefer a tool-supplied human/LLM-friendly rendering when present.
-            def _display(v: Any) -> str:
-                if isinstance(v, dict):
-                    rendered = v.get("rendered")
-                    if isinstance(rendered, str) and rendered.strip():
-                        return rendered.strip()
-                return "" if v is None else str(v)
-
             display = _display(output)
             if not success:
                 # Preserve structured outputs for provenance, but show a clean string to the LLM/UI.
