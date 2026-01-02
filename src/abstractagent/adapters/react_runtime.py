@@ -129,16 +129,38 @@ def create_react_workflow(
         if on_step:
             on_step(step, data)
 
-    tool_defs = logic.tools
-    tool_by_name = {t.name: t for t in tool_defs if getattr(t, "name", None)}
-    allowlist: Optional[list[str]] = None
-    if isinstance(allowed_tools, list):
-        allowlist = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
-        if not allowlist:
-            allowlist = []
-    else:
-        # Default allowlist: the tools the logic provided (defense-in-depth vs executor having extra tools).
-        allowlist = [str(t.name) for t in tool_defs if getattr(t, "name", None)]
+    def _current_tool_defs() -> list[Any]:
+        """Return the current tool definitions from the logic (dynamic)."""
+        defs = getattr(logic, "tools", None)
+        if not isinstance(defs, list):
+            try:
+                defs = list(defs)  # type: ignore[arg-type]
+            except Exception:
+                defs = []
+        return [t for t in defs if getattr(t, "name", None)]
+
+    def _tool_by_name() -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for t in _current_tool_defs():
+            name = getattr(t, "name", None)
+            if isinstance(name, str) and name.strip():
+                out[name] = t
+        return out
+
+    def _default_allowlist() -> list[str]:
+        if isinstance(allowed_tools, list):
+            allow = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
+            return allow if allow else []
+        # Default allowlist: all tools currently known to the logic (deduped, order preserved).
+        out: list[str] = []
+        seen: set[str] = set()
+        for t in _current_tool_defs():
+            name = getattr(t, "name", None)
+            if not isinstance(name, str) or not name.strip() or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        return out
 
     def _normalize_allowlist(raw: Any) -> list[str]:
         items: list[Any]
@@ -153,6 +175,7 @@ def create_react_workflow(
 
         out: list[str] = []
         seen: set[str] = set()
+        current = _tool_by_name()
         for t in items:
             if not isinstance(t, str):
                 continue
@@ -161,8 +184,8 @@ def create_react_workflow(
                 continue
             if name in seen:
                 continue
-            # Only accept tool names known to the workflow's logic.
-            if name not in tool_by_name:
+            # Only accept tool names known to the workflow's logic (dynamic).
+            if name not in current:
                 continue
             seen.add(name)
             out.append(name)
@@ -174,12 +197,13 @@ def create_react_workflow(
             normalized = _normalize_allowlist(runtime_ns.get("allowed_tools"))
             runtime_ns["allowed_tools"] = normalized
             return normalized
-        return _normalize_allowlist(list(allowlist or []))
+        return _normalize_allowlist(list(_default_allowlist()))
 
     def _allowed_tool_defs(allow: list[str]) -> list[Any]:
         out: list[Any] = []
+        current = _tool_by_name()
         for name in allow:
-            tool = tool_by_name.get(name)
+            tool = current.get(name)
             if tool is not None:
                 out.append(tool)
         return out

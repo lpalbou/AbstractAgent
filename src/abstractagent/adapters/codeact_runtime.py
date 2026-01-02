@@ -116,8 +116,33 @@ def create_codeact_workflow(
         if on_step:
             on_step(step, data)
 
-    tool_defs = logic.tools
-    default_allowlist = [str(t.name) for t in tool_defs if getattr(t, "name", None)]
+    def _current_tool_defs() -> list[ToolDefinition]:
+        defs = getattr(logic, "tools", None)
+        if not isinstance(defs, list):
+            try:
+                defs = list(defs)  # type: ignore[arg-type]
+            except Exception:
+                defs = []
+        return [t for t in defs if getattr(t, "name", None)]
+
+    def _tool_by_name() -> dict[str, ToolDefinition]:
+        out: dict[str, ToolDefinition] = {}
+        for t in _current_tool_defs():
+            name = getattr(t, "name", None)
+            if isinstance(name, str) and name.strip():
+                out[name] = t
+        return out
+
+    def _default_allowlist() -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for t in _current_tool_defs():
+            name = getattr(t, "name", None)
+            if not isinstance(name, str) or not name.strip() or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        return out
 
     def _normalize_allowlist(raw: Any) -> list[str]:
         if raw is None:
@@ -142,12 +167,15 @@ def create_codeact_workflow(
     def _effective_allowlist(runtime_ns: Dict[str, Any]) -> list[str]:
         if isinstance(runtime_ns, dict) and "allowed_tools" in runtime_ns:
             normalized = _normalize_allowlist(runtime_ns.get("allowed_tools"))
-            runtime_ns["allowed_tools"] = normalized
-            return normalized
-        return list(default_allowlist)
+            # Filter to currently known tools (dynamic), preserving order.
+            current = _tool_by_name()
+            filtered = [name for name in normalized if name in current]
+            runtime_ns["allowed_tools"] = filtered
+            return filtered
+        return list(_default_allowlist())
 
     def _allowed_tool_defs(allowlist: list[str]) -> list[ToolDefinition]:
-        tool_by_name = {str(t.name): t for t in tool_defs if getattr(t, "name", None)}
+        tool_by_name = _tool_by_name()
         out: list[ToolDefinition] = []
         for name in allowlist:
             tool = tool_by_name.get(name)

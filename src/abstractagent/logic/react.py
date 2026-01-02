@@ -152,6 +152,28 @@ class ReActLogic:
     def tools(self) -> List[ToolDefinition]:
         return list(self._tools)
 
+    def add_tools(self, tools: List[ToolDefinition]) -> int:
+        """Add tool definitions to this logic instance (deduped by name).
+
+        This enables hosts (e.g. AbstractCode) to dynamically register schema-only tools
+        discovered at runtime (e.g. MCP tools) without rebuilding the workflow.
+        """
+        if not isinstance(tools, list) or not tools:
+            return 0
+
+        existing = {str(t.name) for t in self._tools if getattr(t, "name", None)}
+        added = 0
+        for t in tools:
+            name = getattr(t, "name", None)
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if name in existing:
+                continue
+            self._tools.append(t)
+            existing.add(name)
+            added += 1
+        return added
+
     def build_request(
         self,
         *,
