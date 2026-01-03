@@ -623,10 +623,13 @@ def create_react_workflow(
         def _should_retry_for_missing_tool_call(text: str) -> bool:
             if not isinstance(text, str) or not text.strip():
                 return False
-            lowered = text.lower()
-            # Some models echo our internal History formatting (e.g. "observation[web_search] (success): ...")
-            # which is not a real tool execution. Treat that as a strong signal we should re-prompt.
-            return "observation[" in lowered
+            # Some models echo our internal History formatting (e.g. `observation[web_search] (success): ...`)
+            # as transcript lines. Treat only *line-start* occurrences as suspicious (avoid false positives
+            # in JSON/code blocks), and only use this signal when no tools have actually run yet.
+            for line in text.splitlines():
+                if line.lstrip().lower().startswith("observation["):
+                    return True
+            return False
 
         emit(
             "parse",
@@ -658,7 +661,7 @@ def create_react_workflow(
 
         # If the model appears to have produced a fake "observation[tool]" transcript instead of
         # calling tools, give it one corrective retry before treating the message as final.
-        if _should_retry_for_missing_tool_call(content):
+        if not bool(scratchpad.get("used_tools")) and _should_retry_for_missing_tool_call(content):
             try:
                 retries = int(scratchpad.get("tool_retry_count") or 0)
             except Exception:
@@ -879,189 +882,6 @@ def create_react_workflow(
                     next_node="observe",
                 )
 
-        def _normalized_tool_calls_for_signature(raw_calls: List[Any]) -> list[dict[str, Any]]:
-            normalized: list[dict[str, Any]] = []
-            for tc in raw_calls:
-                if isinstance(tc, ToolCall):
-                    name = str(tc.name or "")
-                    arguments = tc.arguments
-                elif isinstance(tc, dict):
-                    name = str(tc.get("name", "") or "")
-                    arguments = tc.get("arguments") or {}
-                else:
-                    continue
-
-                args_dict: dict[str, Any] = {}
-                if isinstance(arguments, dict):
-                    args_dict = dict(arguments)
-                elif isinstance(arguments, str) and arguments.strip():
-                    try:
-                        parsed = json.loads(arguments)
-                        if isinstance(parsed, dict):
-                            args_dict = dict(parsed)
-                    except Exception:
-                        args_dict = {}
-
-                normalized.append({"name": name, "arguments": args_dict})
-            return normalized
-
-        def _tool_calls_signature(raw_calls: List[Any]) -> str:
-            normalized = _normalized_tool_calls_for_signature(raw_calls)
-            payload = json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            return hashlib.sha256(payload).hexdigest()
-
-        def _tool_loop_threshold(normalized_calls: list[dict[str, Any]]) -> int:
-            # File mutation tools are deterministic; repeating identical calls is almost always a model loop.
-            deterministic_mutations = {"edit_file", "write_file"}
-            names = [str(c.get("name") or "") for c in normalized_calls]
-            if names and all(n in deterministic_mutations for n in names):
-                return 2
-            return 3
-
-        # Tool-loop guard: block repeating identical tool calls (common OSS model failure mode).
-        try:
-            normalized_calls = _normalized_tool_calls_for_signature(tool_calls)
-            sig = _tool_calls_signature(tool_calls)
-            threshold = _tool_loop_threshold(normalized_calls)
-
-            loop_guard = scratchpad.get("tool_loop_guard")
-            if not isinstance(loop_guard, dict):
-                loop_guard = {}
-            prev_sig = loop_guard.get("sig")
-            prev_count = loop_guard.get("count")
-            try:
-                prev_count_int = int(prev_count or 0)
-            except Exception:
-                prev_count_int = 0
-
-            count = prev_count_int + 1 if isinstance(prev_sig, str) and prev_sig == sig else 1
-            loop_guard.update(
-                {
-                    "sig": sig,
-                    "count": count,
-                    "tool_names": [c.get("name") for c in normalized_calls if isinstance(c, dict)],
-                }
-            )
-            scratchpad["tool_loop_guard"] = loop_guard
-            temp["_tool_calls_sig"] = sig
-
-            if count >= threshold and normalized_calls:
-                cached_results_raw = loop_guard.get("last_results")
-                cached_results: list[dict[str, Any]] = []
-                if isinstance(cached_results_raw, list):
-                    for item in cached_results_raw:
-                        if isinstance(item, dict):
-                            cached_results.append(dict(item))
-                has_cached_results = bool(cached_results)
-
-                last_success = loop_guard.get("last_success")
-                if not isinstance(last_success, bool):
-                    last_success = None
-                last_summary = loop_guard.get("last_summary")
-                if not isinstance(last_summary, str):
-                    last_summary = ""
-                last_error = loop_guard.get("last_error")
-                if not isinstance(last_error, str):
-                    last_error = ""
-
-                previous_lines: list[str] = []
-                if last_success is True:
-                    previous_lines.append("Previous identical call: succeeded.")
-                elif last_success is False:
-                    previous_lines.append("Previous identical call: failed.")
-                if last_summary.strip():
-                    previous_lines.append(f"Previous result summary:\n{last_summary.strip()}")
-                elif last_error.strip():
-                    previous_lines.append(f"Previous tool error:\n{last_error.strip()}")
-                previous_context = "\n".join(previous_lines).strip()
-
-                hint = (
-                    (
-                        "Tool loop guard: deduped repeated identical tool call(s) (returned cached output).\n"
-                        if has_cached_results
-                        else "Tool loop guard: blocked repeated identical tool call(s).\n"
-                    )
-                    + "Next step: do NOT repeat the same call. Adjust strategy based on the last tool output.\n"
-                    "\n"
-                    "Editing best practice (SOTA): search_files → read_file → small edit/patch.\n"
-                    "\n"
-                    "For edit_file failures:\n"
-                    "- Use search_files() to find the exact line(s), then read_file() around them.\n"
-                    "- Keep pattern small/unique (often 1–5 lines) and set max_replacements=1.\n"
-                    "- Bound the edit with start_line/end_line when possible.\n"
-                    "- For multi-line code blocks, prefer unified diff mode (replacement=None) or preview_only=True.\n"
-                    "\n"
-                    "For write_file:\n"
-                    "- Only use it when you intend to overwrite the ENTIRE file with complete content.\n"
-                )
-                if previous_context:
-                    hint += f"\n{previous_context}\n"
-
-                inbox = runtime_ns.get("inbox")
-                if not isinstance(inbox, list):
-                    inbox = []
-                    runtime_ns["inbox"] = inbox
-                inbox.append({"role": "system", "content": hint.strip()})
-
-                blocked_results: list[dict[str, Any]] = []
-                for idx, tc in enumerate(tool_calls, start=1):
-                    if isinstance(tc, ToolCall):
-                        name = str(tc.name or "")
-                        call_id_raw = tc.call_id
-                    elif isinstance(tc, dict):
-                        name = str(tc.get("name", "") or "")
-                        call_id_raw = tc.get("call_id")
-                    else:
-                        name = ""
-                        call_id_raw = None
-                    call_id = str(call_id_raw).strip() if call_id_raw is not None else ""
-                    if not call_id:
-                        call_id = str(idx)
-                    cached: Optional[dict[str, Any]] = cached_results[idx - 1] if idx - 1 < len(cached_results) else None
-                    if has_cached_results and isinstance(cached, dict):
-                        cached_success = bool(cached.get("success"))
-                        cached_output = cached.get("output")
-                        cached_error = cached.get("error")
-                        blocked_results.append(
-                            {
-                                "call_id": call_id,
-                                "name": name,
-                                "success": cached_success,
-                                "output": cached_output,
-                                "error": None if cached_success else str(cached_error or "Tool failed"),
-                            }
-                        )
-                        continue
-
-                    blocked_error = "Duplicate tool call blocked (tool loop guard)."
-                    if idx == 1 and previous_context:
-                        blocked_error = f"{blocked_error}\n{previous_context}"
-                    blocked_results.append(
-                        {
-                            "call_id": call_id,
-                            "name": name,
-                            "success": False,
-                            "output": None,
-                            "error": blocked_error,
-                        }
-                    )
-
-                temp["pending_tool_calls"] = []
-                temp["tool_results"] = {"mode": "executed", "results": blocked_results, "deduped": has_cached_results}
-                emit(
-                    "act_blocked_loop_guard",
-                    {
-                        "count": count,
-                        "threshold": threshold,
-                        "tools": [r.get("name") for r in blocked_results],
-                        "deduped": has_cached_results,
-                    },
-                )
-                return StepPlan(node_id="act", next_node="observe")
-        except Exception:
-            # Tool loop guard must be best-effort; never block tool execution due to guard errors.
-            pass
-
         for i, tc in enumerate(tool_calls, start=1):
             if isinstance(tc, dict):
                 call_id_raw = tc.get("call_id")
@@ -1130,96 +950,6 @@ def create_react_workflow(
                 if isinstance(rendered, str) and rendered.strip():
                     return rendered.strip()
             return "" if v is None else str(v)
-
-        def _first_line(text: str) -> str:
-            return (str(text or "").splitlines() or [""])[0].strip()
-
-        def _truncate(text: str, *, max_chars: int) -> str:
-            s = str(text or "")
-            if len(s) <= max_chars:
-                return s
-            if max_chars <= 1:
-                return "…"
-            return s[: max_chars - 1] + "…"
-
-        def _jsonable(value: Any) -> Any:
-            if value is None:
-                return None
-            if isinstance(value, (str, int, float, bool)):
-                return value
-            if isinstance(value, dict):
-                return {str(k): _jsonable(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [_jsonable(v) for v in value]
-            try:
-                json.dumps(value)
-                return value
-            except Exception:
-                return str(value)
-
-        def _shrink(value: Any, *, max_str: int = 8192, max_list: int = 250) -> Any:
-            if isinstance(value, str):
-                return _truncate(value, max_chars=max_str)
-            if isinstance(value, list):
-                if len(value) > max_list:
-                    out = [_shrink(v, max_str=max_str, max_list=max_list) for v in value[:max_list]]
-                    out.append("…")
-                    return out
-                return [_shrink(v, max_str=max_str, max_list=max_list) for v in value]
-            if isinstance(value, dict):
-                return {str(k): _shrink(v, max_str=max_str, max_list=max_list) for k, v in value.items()}
-            return value
-
-        # Persist lightweight tool-loop context to help the agent avoid repeating failures.
-        sig = temp.pop("_tool_calls_sig", None)
-        result_dicts = [r for r in results if isinstance(r, dict)]
-        if isinstance(sig, str) and sig.strip() and result_dicts:
-            loop_guard = scratchpad.get("tool_loop_guard")
-            if isinstance(loop_guard, dict) and str(loop_guard.get("sig") or "") == sig:
-                any_failure = False
-                first_error = ""
-                summary_parts: list[str] = []
-                multi = len(result_dicts) > 1
-                cached: list[dict[str, Any]] = []
-                for r in result_dicts:
-                    name = str(r.get("name", "tool") or "tool")
-                    success = bool(r.get("success"))
-                    output = r.get("output", "")
-                    error = r.get("error", "")
-
-                    display = _display(output)
-                    if not success:
-                        any_failure = True
-                        # Preserve structured outputs for provenance, but show a clean string to the LLM/UI.
-                        display = _display(output) if isinstance(output, dict) else str(error or output)
-
-                    head = _first_line(display)
-                    if not success and head and not first_error:
-                        first_error = head
-                    if multi:
-                        tag = "ok" if success else "error"
-                        summary_parts.append(f"{name}: {tag} — {head}".strip())
-                    else:
-                        summary_parts.append(head)
-
-                    cached.append(
-                        {
-                            "name": name,
-                            "success": success,
-                            "output": _shrink(_jsonable(output)),
-                            "error": _truncate(str(error or ""), max_chars=2000),
-                        }
-                    )
-
-                last_summary = summary_parts[0] if summary_parts else ""
-                if multi:
-                    last_summary = " | ".join([p for p in summary_parts if p])
-                last_summary = _truncate(last_summary, max_chars=500)
-                loop_guard["last_success"] = not any_failure
-                loop_guard["last_error"] = first_error
-                loop_guard["last_summary"] = last_summary
-                loop_guard["last_results"] = cached
-                scratchpad["tool_loop_guard"] = loop_guard
 
         for r in results:
             if not isinstance(r, dict):
