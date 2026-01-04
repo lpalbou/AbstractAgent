@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Limits: ReAct/CodeAct now treat `_limits.max_tokens` as a **context/budget** limit and use `_limits.max_output_tokens` (if set) to cap OpenAI-style `max_tokens` (output). This prevents invalid LMStudio requests like `max_tokens=262144` which can return HTTP 400.
+- Tools: ReAct/CodeAct now omit the visible **`Tools (session)`** Active Memory block for **native-tool models** even when the workflow does not know the provider name (prevents conflicts with hidden tool grammars on OpenAI-compatible servers like LMStudio).
 
 ## [0.2.0] - 2025-12-17
 

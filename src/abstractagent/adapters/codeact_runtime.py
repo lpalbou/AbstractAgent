@@ -363,18 +363,18 @@ def create_codeact_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
-        # Same policy as ReAct: when native tools are enabled, avoid duplicating a visible
+        # Same policy as ReAct: when the model supports native tools, avoid duplicating a visible
         # tools catalog in the system prompt (can conflict with provider tool grammars).
-        eff_provider = runtime_ns.get("provider")
-        eff_model = runtime_ns.get("model")
-        provider_key = str(eff_provider or "").strip().lower()
-        model_key = str(eff_model or "").strip()
-
-        def _provider_supports_native_tools(name: str) -> bool:
-            return name in {"lmstudio", "openai", "anthropic", "openai_compatible", "vllm", "openai-compatible"}
+        #
+        # Do not rely on provider-name inference here: some hosts resolve the provider outside the
+        # workflow and `_runtime.provider` can be empty, yet native tools are still used.
+        model_key = str(runtime_ns.get("model") or "").strip()
 
         include_tools_summary = True
-        if tool_specs and model_key and _provider_supports_native_tools(provider_key):
+        override = runtime_ns.get("include_tools_summary") if isinstance(runtime_ns, dict) else None
+        if isinstance(override, bool):
+            include_tools_summary = override
+        elif tool_specs and model_key:
             try:
                 from abstractcore.tools.handler import UniversalToolHandler
 

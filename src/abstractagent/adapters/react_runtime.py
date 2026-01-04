@@ -390,23 +390,25 @@ def create_react_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
-        # IMPORTANT: When native tool calling is enabled (provider receives `tools/tool_choice`),
-        # avoid duplicating a visible tools catalog in the system prompt. Some OpenAI-compatible
-        # servers enforce tool calling via hidden grammars/templates; duplicating tool definitions
-        # (or tool-call transcript instructions) can cause "text leaked" tool calls that the
-        # server does not parse into structured `tool_calls`.
-        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+        # IMPORTANT: When the model supports native tool calling (AbstractCore sends a structured
+        # `tools` payload), avoid duplicating a visible tools catalog in the system prompt.
+        #
+        # Some OpenAI-compatible servers enforce tool calling via hidden grammars/templates;
+        # duplicating tool definitions (or tool-call transcript instructions) can cause "text leaked"
+        # tool calls that the server does not parse into structured `tool_calls`.
+        #
+        # NOTE: We intentionally do NOT gate this on the provider name here. In some hosts, the
+        # provider is resolved outside the workflow and `_runtime.provider` can be empty, yet the
+        # actual execution still uses native tools (e.g. LMStudio/OpenAI-compatible). The safest
+        # default is: if the model is configured as native-capable, omit the Tools(session) block.
         eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
-        provider_key = str(eff_provider or "").strip().lower()
         model_key = str(eff_model or "").strip()
 
-        def _provider_supports_native_tools(name: str) -> bool:
-            # Keep this list conservative: only include providers where AbstractCore sends
-            # structured native tools payloads today.
-            return name in {"lmstudio", "openai", "anthropic", "openai_compatible", "vllm", "openai-compatible"}
-
         include_tools_summary = True
-        if tool_specs and model_key and _provider_supports_native_tools(provider_key):
+        override = runtime_ns.get("include_tools_summary") if isinstance(runtime_ns, dict) else None
+        if isinstance(override, bool):
+            include_tools_summary = override
+        elif tool_specs and model_key:
             try:
                 from abstractcore.tools.handler import UniversalToolHandler
 
@@ -515,17 +517,16 @@ def create_react_workflow(
         runtime_ns.setdefault("allowed_tools", allow)
 
         # Keep the same "native tools => no Tools(session) catalog in system prompt" policy as the
-        # normal reason node (see rationale there).
-        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+        # normal reason node (see rationale there). Do not rely on provider-name inference; see
+        # comment in the reason node for why.
         eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
-        provider_key = str(eff_provider or "").strip().lower()
         model_key = str(eff_model or "").strip()
 
-        def _provider_supports_native_tools(name: str) -> bool:
-            return name in {"lmstudio", "openai", "anthropic", "openai_compatible", "vllm", "openai-compatible"}
-
         include_tools_summary = True
-        if tool_specs and model_key and _provider_supports_native_tools(provider_key):
+        override = runtime_ns.get("include_tools_summary") if isinstance(runtime_ns, dict) else None
+        if isinstance(override, bool):
+            include_tools_summary = override
+        elif tool_specs and model_key:
             try:
                 from abstractcore.tools.handler import UniversalToolHandler
 
