@@ -280,7 +280,7 @@ def create_codeact_workflow(
             "You are preparing a high-level execution plan for the user's request.\n"
             "Return a concise TODO list (5–12 steps) that is actionable and verifiable.\n"
             "Do not call tools yet. Do not include role prefixes like 'assistant:'.\n\n"
-            f"Available tools: {tools_summary}\n\n"
+#            f"Available tools: {tools_summary}\n\n"
             f"User request:\n{task}\n\n"
             "Plan (markdown checklist):\n"
             "- [ ] ...\n"

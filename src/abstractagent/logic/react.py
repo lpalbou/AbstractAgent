@@ -247,16 +247,17 @@ class ReActLogic:
             "- If you want to create/edit files, run commands, fetch URLs, or search, you MUST call the appropriate tool.\n"
             "- If you list next steps, immediately start executing them (with tools) as long as they are within the user's request.\n"
             "- Never fabricate tool outputs. Tool results will appear in History/Scratchpad as tool observations.\n"
-            "- Do not output lines that look like internal transcript markers (e.g. `observation[tool] ...`). Those are context-only.\n"
+#            "- Do not output lines that look like internal transcript markers (e.g. `observation[tool] ...`). Those are context-only.\n"
             "- Do not quote the History or Scratchpad verbatim in your answer; use them silently as context.\n"
             "- Only ask the user a question when required information is missing.\n"
             "- If the latest History entry is an observation, start by stating what you observed in 1 line.\n"
             "- Before calling a tool, write 1–3 short lines explaining what you will do and why.\n"
-            "- After tool results, continue from the new information; do not repeat successful tool calls with the same args.\n"
+#            "- After tool results, continue from the new information; do not repeat successful tool calls with the same args.\n"
             "- Use the Scratchpad as reliable working memory; do not redo actions already listed there unless you explain why.\n"
-            "- For file work, prefer file tools (write_file/edit_file) and verify with list_files/read_file.\n"
-            "- If the user asked you to create/update a file, do it with write_file/edit_file (do not ask for permission).\n"
-            "- Do not prefix your messages with role labels like 'assistant:'.\n"
+#            "- For file work, prefer file tools (write_file/edit_file) and verify with list_files/read_file.\n"
+#            "- If the user asked you to create/update a file, do it with write_file/edit_file (do not ask for permission).\n"
+ #           "- Do not prefix your messages with role labels like 'assistant:'.\n"
+            "\n"
         )
 
         system_memory = str(system_memory or "").strip()
@@ -275,8 +276,8 @@ class ReActLogic:
                 tool_names = ", ".join([t.name for t in self._tools if getattr(t, "name", None)])
         except Exception:
             tool_names = ""
-        if tool_names:
-            system_prompt += f"\nAvailable tools: {tool_names}\n"
+#        if tool_names:
+#            system_prompt += f"\nAvailable tools: {tool_names}\n"
 
         if plan_mode:
             system_prompt += (
