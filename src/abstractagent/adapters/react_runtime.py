@@ -390,6 +390,30 @@ def create_react_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
+        # IMPORTANT: When native tool calling is enabled (provider receives `tools/tool_choice`),
+        # avoid duplicating a visible tools catalog in the system prompt. Some OpenAI-compatible
+        # servers enforce tool calling via hidden grammars/templates; duplicating tool definitions
+        # (or tool-call transcript instructions) can cause "text leaked" tool calls that the
+        # server does not parse into structured `tool_calls`.
+        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
+        provider_key = str(eff_provider or "").strip().lower()
+        model_key = str(eff_model or "").strip()
+
+        def _provider_supports_native_tools(name: str) -> bool:
+            # Keep this list conservative: only include providers where AbstractCore sends
+            # structured native tools payloads today.
+            return name in {"lmstudio", "openai", "anthropic", "openai_compatible", "vllm", "openai-compatible"}
+
+        include_tools_summary = True
+        if tool_specs and model_key and _provider_supports_native_tools(provider_key):
+            try:
+                from abstractcore.tools.handler import UniversalToolHandler
+
+                include_tools_summary = not bool(UniversalToolHandler(model_key).supports_native)
+            except Exception:
+                include_tools_summary = True
+
         inbox = runtime_ns.get("inbox", [])
         guidance = ""
         if isinstance(inbox, list) and inbox:
@@ -422,7 +446,7 @@ def create_react_workflow(
                 return max(1, len(s) // 4)
 
         mem_split = render_active_memory_split_for_llm_request(
-            run.vars, include_tools_summary=True, token_counter=_count_tokens
+            run.vars, include_tools_summary=include_tools_summary, token_counter=_count_tokens
         )
         active_memory = str(mem_split.get("user_memory") or "")
         system_memory = str(mem_split.get("system_memory") or "")
@@ -490,6 +514,25 @@ def create_react_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
+        # Keep the same "native tools => no Tools(session) catalog in system prompt" policy as the
+        # normal reason node (see rationale there).
+        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
+        provider_key = str(eff_provider or "").strip().lower()
+        model_key = str(eff_model or "").strip()
+
+        def _provider_supports_native_tools(name: str) -> bool:
+            return name in {"lmstudio", "openai", "anthropic", "openai_compatible", "vllm", "openai-compatible"}
+
+        include_tools_summary = True
+        if tool_specs and model_key and _provider_supports_native_tools(provider_key):
+            try:
+                from abstractcore.tools.handler import UniversalToolHandler
+
+                include_tools_summary = not bool(UniversalToolHandler(model_key).supports_native)
+            except Exception:
+                include_tools_summary = True
+
         # Keep token fitting consistent with normal calls.
         try:
             from abstractcore.utils.token_utils import TokenUtils  # type: ignore
@@ -514,7 +557,7 @@ def create_react_workflow(
                 return max(1, len(s) // 4)
 
         mem_split = render_active_memory_split_for_llm_request(
-            run.vars, include_tools_summary=True, token_counter=_count_tokens
+            run.vars, include_tools_summary=include_tools_summary, token_counter=_count_tokens
         )
         system_memory = str(mem_split.get("system_memory") or "")
         # Reuse the canonical agent rules from ReActLogic (but do not include History/Scratchpad in prompt).

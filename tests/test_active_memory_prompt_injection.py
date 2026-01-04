@@ -99,3 +99,28 @@ def test_codeact_reason_prompt_includes_active_memory_and_default_system_prompt(
     sys = payload.get("system_prompt")
     assert isinstance(sys, str) and "You are CodeAct" in sys
     assert "## Persona (persistent)" in sys
+
+
+def test_react_system_prompt_omits_tools_session_when_native_tools_are_enabled() -> None:
+    """Native tool calling should not duplicate a visible tools catalog in the system prompt."""
+    tool_a = ToolDefinition(name="tool_a", description="A", parameters={})
+    logic = ReActLogic(tools=[tool_a])
+    wf = create_react_workflow(
+        logic=logic,
+        workflow_id="wf",
+        provider="lmstudio",
+        model="qwen/qwen3-next-80b",
+        allowed_tools=["tool_a"],
+    )
+
+    run = _run(vars=_base_vars(task="t"))
+    reason_node = wf.get_node("reason")
+    plan = reason_node(run, _Ctx())
+    assert plan.effect is not None
+    assert plan.effect.type == EffectType.LLM_CALL
+    payload = plan.effect.payload if isinstance(plan.effect.payload, dict) else {}
+
+    sys = payload.get("system_prompt")
+    assert isinstance(sys, str) and sys.strip()
+    assert "## Persona (persistent)" in sys
+    assert "## Tools (session)" not in sys

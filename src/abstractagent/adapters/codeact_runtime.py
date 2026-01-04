@@ -363,6 +363,25 @@ def create_codeact_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
+        # Same policy as ReAct: when native tools are enabled, avoid duplicating a visible
+        # tools catalog in the system prompt (can conflict with provider tool grammars).
+        eff_provider = runtime_ns.get("provider")
+        eff_model = runtime_ns.get("model")
+        provider_key = str(eff_provider or "").strip().lower()
+        model_key = str(eff_model or "").strip()
+
+        def _provider_supports_native_tools(name: str) -> bool:
+            return name in {"lmstudio", "openai", "anthropic", "openai_compatible", "vllm", "openai-compatible"}
+
+        include_tools_summary = True
+        if tool_specs and model_key and _provider_supports_native_tools(provider_key):
+            try:
+                from abstractcore.tools.handler import UniversalToolHandler
+
+                include_tools_summary = not bool(UniversalToolHandler(model_key).supports_native)
+            except Exception:
+                include_tools_summary = True
+
         # Use AbstractCore token estimation for Active Memory fitting when available so
         # prompt composition + `/memory` token metrics stay in the same ballpark.
         try:
@@ -385,7 +404,7 @@ def create_codeact_workflow(
                 return max(1, len(s) // 4)
 
         mem_split = render_active_memory_split_for_llm_request(
-            run.vars, include_tools_summary=True, token_counter=_count_tokens
+            run.vars, include_tools_summary=include_tools_summary, token_counter=_count_tokens
         )
         active_memory = str(mem_split.get("user_memory") or "")
         system_memory = str(mem_split.get("system_memory") or "")
