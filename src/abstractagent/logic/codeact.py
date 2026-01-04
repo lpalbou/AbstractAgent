@@ -36,15 +36,15 @@ class CodeActLogic:
             if cleaned.startswith(prefix):
                 cleaned = cleaned[len(prefix) :].lstrip()
 
-        label = "observation"
-        if isinstance(name, str) and name:
-            label += f"[{name}]"
+        tool_name = str(name).strip() if isinstance(name, str) and name.strip() else "tool"
         if success is True:
-            label += " (success)"
+            status = "succeeded"
         elif success is False:
-            label += " (error)"
+            status = "failed"
+        else:
+            status = "returned"
 
-        return f"{label}: {cleaned}"
+        return f"Tool {tool_name} {status}: {cleaned}"
 
     def __init__(
         self,

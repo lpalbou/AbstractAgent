@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Documentation: clarify that the interactive REPL moved to **AbstractCode**; `react-agent`/`python -m abstractagent.repl` are deprecated shims.
 - Observability: `on_step` tool-observation previews now include up to **1000 characters** (was 150), with an explicit truncation marker for larger outputs. Full tool outputs are still preserved in the agent message history.
-- ReAct prompt construction now **truncates large tool-call arguments** (e.g. `write_file` content) when building the runtime scratchpad, preventing prompt bloat and reducing stalls on local providers.
+- ReAct prompt construction now renders the runtime scratchpad (node traces) as **compact JSON** (minified) to reduce prompt bloat while preserving full-fidelity tool arguments/results for grounding.
+- ReAct system prompt now includes an explicit **output-token budget hint** and guidance to **chunk large tool arguments** (e.g., file contents) across multiple tool calls to avoid `max_tokens` truncation loops.
 - Tool observations now prefer a tool-supplied `rendered` string (when present) so tools can return structured outputs for provenance without polluting LLM-visible history.
+- ReAct/CodeAct History formatting now renders tool outputs as natural-language lines like `Tool <name> succeeded/failed: ...` instead of bracketed `observation[...]` markers.
 - Built-in memory tool schemas are richer:
   - `recall_memory` now supports `tags_mode`, `usernames`, and `locations` (metadata-first filtering).
   - `remember_note` now supports an optional `location` field.

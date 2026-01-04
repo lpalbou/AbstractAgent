@@ -20,8 +20,9 @@ class ReActLogic:
         if role != "tool":
             return f"{role}: {content_str}"
 
-        # Tool messages are observations. Present them explicitly as such so models don't
-        # confuse "tool:" transcript lines with tool-call request syntax.
+        # Tool messages should be presented as *results*, not as tool-call syntax.
+        # Avoid bracketed markers like `observation[tool] ...` which can look like
+        # parsable tool-call notation to some models.
         meta = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         name = meta.get("name") if isinstance(meta, dict) else None
         success = meta.get("success") if isinstance(meta, dict) else None
@@ -32,15 +33,15 @@ class ReActLogic:
             if cleaned.startswith(prefix):
                 cleaned = cleaned[len(prefix) :].lstrip()
 
-        label = "observation"
-        if isinstance(name, str) and name:
-            label += f"[{name}]"
+        tool_name = str(name).strip() if isinstance(name, str) and name.strip() else "tool"
         if success is True:
-            label += " (success)"
+            status = "succeeded"
         elif success is False:
-            label += " (error)"
+            status = "failed"
+        else:
+            status = "returned"
 
-        return f"{label}: {cleaned}"
+        return f"Tool {tool_name} {status}: {cleaned}"
 
     @staticmethod
     def _format_runtime_scratchpad(vars: Optional[Dict[str, Any]]) -> str:
@@ -80,7 +81,8 @@ class ReActLogic:
             if isinstance(value, str):
                 return value
             try:
-                return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+                # Keep scratchpad compact: it can contain large tool arguments/results.
+                return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
             except Exception:
                 return str(value)
 
@@ -238,6 +240,19 @@ class ReActLogic:
             prompt += f"Current plan:\n{plan}\n\n"
 
         # Keep long-lived agent rules in a separate system prompt for clarity and stability.
+        output_budget_line = ""
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            output_budget_line = (
+                f"- Output token limit for this response: {max_tokens}. Keep any single tool-call payload comfortably below this. "
+                "If you need to send large tool arguments "
+                "(e.g., file contents), split them across multiple tool calls (e.g., `write_file` with mode='w' then mode='a').\n"
+            )
+        else:
+            output_budget_line = (
+                "- If you need to send large tool arguments (e.g., file contents), split them across multiple tool calls "
+                "(e.g., `write_file` with mode='w' then mode='a').\n"
+            )
+
         system_prompt = (
             "You are an autonomous ReAct agent.\n"
             "Taking action / having an effect means calling a tool.\n\n"
@@ -254,6 +269,7 @@ class ReActLogic:
             "- Before calling a tool, write 1–3 short lines explaining what you will do and why.\n"
 #            "- After tool results, continue from the new information; do not repeat successful tool calls with the same args.\n"
             "- Use the Scratchpad as reliable working memory; do not redo actions already listed there unless you explain why.\n"
+            f"{output_budget_line}"
 #            "- For file work, prefer file tools (write_file/edit_file) and verify with list_files/read_file.\n"
 #            "- If the user asked you to create/update a file, do it with write_file/edit_file (do not ask for permission).\n"
  #           "- Do not prefix your messages with role labels like 'assistant:'.\n"
@@ -263,21 +279,6 @@ class ReActLogic:
         system_memory = str(system_memory or "").strip()
         if system_memory:
             system_prompt = f"{system_memory}\n\n{system_prompt}".strip()
-
-        # Prefer the runtime allowlist when present so the system prompt stays consistent
-        # with AbstractCode `/tools` (and with the tool specs actually sent to the model).
-        try:
-            runtime_ns = (vars or {}).get("_runtime", {}) if isinstance(vars, dict) else {}
-            allowed = runtime_ns.get("allowed_tools") if isinstance(runtime_ns, dict) else None
-            if isinstance(allowed, list) and allowed:
-                normalized = [str(t).strip() for t in allowed if isinstance(t, str) and t.strip()]
-                tool_names = ", ".join(normalized)
-            else:
-                tool_names = ", ".join([t.name for t in self._tools if getattr(t, "name", None)])
-        except Exception:
-            tool_names = ""
-#        if tool_names:
-#            system_prompt += f"\nAvailable tools: {tool_names}\n"
 
         if plan_mode:
             system_prompt += (

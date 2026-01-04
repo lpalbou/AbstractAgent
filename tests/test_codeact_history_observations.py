@@ -26,6 +26,6 @@ def test_build_request_renders_tool_messages_as_observations() -> None:
         vars={"_limits": {"max_history_messages": -1}},
     )
 
-    assert "observation[execute_python] (success): ok" in req.prompt
+    assert "Tool execute_python succeeded: ok" in req.prompt
     assert "tool: [execute_python]" not in req.prompt
 

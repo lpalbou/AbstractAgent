@@ -301,13 +301,11 @@ def create_react_workflow(
         task = str(context.get("task", "") or "")
 
         allow = _effective_allowlist(runtime_ns)
-        tools_summary = ", ".join(allow) if allow else "(no tools)"
 
         prompt = (
             "You are preparing a high-level execution plan for the user's request.\n"
             "Return a concise TODO list (5–12 steps) that is actionable and verifiable.\n"
             "Do not call tools yet. Do not include role prefixes like 'assistant:'.\n\n"
-#            f"Available tools: {tools_summary}\n\n"
             f"User request:\n{task}\n\n"
             "Plan (markdown checklist):\n"
             "- [ ] ...\n"
@@ -408,13 +406,27 @@ def create_react_workflow(
         override = runtime_ns.get("include_tools_summary") if isinstance(runtime_ns, dict) else None
         if isinstance(override, bool):
             include_tools_summary = override
-        elif tool_specs and model_key:
-            try:
-                from abstractcore.tools.handler import UniversalToolHandler
+        else:
+            supports_native: Optional[bool] = None
+            if isinstance(runtime_ns, dict):
+                flag = runtime_ns.get("supports_native_tools")
+                if isinstance(flag, bool):
+                    supports_native = flag
+                else:
+                    ts = runtime_ns.get("tool_support")
+                    if isinstance(ts, str) and ts.strip():
+                        supports_native = ts.strip() == "native"
 
-                include_tools_summary = not bool(UniversalToolHandler(model_key).supports_native)
-            except Exception:
-                include_tools_summary = True
+            if supports_native is not None:
+                include_tools_summary = not supports_native
+            elif tool_specs and model_key:
+                # Backward compatibility fallback: infer from model capabilities via AbstractCore.
+                try:
+                    from abstractcore.tools.handler import UniversalToolHandler
+
+                    include_tools_summary = not bool(UniversalToolHandler(model_key).supports_native)
+                except Exception:
+                    include_tools_summary = True
 
         inbox = runtime_ns.get("inbox", [])
         guidance = ""
