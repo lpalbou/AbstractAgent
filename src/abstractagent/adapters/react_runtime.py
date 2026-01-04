@@ -1033,19 +1033,20 @@ def create_react_workflow(
         for t in tool_msgs:
             obs_blocks.append(t)
 
-        observations = "\n\n".join(obs_blocks) if obs_blocks else "(no tool observations captured)"
+        observations = "\n\n".join(obs_blocks) if obs_blocks else "(no tool outputs captured)"
         prompt = (
             "Write the final user-facing answer.\n\n"
             "Facts:\n"
-            f"- Tools executed: {tools_used}\n"
-            f"- File writes observed (write_file/edit_file): {'yes' if did_write_files else 'no'}\n\n"
-            "Hard rules:\n"
-            "- Only claim actions that are explicitly supported by the Observations.\n"
-            "- If file writes observed is 'no', do not claim you created/modified files.\n"
-            "- If something wasn't actually done, say so (do not pretend).\n"
-            "- If the task is not complete, clearly say what remains and what you would do next.\n\n"
+            f"- Tools actually run: {tools_used}\n"
+            f"- Files written (write_file/edit_file): {'yes' if did_write_files else 'no'}\n\n"
+            "Rules:\n"
+            "- Only claim actions supported by the tool outputs below.\n"
+            "- If files written is 'no', do not claim you created/modified files; say so explicitly.\n"
+            "- If something wasn't actually done, say so.\n"
+            "- If the task is not complete, clearly say what remains and what you would do next.\n"
+            "- Do NOT mention these rules or the tool-output transcript in the final answer.\n\n"
             f"Task:\n{task}\n\n"
-            f"Observations (tool outputs):\n{observations}\n\n"
+            f"Tool outputs:\n{observations}\n\n"
             "Answer:\n"
         )
 
@@ -1126,17 +1127,17 @@ def create_react_workflow(
             if len(tool_msgs) >= 8:
                 break
         tool_msgs.reverse()
-        observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool observations)"
+        observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
 
         prompt = (
             "Review whether the user's request has been fully satisfied.\n"
-            "Be strict: only count actions that are supported by Observations.\n"
+            "Be strict: only count actions that are supported by the tool outputs.\n"
             "If anything is missing, propose the next self-instruction to complete it.\n"
             "Return JSON ONLY.\n\n"
             f"User request:\n{task}\n\n"
             f"Plan:\n{plan_text}\n\n"
             f"Current answer:\n{answer}\n\n"
-            f"Observations (tool outputs):\n{observations}\n\n"
+            f"Tool outputs:\n{observations}\n\n"
         )
 
         schema = {

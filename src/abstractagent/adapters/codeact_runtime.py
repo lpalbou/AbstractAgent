@@ -795,17 +795,17 @@ def create_codeact_workflow(
             if len(tool_msgs) >= 8:
                 break
         tool_msgs.reverse()
-        observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool observations)"
+        observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
 
         prompt = (
             "Review whether the user's request has been fully satisfied.\n"
-            "Be strict: only count actions that are supported by Observations.\n"
+            "Be strict: only count actions that are supported by the tool outputs.\n"
             "If anything is missing, propose the next self-instruction to complete it.\n"
             "Return JSON ONLY.\n\n"
             f"User request:\n{task}\n\n"
             f"Plan:\n{plan_text}\n\n"
             f"Current answer:\n{answer}\n\n"
-            f"Observations (tool outputs):\n{observations}\n\n"
+            f"Tool outputs:\n{observations}\n\n"
         )
 
         schema = {
