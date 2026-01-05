@@ -98,7 +98,6 @@ class CodeActLogic:
             "- Be autonomous: do not ask the user for confirmation to proceed; keep going until the task is done.\n"
             "- If you need to run code, call `execute_python` (preferred) or output a fenced ```python code block.\n"
             "- Never fabricate tool outputs.\n"
-            "- Before calling a tool, write 1–3 short lines explaining what you will do and why.\n"
             "- Only ask the user a question when required information is missing.\n"
             f"{output_budget_line}"
         ).strip()
