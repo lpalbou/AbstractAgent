@@ -214,6 +214,35 @@ def create_react_workflow(
             return raw
         return None
 
+    def _sanitize_llm_messages(messages: Any) -> List[Dict[str, str]]:
+        """Convert runtime-owned message dicts into OpenAI-style {role, content, ...}.
+
+        Runtime messages can include extra metadata fields (`timestamp`, `metadata`) that many providers
+        will reject. Keep only the fields the LLM API expects.
+        """
+        if not isinstance(messages, list) or not messages:
+            return []
+        out: List[Dict[str, str]] = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role") or "").strip()
+            content = m.get("content")
+            if not role or content is None:
+                continue
+            content_str = str(content)
+            if not content_str.strip():
+                continue
+            entry: Dict[str, str] = {"role": role, "content": content_str}
+            if role == "tool":
+                meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
+                call_id = meta.get("call_id") if isinstance(meta, dict) else None
+                if call_id is not None and str(call_id).strip():
+                    # OpenAI-compatible servers accept `tool_call_id` for tool messages.
+                    entry["tool_call_id"] = str(call_id).strip()
+            out.append(entry)
+        return out
+
     def _flag(runtime_ns: Dict[str, Any], key: str, *, default: bool = False) -> bool:
         if not isinstance(runtime_ns, dict) or key not in runtime_ns:
             return bool(default)
@@ -377,7 +406,8 @@ def create_react_workflow(
         task = str(context.get("task", "") or "")
         messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
-        # Refresh tool metadata BEFORE rendering Active Memory so `Tools (session)` is accurate.
+        # Refresh tool metadata BEFORE rendering Active Memory so token fitting stays accurate
+        # (even though we do not render a "Tools (session)" block into Active Memory prompts).
         allow = _effective_allowlist(runtime_ns)
         allowed_defs = _allowed_tool_defs(allow)
         tool_specs = [t.to_dict() for t in allowed_defs]
@@ -388,45 +418,11 @@ def create_react_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
-        # IMPORTANT: When the model supports native tool calling (AbstractCore sends a structured
-        # `tools` payload), avoid duplicating a visible tools catalog in the system prompt.
-        #
-        # Some OpenAI-compatible servers enforce tool calling via hidden grammars/templates;
-        # duplicating tool definitions (or tool-call transcript instructions) can cause "text leaked"
-        # tool calls that the server does not parse into structured `tool_calls`.
-        #
-        # NOTE: We intentionally do NOT gate this on the provider name here. In some hosts, the
-        # provider is resolved outside the workflow and `_runtime.provider` can be empty, yet the
-        # actual execution still uses native tools (e.g. LMStudio/OpenAI-compatible). The safest
-        # default is: if the model is configured as native-capable, omit the Tools(session) block.
-        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
-        model_key = str(eff_model or "").strip()
-
-        include_tools_summary = True
-        override = runtime_ns.get("include_tools_summary") if isinstance(runtime_ns, dict) else None
-        if isinstance(override, bool):
-            include_tools_summary = override
-        else:
-            supports_native: Optional[bool] = None
-            if isinstance(runtime_ns, dict):
-                flag = runtime_ns.get("supports_native_tools")
-                if isinstance(flag, bool):
-                    supports_native = flag
-                else:
-                    ts = runtime_ns.get("tool_support")
-                    if isinstance(ts, str) and ts.strip():
-                        supports_native = ts.strip() == "native"
-
-            if supports_native is not None:
-                include_tools_summary = not supports_native
-            elif tool_specs and model_key:
-                # Backward compatibility fallback: infer from model capabilities via AbstractCore.
-                try:
-                    from abstractcore.tools.handler import UniversalToolHandler
-
-                    include_tools_summary = not bool(UniversalToolHandler(model_key).supports_native)
-                except Exception:
-                    include_tools_summary = True
+        # IMPORTANT: Active Memory "Tools (session)" is deprecated for now.
+        # - For native-tool providers, tools are supplied via the structured `tools` payload.
+        # - For prompted-tool providers, AbstractCore is responsible for injecting the tool catalog/instructions.
+        # Duplicating a visible tools catalog here has repeatedly caused tool-call confusion.
+        include_tools_summary = False
 
         inbox = runtime_ns.get("inbox", [])
         guidance = ""
@@ -478,6 +474,10 @@ def create_react_workflow(
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
         payload = {"prompt": req.prompt}
+        # Provide the selected active-context messages as proper chat messages (sanitized).
+        # This keeps the user-role prompt clean (only the request) while still giving the model
+        # access to tool outputs and any rehydrated memory notes.
+        payload["messages"] = _sanitize_llm_messages(messages_view)
         tools_payload = list(tool_specs)
         if tools_payload:
             payload["tools"] = tools_payload
@@ -528,23 +528,8 @@ def create_react_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
-        # Keep the same "native tools => no Tools(session) catalog in system prompt" policy as the
-        # normal reason node (see rationale there). Do not rely on provider-name inference; see
-        # comment in the reason node for why.
-        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
-        model_key = str(eff_model or "").strip()
-
-        include_tools_summary = True
-        override = runtime_ns.get("include_tools_summary") if isinstance(runtime_ns, dict) else None
-        if isinstance(override, bool):
-            include_tools_summary = override
-        elif tool_specs and model_key:
-            try:
-                from abstractcore.tools.handler import UniversalToolHandler
-
-                include_tools_summary = not bool(UniversalToolHandler(model_key).supports_native)
-            except Exception:
-                include_tools_summary = True
+        # Active Memory "Tools (session)" is deprecated; never inject it.
+        include_tools_summary = False
 
         # Keep token fitting consistent with normal calls.
         try:
@@ -637,20 +622,6 @@ def create_react_workflow(
         context, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
-        delta_result: Optional[Dict[str, Any]] = None
-
-        # Apply structured Active Memory deltas (if present) and remove them from user-visible content.
-        try:
-            content, delta = extract_active_memory_delta(content)
-            # Only apply deltas when the model is NOT emitting tool calls. Tool-call turns are
-            # usually incomplete and may contain formatting artifacts; we still strip the delta
-            # block from content for safety, but defer mutation until a non-tool response.
-            if not tool_calls and isinstance(delta, dict) and delta:
-                from abstractruntime.memory.active_memory import apply_active_memory_delta
-
-                delta_result = apply_active_memory_delta(run.vars, delta=delta)
-        except Exception:
-            delta_result = None
 
         def _sanitize_tool_call_content(text: str) -> str:
             """Remove tool-transcript markers from assistant content before persisting to history.
@@ -695,8 +666,6 @@ def create_react_workflow(
                 "tool_calls": [{"name": tc.name, "arguments": tc.arguments, "call_id": tc.call_id} for tc in tool_calls],
             },
         )
-        if isinstance(delta_result, dict) and delta_result.get("ok"):
-            emit("active_memory_delta", {"applied": delta_result.get("applied")})
         temp.pop("llm_response", None)
 
         # Reset retry counter on any successful tool-call detection.
@@ -761,19 +730,21 @@ def create_react_workflow(
             return StepPlan(node_id="parse", next_node="maybe_review")
 
         if content.strip():
-            context["messages"].append(_new_message(ctx, role="assistant", content=content))
+            # Do not persist a final user-facing assistant message here. We always run a final,
+            # tool-free structured output pass (`finalize`) to produce:
+            # - the user-facing answer (`content`)
+            # - deterministic Active Memory updates
+            #
+            # We still allow Plan-mode updates to be extracted from this draft text.
+            temp["final_answer_draft"] = content
             if _flag(runtime_ns, "plan_mode", default=False):
                 updated = _extract_plan_update(content)
                 if isinstance(updated, str) and updated.strip():
                     scratchpad["plan"] = updated.strip()
-
-        temp["final_answer"] = content
         scratchpad["tool_retry_count"] = 0
-        # If we used tools, always run a final "synthesis" LLM pass to produce a
-        # clean user-facing answer (models may otherwise echo tool transcript lines).
-        if bool(scratchpad.get("used_tools")):
-            return StepPlan(node_id="parse", next_node="finalize")
-        return StepPlan(node_id="parse", next_node="maybe_review")
+        # Always run a final tool-free structured-output pass to produce the user-facing answer
+        # and apply deterministic Active Memory updates.
+        return StepPlan(node_id="parse", next_node="finalize")
 
     def act_node(run: RunState, ctx) -> StepPlan:
         _, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
@@ -1068,12 +1039,15 @@ def create_react_workflow(
         return StepPlan(node_id="observe", next_node="reason")
 
     def finalize_node(run: RunState, ctx) -> StepPlan:
-        """Final synthesis pass to ensure we return a user-facing answer.
+        """Final synthesis pass producing a structured envelope.
 
-        This is intentionally tool-free: tools have already been executed, and we
-        want a single clean response that uses the observations.
+        This is intentionally tool-free:
+        - tools have already been executed (if any)
+        - we want ONE deterministic JSON object containing:
+          - user-facing answer (`content`)
+          - Active Memory updates (tasks/context/insights/history)
         """
-        context, _, runtime_ns, _, _ = ensure_react_vars(run)
+        context, _, runtime_ns, temp, _ = ensure_react_vars(run)
         task = str(context.get("task", "") or "")
         # NOTE: We intentionally use a prompt-only synthesis request (instead of
         # passing message dicts) because host messages can contain extra metadata
@@ -1115,28 +1089,81 @@ def create_react_workflow(
             obs_blocks.append(t)
 
         observations = "\n\n".join(obs_blocks) if obs_blocks else "(no tool outputs captured)"
-        prompt = (
-            "Write the final user-facing answer.\n\n"
+        try:
+            from abstractruntime.memory.active_memory import ACTIVE_MEMORY_ENVELOPE_SCHEMA_V1
+        except Exception:
+            ACTIVE_MEMORY_ENVELOPE_SCHEMA_V1 = None  # type: ignore[assignment]
+        schema = ACTIVE_MEMORY_ENVELOPE_SCHEMA_V1 if isinstance(ACTIVE_MEMORY_ENVELOPE_SCHEMA_V1, dict) else {}
+
+        draft = str(temp.get("final_answer_draft") or "").strip()
+        temp.pop("final_answer_draft", None)
+
+        # Keep user-role content clean (only the user's request). Put all finalization
+        # instructions and evidence into the system prompt to avoid confusing the model
+        # about "what the user asked".
+        finalize_block = (
+            "Finalization (structured output):\n"
+            "- Return JSON ONLY matching the provided schema.\n"
+            "- `content` is the final user-facing answer.\n"
+            "- `key_history.added` is append-only experiential notes (no raw commands/tool-call syntax).\n"
+            "- Removed lists may contain either ids OR exact existing text; the runtime resolves them deterministically.\n"
+            "- Only claim actions supported by Tool outputs.\n\n"
             "Facts:\n"
             f"- Tools actually run: {tools_used}\n"
             f"- Files written (write_file/edit_file): {'yes' if did_write_files else 'no'}\n\n"
-            "Rules:\n"
-            "- Only claim actions supported by the tool outputs below.\n"
-            "- If files written is 'no', do not claim you created/modified files; say so explicitly.\n"
-            "- If something wasn't actually done, say so.\n"
-            "- If the task is not complete, clearly say what remains and what you would do next.\n"
-            "- Do NOT mention these rules or the tool-output transcript in the final answer.\n\n"
-            f"Task:\n{task}\n\n"
-            f"Tool outputs:\n{observations}\n\n"
-            "Answer:\n"
-        )
+            "Tool outputs (evidence):\n"
+            f"{observations}\n"
+        ).strip()
+        if draft:
+            finalize_block += "\n\nDraft answer (revise if needed):\n" + draft.strip()
 
         emit("finalize", {"tool_messages": len(tool_msgs)})
 
-        payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
-        sys = _system_prompt(runtime_ns)
+        # Include Active Memory in the system prompt so the model can add/remove items deterministically.
+        try:
+            from abstractcore.utils.token_utils import TokenUtils  # type: ignore
+        except Exception:  # pragma: no cover
+            TokenUtils = None  # type: ignore[assignment]
+
+        eff_model_for_tokens = str(runtime_ns.get("model") or "").strip()
+
+        def _count_tokens(text: str) -> int:
+            s = str(text or "")
+            if not s:
+                return 0
+            if TokenUtils is None:
+                return max(1, len(s) // 4)
+            try:
+                return max(0, int(TokenUtils.estimate_tokens(s, model=eff_model_for_tokens)))
+            except Exception:
+                return max(1, len(s) // 4)
+
+        mem_split = render_active_memory_split_for_llm_request(
+            run.vars, include_tools_summary=False, token_counter=_count_tokens
+        )
+        system_memory = str(mem_split.get("system_memory") or "")
+        active_memory = str(mem_split.get("user_memory") or "")
+
+        sys_req = logic.build_request(
+            task=task,
+            messages=[],
+            guidance="",
+            active_memory=active_memory,
+            system_memory=system_memory,
+            iteration=0,
+            max_iterations=0,
+            vars=run.vars,
+        )
+
+        payload: Dict[str, Any] = {
+            "prompt": task,
+            "response_schema": schema,
+            "response_schema_name": "ActiveMemoryEnvelopeV1",
+            "params": {"temperature": 0.2},
+        }
+        sys = _system_prompt(runtime_ns) or sys_req.system_prompt
         if sys is not None:
-            payload["system_prompt"] = sys
+            payload["system_prompt"] = (str(sys).rstrip() + "\n\n" + finalize_block).strip()
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
         eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
         if isinstance(eff_provider, str) and eff_provider.strip():
@@ -1155,13 +1182,48 @@ def create_react_workflow(
         )
 
     def finalize_parse_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp, _ = ensure_react_vars(run)
+        context, _, runtime_ns, temp, _ = ensure_react_vars(run)
         resp = temp.get("final_llm_response", {})
         if not isinstance(resp, dict):
             resp = {}
-        content = resp.get("content")
-        answer = "" if content is None else str(content)
-        emit("finalize_parse", {"content_preview": answer[:100] if answer else "(empty)"})
+        data = resp.get("data")
+        if data is None and isinstance(resp.get("content"), str):
+            try:
+                data = json.loads(resp["content"])
+            except Exception:
+                data = None
+        envelope = data if isinstance(data, dict) else {}
+
+        answer_raw = envelope.get("content")
+        answer = str(answer_raw or "").strip()
+
+        # Apply deterministic Active Memory updates from the envelope.
+        applied: Optional[Dict[str, Any]] = None
+        try:
+            from abstractruntime.memory.active_memory import apply_active_memory_envelope
+
+            applied = apply_active_memory_envelope(run.vars, envelope=envelope)
+        except Exception:
+            applied = None
+
+        emit(
+            "finalize_parse",
+            {
+                "content_preview": answer[:100] if answer else "(empty)",
+                "applied_memory": bool(isinstance(applied, dict) and applied.get("ok")),
+            },
+        )
+        if isinstance(applied, dict) and applied.get("ok") and applied.get("applied") is not None:
+            emit("active_memory_envelope", {"applied": applied.get("applied")})
+
+        # Replace the last assistant message (if any) with the user-facing content.
+        # This keeps /history clean: only the final answer is persisted as assistant content.
+        messages = context.get("messages")
+        if isinstance(messages, list) and messages:
+            last = messages[-1] if messages else None
+            if isinstance(last, dict) and last.get("role") == "assistant":
+                last["content"] = answer
+
         temp["final_answer"] = answer
         temp.pop("final_llm_response", None)
         return StepPlan(node_id="finalize_parse", next_node="maybe_review")

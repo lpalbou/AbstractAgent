@@ -189,6 +189,34 @@ def create_codeact_workflow(
             return raw
         return None
 
+    def _sanitize_llm_messages(messages: Any) -> List[Dict[str, str]]:
+        """Convert runtime-owned message dicts into OpenAI-style {role, content, ...}.
+
+        Runtime messages can include extra metadata fields (`timestamp`, `metadata`) that many providers
+        will reject. Keep only the fields the LLM API expects.
+        """
+        if not isinstance(messages, list) or not messages:
+            return []
+        out: List[Dict[str, str]] = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role") or "").strip()
+            content = m.get("content")
+            if not role or content is None:
+                continue
+            content_str = str(content)
+            if not content_str.strip():
+                continue
+            entry: Dict[str, str] = {"role": role, "content": content_str}
+            if role == "tool":
+                meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
+                call_id = meta.get("call_id") if isinstance(meta, dict) else None
+                if call_id is not None and str(call_id).strip():
+                    entry["tool_call_id"] = str(call_id).strip()
+            out.append(entry)
+        return out
+
     def _flag(runtime_ns: Dict[str, Any], key: str, *, default: bool = False) -> bool:
         if not isinstance(runtime_ns, dict) or key not in runtime_ns:
             return bool(default)
@@ -350,7 +378,8 @@ def create_codeact_workflow(
 
         messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
-        # Refresh tool metadata BEFORE rendering Active Memory so `Tools (session)` is accurate.
+        # Refresh tool metadata BEFORE rendering Active Memory so token fitting stays accurate
+        # (even though we do not render a "Tools (session)" block into Active Memory prompts).
         allow = _effective_allowlist(runtime_ns)
         allowed_defs = _allowed_tool_defs(allow)
         tool_specs = [t.to_dict() for t in allowed_defs]
@@ -361,38 +390,10 @@ def create_codeact_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
-        # Same policy as ReAct: when the model supports native tools, avoid duplicating a visible
-        # tools catalog in the system prompt (can conflict with provider tool grammars).
-        #
-        # Do not rely on provider-name inference here: some hosts resolve the provider outside the
-        # workflow and `_runtime.provider` can be empty, yet native tools are still used.
-        model_key = str(runtime_ns.get("model") or "").strip()
-
-        include_tools_summary = True
-        override = runtime_ns.get("include_tools_summary") if isinstance(runtime_ns, dict) else None
-        if isinstance(override, bool):
-            include_tools_summary = override
-        else:
-            supports_native: Optional[bool] = None
-            if isinstance(runtime_ns, dict):
-                flag = runtime_ns.get("supports_native_tools")
-                if isinstance(flag, bool):
-                    supports_native = flag
-                else:
-                    ts = runtime_ns.get("tool_support")
-                    if isinstance(ts, str) and ts.strip():
-                        supports_native = ts.strip() == "native"
-
-            if supports_native is not None:
-                include_tools_summary = not supports_native
-            elif tool_specs and model_key:
-                # Backward compatibility fallback: infer from model capabilities via AbstractCore.
-                try:
-                    from abstractcore.tools.handler import UniversalToolHandler
-
-                    include_tools_summary = not bool(UniversalToolHandler(model_key).supports_native)
-                except Exception:
-                    include_tools_summary = True
+        # IMPORTANT: Active Memory "Tools (session)" is deprecated for now.
+        # - For native-tool providers, tools are supplied via the structured `tools` payload.
+        # - For prompted-tool providers, AbstractCore is responsible for injecting the tool catalog/instructions.
+        include_tools_summary = False
 
         # Use AbstractCore token estimation for Active Memory fitting when available so
         # prompt composition + `/memory` token metrics stay in the same ballpark.
@@ -433,7 +434,11 @@ def create_codeact_workflow(
 
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
-        payload: Dict[str, Any] = {"prompt": req.prompt, "tools": list(tool_specs)}
+        payload: Dict[str, Any] = {
+            "prompt": req.prompt,
+            "messages": _sanitize_llm_messages(messages_view),
+            "tools": list(tool_specs),
+        }
         sys = _system_prompt(runtime_ns) or req.system_prompt
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
