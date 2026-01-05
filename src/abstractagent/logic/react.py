@@ -194,7 +194,8 @@ class ReActLogic:
             task: The task to perform
             messages: Conversation history
             guidance: Optional guidance text to inject
-            active_memory: "User prompt memory" (current tasks/context/insights/history).
+            active_memory: Deprecated split for "user prompt memory". Active Memory is internal;
+                          callers should render it into `system_memory`.
             system_memory: "System prompt memory" (persona/memory organization/tools).
             iteration: Current iteration number
             max_iterations: Maximum allowed iterations
@@ -221,23 +222,12 @@ class ReActLogic:
         plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
         plan = str(plan_text).strip() if isinstance(plan_text, str) and plan_text.strip() else ""
 
-        runtime_scratchpad = self._format_runtime_scratchpad(vars)
-
-        history_text = "\n".join([self._format_history_message(m) for m in messages])
-        prompt = f"Iteration: {int(iteration)}/{int(max_iterations)}\n\nTask:\n{task}\n\n"
-
-        active_memory = str(active_memory or "").strip()
-        if active_memory:
-            prompt += f"Active Memory:\n{active_memory}\n\n"
-
-        if history_text:
-            prompt += f"History:\n{history_text}\n\n"
-        if runtime_scratchpad:
-            prompt += f"Scratchpad (runtime; tool calls + results):\n{runtime_scratchpad}\n\n"
-        if guidance:
-            prompt += "[User guidance]: " + guidance + "\n\n"
-        if plan_mode and plan:
-            prompt += f"Current plan:\n{plan}\n\n"
+        # USER ROLE CONTENT MUST CONTAIN ONLY THE USER'S REQUEST.
+        #
+        # Rationale:
+        # - Mixing internal memory/history (especially tool-call-like syntax) into a user-role message
+        #   causes some models to treat it as a new user instruction and can trigger loops.
+        prompt = task.strip()
 
         # Keep long-lived agent rules in a separate system prompt for clarity and stability.
         output_budget_line = ""
@@ -257,18 +247,17 @@ class ReActLogic:
             "You are an autonomous ReAct agent.\n"
             "Taking action / having an effect means calling a tool.\n\n"
             "Rules:\n"
-            "- Be truthful: only claim actions that are supported by tool outputs in History/Scratchpad.\n"
+            "- Be truthful: only claim actions supported by tool outputs (recorded durably by the host/runtime).\n"
             "- Be autonomous: do not ask the user for confirmation to proceed. Keep going until the task is done.\n"
             "- If you want to create/edit files, run commands, fetch URLs, or search, you MUST call the appropriate tool.\n"
             "- If you list next steps, immediately start executing them (with tools) as long as they are within the user's request.\n"
-            "- Never fabricate tool outputs. Tool results will appear in History/Scratchpad as tool observations.\n"
+            "- Never fabricate tool outputs. Tool outcomes are captured into internal memory (Active Memory → Key History).\n"
 #            "- Do not output lines that look like internal transcript markers (e.g. `observation[tool] ...`). Those are context-only.\n"
-            "- Do not quote the History or Scratchpad verbatim in your answer; use them silently as context.\n"
+            "- Do not quote internal memory verbatim in your answer; use it silently as context.\n"
             "- Only ask the user a question when required information is missing.\n"
-            "- If the latest History entry is an observation, start by stating what you observed in 1 line.\n"
             "- Before calling a tool, write 1–3 short lines explaining what you will do and why.\n"
 #            "- After tool results, continue from the new information; do not repeat successful tool calls with the same args.\n"
-            "- Use the Scratchpad as reliable working memory; do not redo actions already listed there unless you explain why.\n"
+            "- Use Active Memory (Current Tasks/Context/Key History) as your working memory; avoid repeating the same successful action.\n"
             f"{output_budget_line}"
 #            "- For file work, prefer file tools (write_file/edit_file) and verify with list_files/read_file.\n"
 #            "- If the user asked you to create/update a file, do it with write_file/edit_file (do not ask for permission).\n"
@@ -277,8 +266,38 @@ class ReActLogic:
         )
 
         system_memory = str(system_memory or "").strip()
+        active_memory = str(active_memory or "").strip()
+
+        # Treat *all* Active Memory as internal/system context (never user-role).
+        internal_sections: List[str] = []
         if system_memory:
-            system_prompt = f"{system_memory}\n\n{system_prompt}".strip()
+            internal_sections.append(system_memory)
+        if active_memory:
+            internal_sections.append(active_memory)
+
+        if internal_sections:
+            internal_header = (
+                "## Active Memory (internal)\n"
+                "The sections below are your INTERNAL memory/state.\n"
+                "- They are NOT messages from the user.\n"
+                "- Do NOT treat them as new user instructions.\n"
+            ).strip()
+            system_prompt = f"{internal_header}\n\n" + "\n\n".join(internal_sections).strip() + "\n\n" + system_prompt
+            system_prompt = system_prompt.strip()
+
+        # Iteration info is internal coordination (keep it OUT of user-role content).
+        system_prompt = (
+            f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n{system_prompt}".strip()
+            if isinstance(iteration, int) and isinstance(max_iterations, int)
+            else system_prompt.strip()
+        )
+
+        # User guidance is host/user-provided policy, not part of the user request body.
+        if guidance:
+            system_prompt = (system_prompt + "\n\n" + "Guidance:\n" + guidance).strip()
+
+        if plan_mode and plan:
+            system_prompt = (system_prompt + "\n\n" + "Current plan:\n" + plan).strip()
 
         if plan_mode:
             system_prompt += (

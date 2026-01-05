@@ -19,11 +19,14 @@ def test_build_request_includes_history_and_memory_instruction() -> None:
         max_iterations=10,
         vars={"_limits": {"max_history_messages": -1}},
     )
-    assert "History:" in req.prompt
+    # User-role content must contain only the user's request (no internal history/memory).
+    assert req.prompt == "Do something"
+    assert "History:" not in req.prompt
     assert isinstance(req.system_prompt, str) and req.system_prompt.strip()
+    assert "Iteration: 2/10" in req.system_prompt
     assert "autonomous ReAct agent" in req.system_prompt
-    assert "user: hi" in req.prompt
-    assert "assistant: hello" in req.prompt
+    assert "user: hi" not in req.prompt
+    assert "assistant: hello" not in req.prompt
 
 
 def test_build_request_does_not_slice_history() -> None:
@@ -40,11 +43,11 @@ def test_build_request_does_not_slice_history() -> None:
         max_iterations=5,
         vars={"_limits": {"max_history_messages": 1}},
     )
-    # History slicing is now handled by the runtime-owned ActiveContextPolicy.
-    # Logic should treat the provided messages as the already-selected active view.
-    assert "user: m3" in req.prompt
-    assert "assistant: m2" in req.prompt
-    assert "user: m1" in req.prompt
+    # Messages are internal state and must not be placed in the user-role prompt.
+    assert req.prompt == "t"
+    assert "m1" not in req.prompt
+    assert "m2" not in req.prompt
+    assert "m3" not in req.prompt
 
 
 def test_build_request_renders_tool_messages_as_observations() -> None:
@@ -63,9 +66,9 @@ def test_build_request_renders_tool_messages_as_observations() -> None:
         max_iterations=5,
         vars={"_limits": {"max_history_messages": -1}},
     )
-
-    assert "Tool execute_command succeeded: ok" in req.prompt
-    assert "tool: [execute_command]" not in req.prompt
+    # Tool observations are internal and must not appear in the user-role prompt.
+    assert req.prompt == "t"
+    assert "execute_command" not in req.prompt
 
 
 def test_parse_response_reads_native_tool_calls() -> None:

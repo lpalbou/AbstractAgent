@@ -65,13 +65,16 @@ def test_react_reason_prompt_includes_active_memory_and_default_system_prompt() 
     payload = plan.effect.payload if isinstance(plan.effect.payload, dict) else {}
 
     prompt = str(payload.get("prompt") or "")
-    assert "Active Memory:" in prompt
-    assert "## Current Tasks (evolving)" in prompt
-    assert "## Persona (persistent)" not in prompt
+    # User-role prompt must contain only the user request.
+    assert prompt == "t"
+    assert "Active Memory:" not in prompt
+    assert "## Current Tasks (evolving)" not in prompt
 
     sys = payload.get("system_prompt")
     assert isinstance(sys, str) and "autonomous ReAct agent" in sys
+    assert "## Active Memory (internal)" in sys
     assert "## Persona (persistent)" in sys
+    assert "## Current Tasks (evolving)" in sys
 
 
 def test_codeact_reason_prompt_includes_active_memory_and_default_system_prompt() -> None:
@@ -92,13 +95,15 @@ def test_codeact_reason_prompt_includes_active_memory_and_default_system_prompt(
     payload = plan.effect.payload if isinstance(plan.effect.payload, dict) else {}
 
     prompt = str(payload.get("prompt") or "")
-    assert "Active Memory:" in prompt
-    assert "## Current Tasks (evolving)" in prompt
-    assert "## Persona (persistent)" not in prompt
+    assert prompt == "t"
+    assert "Active Memory:" not in prompt
+    assert "## Current Tasks (evolving)" not in prompt
 
     sys = payload.get("system_prompt")
     assert isinstance(sys, str) and "You are CodeAct" in sys
+    assert "## Active Memory (internal)" in sys
     assert "## Persona (persistent)" in sys
+    assert "## Current Tasks (evolving)" in sys
 
 
 def test_react_system_prompt_omits_tools_session_when_native_tools_are_enabled() -> None:

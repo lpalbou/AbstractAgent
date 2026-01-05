@@ -286,7 +286,10 @@ ACTIVE_MEMORY_DELTA_TOOL = ToolDefinition(
         },
         "key_history": {
             "type": "object",
-            "description": "Optional patch for Key History: {clear?: bool, remove?: [event_id], add?: [event_obj|summary_str]}.",
+            "description": (
+                "Optional patch for Key History: {clear?: bool, remove?: [event_id], add?: [event_obj|summary_str]}.\n"
+                "IMPORTANT: key_history entries must be experiential summaries (no raw commands/tool-call syntax)."
+            ),
             "default": None,
         },
     },
@@ -355,5 +358,5 @@ KEY_HISTORY_TOOL = ToolDefinition(
             "default": None,
         },
     },
-    when_to_use="Use to append/update Key History with durable, natural-language events.",
+    when_to_use="Use to append/update Key History with short experiential summaries (no raw commands/tool-call syntax).",
 )
