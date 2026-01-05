@@ -211,7 +211,7 @@ def create_react_workflow(
             return raw
         return None
 
-    def _sanitize_llm_messages(messages: Any) -> List[Dict[str, str]]:
+    def _sanitize_llm_messages(messages: Any, *, limits: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
         """Convert runtime-owned message dicts into OpenAI-style {role, content, ...}.
 
         Runtime messages can include extra metadata fields (`timestamp`, `metadata`) that many providers
@@ -219,6 +219,30 @@ def create_react_workflow(
         """
         if not isinstance(messages, list) or not messages:
             return []
+        # Keep the LLM-visible context bounded even if the durable history contains large
+        # tool outputs or code dumps.
+        def _limit_int(key: str, default: int) -> int:
+            if not isinstance(limits, dict):
+                return default
+            try:
+                return int(limits.get(key, default))
+            except Exception:
+                return default
+        max_message_chars = _limit_int("max_message_chars", -1)
+        max_tool_message_chars = _limit_int("max_tool_message_chars", -1)
+
+        def _truncate(text: str, *, max_chars: int) -> str:
+            if max_chars <= 0:
+                return text
+            if len(text) <= max_chars:
+                return text
+            suffix = f"\n… (truncated, {len(text):,} chars total)"
+            keep = max_chars - len(suffix)
+            if keep < 200:
+                keep = max_chars
+                suffix = ""
+            return text[:keep].rstrip() + suffix
+
         out: List[Dict[str, str]] = []
         for m in messages:
             if not isinstance(m, dict):
@@ -230,7 +254,8 @@ def create_react_workflow(
             content_str = str(content)
             if not content_str.strip():
                 continue
-            entry: Dict[str, str] = {"role": role, "content": content_str}
+            limit = max_tool_message_chars if role == "tool" else max_message_chars
+            entry: Dict[str, str] = {"role": role, "content": _truncate(content_str, max_chars=limit)}
             if role == "tool":
                 meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
                 call_id = meta.get("call_id") if isinstance(meta, dict) else None
@@ -439,7 +464,7 @@ def create_react_workflow(
         # current request is already present in `messages`, which duplicates user turns and
         # wastes context budget.
         payload: Dict[str, Any] = {"prompt": ""}
-        payload["messages"] = _sanitize_llm_messages(messages_view)
+        payload["messages"] = _sanitize_llm_messages(messages_view, limits=limits)
         tools_payload = list(tool_specs)
         if tools_payload:
             payload["tools"] = tools_payload
@@ -963,15 +988,26 @@ def create_react_workflow(
         return StepPlan(node_id="maybe_review", next_node="review")
 
     def review_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, runtime_ns, _, _ = ensure_react_vars(run)
+        context, scratchpad, runtime_ns, _, limits = ensure_react_vars(run)
 
         task = str(context.get("task", "") or "")
         plan = scratchpad.get("plan")
         plan_text = str(plan).strip() if isinstance(plan, str) and plan.strip() else "(no plan)"
 
-        answer = str(run.vars.get("_temp", {}).get("final_answer") or "")
-
         allow = _effective_allowlist(runtime_ns)
+
+        def _truncate_block(text: str, *, max_chars: int) -> str:
+            s = str(text or "")
+            if max_chars <= 0:
+                return s
+            if len(s) <= max_chars:
+                return s
+            suffix = f"\n… (truncated, {len(s):,} chars total)"
+            keep = max_chars - len(suffix)
+            if keep < 200:
+                keep = max_chars
+                suffix = ""
+            return s[:keep].rstrip() + suffix
 
         def _format_allowed_tools() -> str:
             # Prefer the already-computed tool_specs (created in reason_node) to avoid
@@ -999,16 +1035,32 @@ def create_react_workflow(
         # Include recent tool outputs for evidence-based review.
         messages = list(context.get("messages") or [])
         tool_msgs: list[str] = []
+        try:
+            tool_limit = int(limits.get("review_max_tool_output_chars", -1))
+        except Exception:
+            tool_limit = -1
+        try:
+            answer_limit = int(limits.get("review_max_answer_chars", -1))
+        except Exception:
+            answer_limit = -1
+
         for m in reversed(messages):
             if not isinstance(m, dict) or m.get("role") != "tool":
                 continue
             content = m.get("content")
             if isinstance(content, str) and content.strip():
-                tool_msgs.append(content.strip())
+                tool_msgs.append(_truncate_block(content.strip(), max_chars=tool_limit))
             if len(tool_msgs) >= 8:
                 break
         tool_msgs.reverse()
         observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
+
+        # The verifier should primarily judge based on tool outputs. Only include an answer
+        # excerpt when we have no tool evidence (pure Q&A runs).
+        answer_raw = str(run.vars.get("_temp", {}).get("final_answer") or "")
+        answer_excerpt = ""
+        if not tool_msgs and answer_raw.strip():
+            answer_excerpt = _truncate_block(answer_raw.strip(), max_chars=answer_limit)
 
         prompt = (
             "You are a verifier. Review whether the user's request has been fully satisfied.\n"
@@ -1018,8 +1070,8 @@ def create_react_workflow(
             "Return JSON ONLY.\n\n"
             f"User request:\n{task}\n\n"
             f"Plan:\n{plan_text}\n\n"
-            f"Current answer:\n{answer}\n\n"
-            f"Tool outputs:\n{observations}\n\n"
+            + (f"Current answer (excerpt):\n{answer_excerpt}\n\n" if answer_excerpt else "")
+            + f"Tool outputs:\n{observations}\n\n"
             f"Allowed tools:\n{_format_allowed_tools()}\n\n"
         )
 

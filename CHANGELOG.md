@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `remember_note` now supports an optional `location` field.
 - Active Memory: agents now expose `active_memory_delta` (and module alias tools) as schema-only tools executed by AbstractRuntime, so native-tool providers (e.g. LMStudio) don’t mis-parse inline memory JSON as tool calls.
 - ReAct/CodeAct loop reliability: adds an evidence-based **verifier policy** (structured output) that can return `next_tool_calls` when a response is incomplete, avoiding brittle “continuation text” heuristics.
+- Defaults: `max_history_messages` now defaults to **20** (was unlimited) to keep LLM context stable during long runs.
+- Context budgeting: LLM-visible message payloads now **truncate very large tool/assistant messages** (character-level) while keeping the durable run history intact.
+- Verifier prompts now **omit** the full “current answer” when tool outputs exist (to avoid accidentally feeding huge code dumps back into the model).
 
 ### Fixed
 - Limits: ReAct/CodeAct now treat `_limits.max_tokens` as a **context/budget** limit and use `_limits.max_output_tokens` (if set) to cap OpenAI-style `max_tokens` (output). This prevents invalid LMStudio requests like `max_tokens=262144` which can return HTTP 400.

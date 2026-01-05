@@ -131,6 +131,10 @@ class CodeActAgent(BaseAgent):
         limits["max_iterations"] = int(self._max_iterations)
         limits["current_iteration"] = 0
         limits["max_history_messages"] = int(self._max_history_messages)
+        # Message-size guards for LLM-visible context (character-level).
+        # Disabled by default (-1): enable by setting a positive character budget.
+        limits.setdefault("max_message_chars", -1)
+        limits.setdefault("max_tool_message_chars", -1)
         limits["estimated_tokens_used"] = 0
         try:
             max_tokens_override = int(self._max_tokens) if self._max_tokens is not None else None
