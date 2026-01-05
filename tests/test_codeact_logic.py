@@ -30,10 +30,7 @@ def test_build_request_includes_codeact_instructions() -> None:
     assert isinstance(req.system_prompt, str) and req.system_prompt.strip()
     assert "You are CodeAct" in req.system_prompt
     assert "execute_python" in req.system_prompt
-    # History slicing is now handled by the runtime-owned ActiveContextPolicy.
-    # Logic should treat the provided messages as the already-selected active view.
-    assert "assistant: hello" in req.prompt
-    assert "user: hi" in req.prompt
+    assert req.prompt == "Compute something"
 
 
 def test_format_observation_execute_python_dict() -> None:

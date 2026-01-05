@@ -8,7 +8,6 @@ All agent types (ReAct, CodeAct, etc.) inherit from BaseAgent to get:
 """
 
 from abc import ABC, abstractmethod
-import copy
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractruntime import Runtime, RunState, RunStatus, WorkflowSpec
@@ -54,7 +53,6 @@ class BaseAgent(ABC):
         self.actor_id: Optional[str] = actor_id
         self.session_id: Optional[str] = session_id
         self.session_messages: List[Dict[str, Any]] = []
-        self.session_active_memory: Optional[Dict[str, Any]] = None
 
     def _sync_session_caches_from_state(self, state: Optional[RunState]) -> None:
         if state is None or not hasattr(state, "vars") or not isinstance(state.vars, dict):
@@ -71,10 +69,6 @@ class BaseAgent(ABC):
 
         if messages is not None:
             self.session_messages = list(messages)
-
-        runtime_ns = state.vars.get("_runtime")
-        if isinstance(runtime_ns, dict) and isinstance(runtime_ns.get("active_memory"), dict):
-            self.session_active_memory = copy.deepcopy(runtime_ns["active_memory"])
 
     def _ensure_actor_id(self) -> str:
         if self.actor_id:

@@ -170,11 +170,6 @@ class ReactAgent(BaseAgent):
             normalized = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
             vars["_runtime"]["allowed_tools"] = normalized
 
-        if isinstance(self.session_active_memory, dict) and self.session_active_memory:
-            import copy
-
-            vars["_runtime"]["active_memory"] = copy.deepcopy(self.session_active_memory)
-
         run_id = self.runtime.start(
             workflow=self.workflow,
             vars=vars,

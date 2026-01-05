@@ -1,26 +1,24 @@
-"""CodeAct logic (pure; no runtime imports).
+"""MemAct logic (pure; no runtime imports).
 
-This module implements a conventional CodeAct loop:
-- the model primarily acts by producing Python code (or calling execute_python)
-- tool results are appended to chat history
-- the model iterates until it can answer directly
+MemAct is a memory-enhanced agent (Letta-like) that relies on a separate, runtime-owned
+Active Memory system. This logic layer stays conventional:
+- tool calling is the only way to have an effect
+- tool results are appended to chat history by the runtime adapter
 
-CodeAct is intentionally *not* a memory-enhanced agent.
+The memory system is injected by the MemAct runtime adapter via the system prompt and
+updated via a structured JSON envelope at finalization.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from abstractcore.tools import ToolCall, ToolDefinition
 
 from .types import LLMRequest
 
-_CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)\n```", re.IGNORECASE | re.DOTALL)
 
-
-class CodeActLogic:
+class MemActLogic:
     def __init__(
         self,
         *,
@@ -38,23 +36,6 @@ class CodeActLogic:
     def tools(self) -> List[ToolDefinition]:
         return list(self._tools)
 
-    def add_tools(self, tools: List[ToolDefinition]) -> int:
-        if not isinstance(tools, list) or not tools:
-            return 0
-
-        existing = {str(t.name) for t in self._tools if getattr(t, "name", None)}
-        added = 0
-        for t in tools:
-            name = getattr(t, "name", None)
-            if not isinstance(name, str) or not name.strip():
-                continue
-            if name in existing:
-                continue
-            self._tools.append(t)
-            existing.add(name)
-            added += 1
-        return added
-
     def build_request(
         self,
         *,
@@ -65,9 +46,10 @@ class CodeActLogic:
         max_iterations: int = 20,
         vars: Optional[Dict[str, Any]] = None,
     ) -> LLMRequest:
-        _ = messages  # history is carried out-of-band via chat messages
+        """Build a base LLM request (adapter injects memory blocks separately)."""
+        _ = messages  # history is carried via chat messages by the adapter
 
-        task = str(task or "")
+        task = str(task or "").strip()
         guidance = str(guidance or "").strip()
 
         limits = (vars or {}).get("_limits", {})
@@ -78,25 +60,18 @@ class CodeActLogic:
             except Exception:
                 max_output_tokens = None
 
-        runtime_ns = (vars or {}).get("_runtime", {})
-        scratchpad = (vars or {}).get("scratchpad", {})
-        plan_mode = bool(runtime_ns.get("plan_mode")) if isinstance(runtime_ns, dict) else False
-        plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
-        plan = str(plan_text).strip() if isinstance(plan_text, str) and plan_text.strip() else ""
-
-        prompt = task.strip()
-
         output_budget_line = ""
         if isinstance(max_output_tokens, int) and max_output_tokens > 0:
             output_budget_line = f"- Output token limit for this response: {max_output_tokens}.\n"
 
         system_prompt = (
             f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
-            "You are CodeAct: you solve tasks by writing and executing Python when needed.\n\n"
+            "You are an autonomous MemAct agent.\n"
+            "Taking action / having an effect means calling a tool.\n\n"
             "Rules:\n"
             "- Be truthful: only claim actions supported by tool outputs.\n"
             "- Be autonomous: do not ask the user for confirmation to proceed; keep going until the task is done.\n"
-            "- If you need to run code, call `execute_python` (preferred) or output a fenced ```python code block.\n"
+            "- If you need to create/edit files, run commands, fetch URLs, or search, you MUST call an appropriate tool.\n"
             "- Never fabricate tool outputs.\n"
             "- Before calling a tool, write 1–3 short lines explaining what you will do and why.\n"
             "- Only ask the user a question when required information is missing.\n"
@@ -106,21 +81,8 @@ class CodeActLogic:
         if guidance:
             system_prompt = (system_prompt + "\n\nGuidance:\n" + guidance).strip()
 
-        if plan_mode and plan:
-            system_prompt = (system_prompt + "\n\nCurrent plan:\n" + plan).strip()
-
-        if plan_mode:
-            system_prompt = (
-                system_prompt
-                + "\n\nPlan mode:\n"
-                "- Maintain and update the plan as you work.\n"
-                "- If the plan changes, include a final section at the END of your message:\n"
-                "  Plan Update:\n"
-                "  <markdown checklist>\n"
-            ).strip()
-
         return LLMRequest(
-            prompt=prompt,
+            prompt=task,
             system_prompt=system_prompt,
             tools=self.tools,
             max_tokens=max_output_tokens,
@@ -132,6 +94,11 @@ class CodeActLogic:
 
         content = response.get("content")
         content = "" if content is None else str(content)
+        content = content.lstrip()
+        for prefix in ("assistant:", "assistant："):
+            if content.lower().startswith(prefix):
+                content = content[len(prefix) :].lstrip()
+                break
 
         if not content.strip():
             reasoning = response.get("reasoning")
@@ -154,17 +121,8 @@ class CodeActLogic:
 
         return content, tool_calls
 
-    def extract_code(self, text: str) -> str | None:
-        text = str(text or "")
-        m = _CODE_BLOCK_RE.search(text)
-        if not m:
-            return None
-        code = m.group(1).strip("\n")
-        return code.strip() or None
-
-    def format_observation(self, *, name: str, output: Any, success: bool) -> str:
-        out = "" if output is None else str(output)
+    def format_observation(self, *, name: str, output: str, success: bool) -> str:
         if success:
-            return f"[{name}]: {out}"
-        return f"[{name}]: Error: {out}"
+            return f"[{name}]: {output}"
+        return f"[{name}]: Error: {output}"
 

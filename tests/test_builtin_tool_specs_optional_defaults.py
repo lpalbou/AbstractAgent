@@ -20,5 +20,3 @@ def test_builtin_tool_specs_mark_optional_args_with_defaults() -> None:
     assert _required_arg_names(builtins.REMEMBER_TOOL.parameters) == ["span_id", "tags"]
     assert _required_arg_names(builtins.REMEMBER_NOTE_TOOL.parameters) == ["note"]
     assert _required_arg_names(builtins.COMPACT_MEMORY_TOOL.parameters) == []
-    assert _required_arg_names(builtins.COMPACT_ACTIVE_MEMORY_TOOL.parameters) == []
-

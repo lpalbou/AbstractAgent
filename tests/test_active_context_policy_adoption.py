@@ -63,14 +63,17 @@ def test_react_adapter_uses_runtime_active_context_policy() -> None:
 
     plan = reason_node(run, _Ctx())
     assert plan.effect is not None
-    prompt = str((plan.effect.payload or {}).get("prompt") or "")
+    payload = plan.effect.payload if isinstance(plan.effect.payload, dict) else {}
+    msgs = payload.get("messages")
+    assert isinstance(msgs, list)
+    rendered = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in msgs if isinstance(m, dict))
 
     # System preserved, history limit applied to non-system only.
-    assert "system: SYS" in prompt
-    assert "user: m3" in prompt
-    assert "assistant: m4" in prompt
-    assert "user: m1" not in prompt
-    assert "assistant: m2" not in prompt
+    assert "system: SYS" in rendered
+    assert "user: m3" in rendered
+    assert "assistant: m4" in rendered
+    assert "user: m1" not in rendered
+    assert "assistant: m2" not in rendered
 
 
 def test_codeact_adapter_uses_runtime_active_context_policy() -> None:
@@ -80,11 +83,13 @@ def test_codeact_adapter_uses_runtime_active_context_policy() -> None:
 
     plan = reason_node(run, _Ctx())
     assert plan.effect is not None
-    prompt = str((plan.effect.payload or {}).get("prompt") or "")
+    payload = plan.effect.payload if isinstance(plan.effect.payload, dict) else {}
+    msgs = payload.get("messages")
+    assert isinstance(msgs, list)
+    rendered = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in msgs if isinstance(m, dict))
 
-    assert "system: SYS" in prompt
-    assert "user: m3" in prompt
-    assert "assistant: m4" in prompt
-    assert "user: m1" not in prompt
-    assert "assistant: m2" not in prompt
-
+    assert "system: SYS" in rendered
+    assert "user: m3" in rendered
+    assert "assistant: m4" in rendered
+    assert "user: m1" not in rendered
+    assert "assistant: m2" not in rendered

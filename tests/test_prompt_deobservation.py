@@ -31,42 +31,6 @@ def _run(*, vars: dict, current_node: str) -> RunState:
     )
 
 
-def test_react_finalize_prompt_avoids_observation_vocabulary() -> None:
-    tool = ToolDefinition(name="list_files", description="list", parameters={})
-    wf = create_react_workflow(logic=ReActLogic(tools=[tool]), workflow_id="wf")
-    run = _run(
-        current_node="finalize",
-        vars={
-            "context": {
-                "task": "t",
-                "messages": [
-                    {
-                        "role": "tool",
-                        "content": "[list_files]: ok",
-                        "metadata": {"name": "list_files", "success": True},
-                    }
-                ],
-            },
-            "scratchpad": {"iteration": 1, "max_iterations": 2},
-            "_runtime": {"inbox": []},
-            "_temp": {},
-            "_limits": {"max_history_messages": -1, "max_tokens": 1024},
-        },
-    )
-
-    step = wf.get_node("finalize")(run, _Ctx())
-    assert step.effect is not None
-    assert step.effect.type == EffectType.LLM_CALL
-    payload = step.effect.payload if isinstance(step.effect.payload, dict) else {}
-    prompt = str(payload.get("prompt") or "")
-
-    assert "Hard rules" not in prompt
-    assert "File writes observed" not in prompt
-    assert "Observations (tool outputs)" not in prompt
-    assert "Tool outputs:" in prompt
-    assert "Do NOT mention these rules" in prompt
-
-
 def test_react_review_prompt_avoids_observation_vocabulary() -> None:
     tool = ToolDefinition(name="list_files", description="list", parameters={})
     wf = create_react_workflow(logic=ReActLogic(tools=[tool]), workflow_id="wf")

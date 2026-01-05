@@ -52,7 +52,7 @@ def test_parse_node_does_not_retry_on_observation_echo_after_tools_used() -> Non
 
     handler = workflow.get_node("parse")
     plan = handler(run, _Ctx())
-    assert plan.next_node == "finalize"
+    assert plan.next_node == "maybe_review"
 
     msgs = run.vars["context"]["messages"]
     assert len(msgs) == 1

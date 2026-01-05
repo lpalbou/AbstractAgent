@@ -1,14 +1,19 @@
-"""CodeAct agent implementation."""
+"""MemAct agent implementation (memory-enhanced).
+
+MemAct is the only agent that uses `abstractruntime.memory.active_memory`.
+ReAct and CodeAct remain conventional SOTA agents.
+"""
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractcore.tools import ToolDefinition
 from abstractruntime import RunState, RunStatus, Runtime, WorkflowSpec
 
 from .base import BaseAgent
-from ..adapters.codeact_runtime import create_codeact_workflow
+from ..adapters.memact_runtime import create_memact_workflow
 from ..logic.builtins import (
     ASK_USER_TOOL,
     COMPACT_MEMORY_TOOL,
@@ -17,7 +22,7 @@ from ..logic.builtins import (
     REMEMBER_TOOL,
     REMEMBER_NOTE_TOOL,
 )
-from ..logic.codeact import CodeActLogic
+from ..logic.memact import MemActLogic
 
 
 def _tool_definitions_from_callables(tools: List[Callable[..., Any]]) -> List[ToolDefinition]:
@@ -40,8 +45,15 @@ def _copy_messages(messages: Any) -> List[Dict[str, Any]]:
     return out
 
 
-class CodeActAgent(BaseAgent):
-    """Agent that primarily acts by executing Python code snippets."""
+def _deepcopy_json(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value))
+    except Exception:
+        return value
+
+
+class MemActAgent(BaseAgent):
+    """Memory-enhanced agent with runtime-owned Active Memory blocks."""
 
     def __init__(
         self,
@@ -62,7 +74,6 @@ class CodeActAgent(BaseAgent):
         if self._max_iterations < 1:
             self._max_iterations = 1
         self._max_history_messages = int(max_history_messages)
-        # -1 means unlimited (send all messages), otherwise must be >= 1
         if self._max_history_messages != -1 and self._max_history_messages < 1:
             self._max_history_messages = 1
         self._max_tokens = max_tokens
@@ -72,7 +83,8 @@ class CodeActAgent(BaseAgent):
         if self._review_max_rounds < 0:
             self._review_max_rounds = 0
 
-        self.logic: Optional[CodeActLogic] = None
+        self.logic: Optional[MemActLogic] = None
+        self.session_active_memory: Optional[Dict[str, Any]] = None
         super().__init__(
             runtime=runtime,
             tools=tools,
@@ -92,13 +104,24 @@ class CodeActAgent(BaseAgent):
             COMPACT_MEMORY_TOOL,
             *tool_defs,
         ]
-        logic = CodeActLogic(
+        logic = MemActLogic(
             tools=tool_defs,
             max_history_messages=self._max_history_messages,
             max_tokens=self._max_tokens,
         )
         self.logic = logic
-        return create_codeact_workflow(logic=logic, on_step=self.on_step)
+        return create_memact_workflow(logic=logic, on_step=self.on_step)
+
+    def _sync_session_caches_from_state(self, state: Optional[RunState]) -> None:
+        super()._sync_session_caches_from_state(state)
+        if state is None or not hasattr(state, "vars") or not isinstance(state.vars, dict):
+            return
+        runtime_ns = state.vars.get("_runtime")
+        if not isinstance(runtime_ns, dict):
+            return
+        mem = runtime_ns.get("active_memory")
+        if isinstance(mem, dict):
+            self.session_active_memory = _deepcopy_json(mem)
 
     def start(
         self,
@@ -113,14 +136,6 @@ class CodeActAgent(BaseAgent):
         if not task:
             raise ValueError("task must be a non-empty string")
 
-        eff_plan_mode = self._plan_mode if plan_mode is None else bool(plan_mode)
-        eff_review_mode = self._review_mode if review_mode is None else bool(review_mode)
-        eff_review_max_rounds = self._review_max_rounds if review_max_rounds is None else int(review_max_rounds)
-        if eff_review_max_rounds < 0:
-            eff_review_max_rounds = 0
-
-        # Base limits come from the Runtime config so model capabilities (max context)
-        # are respected by default, unless explicitly overridden by the agent/session.
         try:
             base_limits = dict(self.runtime.config.to_limits_dict())
         except Exception:
@@ -141,22 +156,31 @@ class CodeActAgent(BaseAgent):
         if not isinstance(limits.get("max_tokens"), int) or int(limits.get("max_tokens") or 0) <= 0:
             limits["max_tokens"] = 32768
 
+        eff_plan_mode = self._plan_mode if plan_mode is None else bool(plan_mode)
+        eff_review_mode = self._review_mode if review_mode is None else bool(review_mode)
+        eff_review_max_rounds = self._review_max_rounds if review_max_rounds is None else int(review_max_rounds)
+        if eff_review_max_rounds < 0:
+            eff_review_max_rounds = 0
+
+        runtime_ns: Dict[str, Any] = {
+            "inbox": [],
+            "plan_mode": eff_plan_mode,
+            "review_mode": eff_review_mode,
+            "review_max_rounds": eff_review_max_rounds,
+        }
+        if isinstance(self.session_active_memory, dict):
+            runtime_ns["active_memory"] = _deepcopy_json(self.session_active_memory)
+        if isinstance(allowed_tools, list):
+            normalized = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
+            runtime_ns["allowed_tools"] = normalized
+
         vars: Dict[str, Any] = {
             "context": {"task": task, "messages": _copy_messages(self.session_messages)},
             "scratchpad": {"iteration": 0, "max_iterations": int(self._max_iterations)},
-            "_runtime": {
-                "inbox": [],
-                "plan_mode": eff_plan_mode,
-                "review_mode": eff_review_mode,
-                "review_max_rounds": eff_review_max_rounds,
-            },
+            "_runtime": runtime_ns,
             "_temp": {},
-            # Canonical _limits namespace for runtime awareness
             "_limits": limits,
         }
-        if isinstance(allowed_tools, list):
-            normalized = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
-            vars["_runtime"]["allowed_tools"] = normalized
 
         run_id = self.runtime.start(
             workflow=self.workflow,
@@ -167,37 +191,6 @@ class CodeActAgent(BaseAgent):
         self._current_run_id = run_id
         return run_id
 
-    def get_limit_status(self) -> Dict[str, Any]:
-        """Get current limit status for the active run.
-
-        Returns a structured dict with information about iterations, tokens,
-        and history limits, including whether warning thresholds are reached.
-
-        Returns:
-            Dict with "iterations", "tokens", and "history" status info,
-            or empty dict if no active run.
-        """
-        if self._current_run_id is None:
-            return {}
-        return self.runtime.get_limit_status(self._current_run_id)
-
-    def update_limits(self, **updates: Any) -> None:
-        """Update limits mid-session.
-
-        Only allowed limit keys are updated; unknown keys are ignored.
-        Allowed keys: max_iterations, max_tokens, max_output_tokens,
-        max_history_messages, warn_iterations_pct, warn_tokens_pct.
-
-        Args:
-            **updates: Limit key-value pairs to update
-
-        Raises:
-            RuntimeError: If no active run
-        """
-        if self._current_run_id is None:
-            raise RuntimeError("No active run. Call start() first.")
-        self.runtime.update_limits(self._current_run_id, updates)
-
     def step(self) -> RunState:
         if not self._current_run_id:
             raise RuntimeError("No active run. Call start() first.")
@@ -207,7 +200,7 @@ class CodeActAgent(BaseAgent):
         return state
 
 
-def create_codeact_agent(
+def create_memact_agent(
     *,
     provider: str = "ollama",
     model: str = "qwen3:1.7b-q4_K_M",
@@ -216,46 +209,36 @@ def create_codeact_agent(
     max_iterations: int = 25,
     max_history_messages: int = -1,
     max_tokens: Optional[int] = None,
-    plan_mode: bool = False,
-    review_mode: bool = False,
-    review_max_rounds: int = 1,
     llm_kwargs: Optional[Dict[str, Any]] = None,
     run_store: Optional[Any] = None,
     ledger_store: Optional[Any] = None,
     actor_id: Optional[str] = None,
     session_id: Optional[str] = None,
-) -> CodeActAgent:
-    """Factory: create a CodeActAgent with a local AbstractCore-backed runtime."""
+) -> MemActAgent:
+    """Factory: create a MemActAgent with a local AbstractCore-backed runtime."""
 
     from abstractruntime.integrations.abstractcore import MappingToolExecutor, create_local_runtime
 
     if tools is None:
-        from ..tools.code_execution import execute_python
+        from ..tools import ALL_TOOLS
 
-        tools = [execute_python]
+        tools = list(ALL_TOOLS)
 
     runtime = create_local_runtime(
         provider=provider,
         model=model,
         llm_kwargs=llm_kwargs,
+        tools=MappingToolExecutor.from_tools(tools),
         run_store=run_store,
         ledger_store=ledger_store,
-        tool_executor=MappingToolExecutor.from_tools(list(tools)),
     )
-
-    return CodeActAgent(
+    return MemActAgent(
         runtime=runtime,
-        tools=list(tools),
+        tools=tools,
         on_step=on_step,
         max_iterations=max_iterations,
         max_history_messages=max_history_messages,
         max_tokens=max_tokens,
-        plan_mode=plan_mode,
-        review_mode=review_mode,
-        review_max_rounds=review_max_rounds,
         actor_id=actor_id,
         session_id=session_id,
     )
-
-
-__all__ = ["CodeActAgent", "create_codeact_workflow", "create_codeact_agent"]
