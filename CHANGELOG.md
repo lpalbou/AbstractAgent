@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in memory tool schemas are richer:
   - `recall_memory` now supports `tags_mode`, `usernames`, and `locations` (metadata-first filtering).
   - `remember_note` now supports an optional `location` field.
+- Active Memory: agents now expose `active_memory_delta` (and module alias tools) as schema-only tools executed by AbstractRuntime, so native-tool providers (e.g. LMStudio) don’t mis-parse inline memory JSON as tool calls.
 
 ### Fixed
 - Limits: ReAct/CodeAct now treat `_limits.max_tokens` as a **context/budget** limit and use `_limits.max_output_tokens` (if set) to cap OpenAI-style `max_tokens` (output). This prevents invalid LMStudio requests like `max_tokens=262144` which can return HTTP 400.

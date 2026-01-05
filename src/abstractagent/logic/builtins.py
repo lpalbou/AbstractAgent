@@ -261,3 +261,99 @@ COMPACT_ACTIVE_MEMORY_TOOL = ToolDefinition(
         "Use when Active Memory lists are growing too large and you need to archive older items."
     ),
 )
+
+# ---------------------------------------------------------------------------
+# Structured Active Memory editing tools (runtime-owned; schema-only)
+# ---------------------------------------------------------------------------
+ACTIVE_MEMORY_DELTA_TOOL = ToolDefinition(
+    name="active_memory_delta",
+    description="Apply a delta patch to Structured Active Memory (tasks/context/insights/history).",
+    parameters={
+        "current_tasks": {
+            "type": "object",
+            "description": "Optional patch for Current Tasks: {clear?: bool, remove?: [task_id], upsert?: [task_obj|title_str]}.",
+            "default": None,
+        },
+        "current_context": {
+            "type": "object",
+            "description": "Optional patch for Current Context: {clear?: bool, remove?: [context_id], upsert?: [context_obj|title_str]}.",
+            "default": None,
+        },
+        "critical_insights": {
+            "type": "object",
+            "description": "Optional patch for Critical Insights: {clear?: bool, remove?: [insight_id], add?: [insight_obj|text_str]}.",
+            "default": None,
+        },
+        "key_history": {
+            "type": "object",
+            "description": "Optional patch for Key History: {clear?: bool, remove?: [event_id], add?: [event_obj|summary_str]}.",
+            "default": None,
+        },
+    },
+    when_to_use="Use to keep Active Memory up to date as you progress (update tasks/context/insights/history).",
+)
+
+# Optional granular aliases (models sometimes try these names directly).
+CURRENT_TASKS_TOOL = ToolDefinition(
+    name="current_tasks",
+    description="Patch the Active Memory Current Tasks module.",
+    parameters={
+        "clear": {"type": "boolean", "description": "If true, clears all tasks.", "default": False},
+        "remove": {"type": "array", "items": {"type": "string"}, "description": "Task IDs to remove.", "default": None},
+        "upsert": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "Tasks to upsert (task objects). String shorthands are allowed by the runtime.",
+            "default": None,
+        },
+    },
+    when_to_use="Use to update the Active Memory Current Tasks list.",
+)
+
+CURRENT_CONTEXT_TOOL = ToolDefinition(
+    name="current_context",
+    description="Patch the Active Memory Current Context module.",
+    parameters={
+        "clear": {"type": "boolean", "description": "If true, clears all context items.", "default": False},
+        "remove": {"type": "array", "items": {"type": "string"}, "description": "Context IDs to remove.", "default": None},
+        "upsert": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "Context items to upsert (context objects). String shorthands are allowed by the runtime.",
+            "default": None,
+        },
+    },
+    when_to_use="Use to update the Active Memory Current Context list.",
+)
+
+CRITICAL_INSIGHTS_TOOL = ToolDefinition(
+    name="critical_insights",
+    description="Patch the Active Memory Critical Insights module.",
+    parameters={
+        "clear": {"type": "boolean", "description": "If true, clears all critical insights.", "default": False},
+        "remove": {"type": "array", "items": {"type": "string"}, "description": "Insight IDs to remove.", "default": None},
+        "add": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "Insights to add (insight objects). String shorthands are allowed by the runtime.",
+            "default": None,
+        },
+    },
+    when_to_use="Use to update the Active Memory Critical Insights list.",
+)
+
+KEY_HISTORY_TOOL = ToolDefinition(
+    name="key_history",
+    description="Patch the Active Memory Key History module.",
+    parameters={
+        "clear": {"type": "boolean", "description": "If true, clears key history.", "default": False},
+        "remove": {"type": "array", "items": {"type": "string"}, "description": "Event IDs to remove.", "default": None},
+        "add": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "Events to add (event objects). String shorthands are allowed by the runtime.",
+            "default": None,
+        },
+    },
+    when_to_use="Use to append/update Key History with durable, natural-language events.",
+)

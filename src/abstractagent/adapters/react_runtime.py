@@ -793,6 +793,11 @@ def create_react_workflow(
             "remember_note",
             "compact_memory",
             "compact_active_memory",
+            "active_memory_delta",
+            "current_tasks",
+            "current_context",
+            "critical_insights",
+            "key_history",
         }
 
         # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
@@ -933,6 +938,26 @@ def create_react_workflow(
                     effect=Effect(
                         type=EffectType.MEMORY_COMPACT_STRUCTURED,
                         payload=payload,
+                        result_key="_temp.tool_results",
+                    ),
+                    next_node="observe",
+                )
+
+            if name in ("active_memory_delta", "current_tasks", "current_context", "critical_insights", "key_history"):
+                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                payload = dict(args) if isinstance(args, dict) else {}
+                delta = payload if name == "active_memory_delta" else {str(name): payload}
+                eff_payload = {
+                    "tool_name": str(name),
+                    "call_id": tc.get("call_id") or "memory",
+                    "delta": delta,
+                }
+                emit("active_memory_delta", {"tool": name, "delta_keys": list(delta.keys())})
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(
+                        type=EffectType.ACTIVE_MEMORY_DELTA,
+                        payload=eff_payload,
                         result_key="_temp.tool_results",
                     ),
                     next_node="observe",

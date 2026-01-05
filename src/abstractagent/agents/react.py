@@ -20,12 +20,17 @@ from abstractruntime import RunState, Runtime, WorkflowSpec
 from .base import BaseAgent
 from ..adapters.react_runtime import create_react_workflow
 from ..logic.builtins import (
+    ACTIVE_MEMORY_DELTA_TOOL,
     ASK_USER_TOOL,
     COMPACT_ACTIVE_MEMORY_TOOL,
     COMPACT_MEMORY_TOOL,
     INSPECT_VARS_TOOL,
     RECALL_MEMORY_TOOL,
     REMEMBER_TOOL,
+    CRITICAL_INSIGHTS_TOOL,
+    CURRENT_CONTEXT_TOOL,
+    CURRENT_TASKS_TOOL,
+    KEY_HISTORY_TOOL,
 )
 from ..logic.react import ReActLogic
 
@@ -101,6 +106,12 @@ class ReactAgent(BaseAgent):
             REMEMBER_TOOL,
             COMPACT_MEMORY_TOOL,
             COMPACT_ACTIVE_MEMORY_TOOL,
+            ACTIVE_MEMORY_DELTA_TOOL,
+            # Aliases (models sometimes try these directly; executed via ACTIVE_MEMORY_DELTA)
+            CURRENT_TASKS_TOOL,
+            CURRENT_CONTEXT_TOOL,
+            CRITICAL_INSIGHTS_TOOL,
+            KEY_HISTORY_TOOL,
             *tool_defs,
         ]
 
