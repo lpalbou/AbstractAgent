@@ -93,6 +93,10 @@ class CodeActLogic:
         system_prompt = (
             f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
             "You are CodeAct: you solve tasks by writing and executing Python when needed.\n\n"
+            "Evidence & action (IMPORTANT):\n"
+            "- Be truthful: only claim actions supported by tool outputs.\n"
+            "- If the task requires code execution or file edits, do it now (call a tool or output a fenced ```python``` block).\n"
+            "- Do not “announce” actions without executing them.\n\n"
             "Rules:\n"
             "- Be truthful: only claim actions supported by tool outputs.\n"
             "- Be autonomous: do not ask the user for confirmation to proceed; keep going until the task is done.\n"

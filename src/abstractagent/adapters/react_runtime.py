@@ -580,6 +580,15 @@ def create_react_workflow(
                     return True
             return False
 
+        def _extract_final_answer(text: str) -> tuple[bool, str]:
+            """Return (is_explicit_final, stripped_answer)."""
+            if not isinstance(text, str) or not text.strip():
+                return False, ""
+            s = text.lstrip()
+            if s.upper().startswith("FINAL:"):
+                return True, s[len("FINAL:") :].lstrip()
+            return False, text
+
         emit(
             "parse",
             {
@@ -651,10 +660,25 @@ def create_react_workflow(
             scratchpad["tool_retry_count"] = 0
             return StepPlan(node_id="parse", next_node="maybe_review")
 
-        final = _sanitize_tool_call_content(content)
-        if not final.strip():
-            final = str(content or "").strip()
+        final_raw = _sanitize_tool_call_content(content)
+        if not final_raw.strip():
+            final_raw = str(content or "").strip()
 
+        is_final, final_text = _extract_final_answer(final_raw)
+        if is_final:
+            if final_text:
+                context["messages"].append(_new_message(ctx, role="assistant", content=final_text))
+                if _flag(runtime_ns, "plan_mode", default=False):
+                    updated = _extract_plan_update(final_text)
+                    if isinstance(updated, str) and updated.strip():
+                        scratchpad["plan"] = updated.strip()
+            temp["final_answer"] = final_text or "No answer provided"
+            temp["pending_tool_calls"] = []
+            scratchpad["tool_retry_count"] = 0
+            return StepPlan(node_id="parse", next_node="maybe_review")
+
+        # Default: treat as a normal final answer even if it lacks an explicit FINAL marker.
+        final = final_raw
         if final:
             context["messages"].append(_new_message(ctx, role="assistant", content=final))
             if _flag(runtime_ns, "plan_mode", default=False):
@@ -912,6 +936,9 @@ def create_react_workflow(
 
         temp.pop("tool_results", None)
         temp["pending_tool_calls"] = []
+        # Reset verifier/review rounds after executing tools. This enables repeated
+        # verify→act→observe cycles without immediately hitting review_max_rounds.
+        scratchpad["review_count"] = 0
         return StepPlan(node_id="observe", next_node="reason")
 
     def maybe_review_node(run: RunState, ctx) -> StepPlan:
@@ -944,6 +971,31 @@ def create_react_workflow(
 
         answer = str(run.vars.get("_temp", {}).get("final_answer") or "")
 
+        allow = _effective_allowlist(runtime_ns)
+
+        def _format_allowed_tools() -> str:
+            # Prefer the already-computed tool_specs (created in reason_node) to avoid
+            # re-materializing tool definitions and to keep formatting stable.
+            specs = runtime_ns.get("tool_specs")
+            if not isinstance(specs, list) or not specs:
+                defs = _allowed_tool_defs(allow)
+                specs = [t.to_dict() for t in defs]
+            lines: list[str] = []
+            for spec in specs:
+                if not isinstance(spec, dict):
+                    continue
+                name = str(spec.get("name") or "").strip()
+                if not name:
+                    continue
+                params = spec.get("parameters")
+                props = params.get("properties", {}) if isinstance(params, dict) else {}
+                keys = sorted([k for k in props.keys() if isinstance(k, str)])
+                if keys:
+                    lines.append(f"- {name}({', '.join(keys)})")
+                else:
+                    lines.append(f"- {name}()")
+            return "\n".join(lines) if lines else "(no tools available)"
+
         # Include recent tool outputs for evidence-based review.
         messages = list(context.get("messages") or [])
         tool_msgs: list[str] = []
@@ -959,14 +1011,16 @@ def create_react_workflow(
         observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
 
         prompt = (
-            "Review whether the user's request has been fully satisfied.\n"
+            "You are a verifier. Review whether the user's request has been fully satisfied.\n"
             "Be strict: only count actions that are supported by the tool outputs.\n"
-            "If anything is missing, propose the next self-instruction to complete it.\n"
+            "If anything is missing, propose the NEXT ACTIONS.\n"
+            "Prefer returning `next_tool_calls` over `next_prompt`.\n"
             "Return JSON ONLY.\n\n"
             f"User request:\n{task}\n\n"
             f"Plan:\n{plan_text}\n\n"
             f"Current answer:\n{answer}\n\n"
             f"Tool outputs:\n{observations}\n\n"
+            f"Allowed tools:\n{_format_allowed_tools()}\n\n"
         )
 
         schema = {
@@ -975,8 +1029,20 @@ def create_react_workflow(
                 "complete": {"type": "boolean"},
                 "missing": {"type": "array", "items": {"type": "string"}},
                 "next_prompt": {"type": "string"},
+                "next_tool_calls": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "arguments": {"type": "object"},
+                        },
+                        "required": ["name", "arguments"],
+                        "additionalProperties": False,
+                    },
+                },
             },
-            "required": ["complete", "missing", "next_prompt"],
+            "required": ["complete", "missing", "next_prompt", "next_tool_calls"],
             "additionalProperties": False,
         }
 
@@ -985,7 +1051,7 @@ def create_react_workflow(
         payload: Dict[str, Any] = {
             "prompt": prompt,
             "response_schema": schema,
-            "response_schema_name": "ReActReview",
+            "response_schema_name": "ReActVerifier",
             "params": {"temperature": 0.2},
         }
         sys = _system_prompt(runtime_ns)
@@ -1027,12 +1093,29 @@ def create_react_workflow(
         missing = data.get("missing") if isinstance(data.get("missing"), list) else []
         next_prompt = data.get("next_prompt")
         next_prompt_text = str(next_prompt or "").strip()
+        next_tool_calls_raw = data.get("next_tool_calls")
+        next_tool_calls: list[dict[str, Any]] = []
+        if isinstance(next_tool_calls_raw, list):
+            for item in next_tool_calls_raw:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                args = item.get("arguments")
+                if not isinstance(args, dict):
+                    args = {}
+                if name:
+                    next_tool_calls.append({"name": name, "arguments": args})
 
         emit("review", {"complete": complete, "missing": missing})
         temp.pop("review_llm_response", None)
 
         if complete:
             return StepPlan(node_id="review_parse", next_node="done")
+
+        if next_tool_calls:
+            temp["pending_tool_calls"] = next_tool_calls
+            emit("review_tool_calls", {"count": len(next_tool_calls)})
+            return StepPlan(node_id="review_parse", next_node="act")
 
         if next_prompt_text:
             inbox = runtime_ns.get("inbox")

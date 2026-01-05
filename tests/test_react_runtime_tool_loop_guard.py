@@ -38,7 +38,8 @@ def test_parse_node_does_not_retry_on_observation_echo_after_tools_used() -> Non
             "_temp": {
                 "llm_response": {
                     "content": (
-                        "observation[list_files] (success): Entries in '/tmp' matching '*':\n"
+                            "FINAL: Files listed above.\n\n"
+                            "observation[list_files] (success): Entries in '/tmp' matching '*':\n"
                         "  a.txt\n"
                         "  b.txt\n\n"
                         "Files listed above."
@@ -57,6 +58,7 @@ def test_parse_node_does_not_retry_on_observation_echo_after_tools_used() -> Non
     msgs = run.vars["context"]["messages"]
     assert len(msgs) == 1
     assert msgs[0]["role"] == "assistant"
+    assert msgs[0]["content"] == "Files listed above."
 
 
 def test_parse_node_retries_on_observation_echo_when_no_tools_used() -> None:
@@ -124,7 +126,7 @@ def test_parse_node_does_not_retry_on_observation_substring_in_json() -> None:
             "_temp": {
                 "llm_response": {
                     "content": (
-                        "I will answer directly.\n\n"
+                        "FINAL: I will answer directly.\n\n"
                         "```json\n"
                         "{\n"
                         "  \"ref\": \"observation[list_files] (success): Entries: a.txt\"\n"

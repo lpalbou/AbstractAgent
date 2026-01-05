@@ -80,7 +80,7 @@ def test_react_review_mode_can_self_prompt_back_to_reason() -> None:
     assert maybe.next_node == "review"
 
     run.vars["_temp"]["review_llm_response"] = {
-        "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next"},
+        "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
     }
     review_parse = wf.get_node("review_parse")(run, _Ctx())
     assert review_parse.next_node == "reason"
@@ -114,7 +114,7 @@ def test_codeact_review_mode_routes_to_reason_when_incomplete() -> None:
     assert maybe.next_node == "review"
 
     run.vars["_temp"]["review_llm_response"] = {
-        "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next"},
+        "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
     }
     review_parse = wf.get_node("review_parse")(run, _Ctx())
     assert review_parse.next_node == "reason"
