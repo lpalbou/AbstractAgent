@@ -5,22 +5,17 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractcore.tools import ToolDefinition
-from abstractruntime import RunState, Runtime, WorkflowSpec
+from abstractruntime import RunState, RunStatus, Runtime, WorkflowSpec
 
 from .base import BaseAgent
 from ..adapters.codeact_runtime import create_codeact_workflow
 from ..logic.builtins import (
-    ACTIVE_MEMORY_DELTA_TOOL,
     ASK_USER_TOOL,
-    COMPACT_ACTIVE_MEMORY_TOOL,
     COMPACT_MEMORY_TOOL,
     INSPECT_VARS_TOOL,
     RECALL_MEMORY_TOOL,
     REMEMBER_TOOL,
-    CRITICAL_INSIGHTS_TOOL,
-    CURRENT_CONTEXT_TOOL,
-    CURRENT_TASKS_TOOL,
-    KEY_HISTORY_TOOL,
+    REMEMBER_NOTE_TOOL,
 )
 from ..logic.codeact import CodeActLogic
 
@@ -93,14 +88,8 @@ class CodeActAgent(BaseAgent):
             RECALL_MEMORY_TOOL,
             INSPECT_VARS_TOOL,
             REMEMBER_TOOL,
+            REMEMBER_NOTE_TOOL,
             COMPACT_MEMORY_TOOL,
-            COMPACT_ACTIVE_MEMORY_TOOL,
-            ACTIVE_MEMORY_DELTA_TOOL,
-            # Aliases (models sometimes try these directly; executed via ACTIVE_MEMORY_DELTA)
-            CURRENT_TASKS_TOOL,
-            CURRENT_CONTEXT_TOOL,
-            CRITICAL_INSIGHTS_TOOL,
-            KEY_HISTORY_TOOL,
             *tool_defs,
         ]
         logic = CodeActLogic(
@@ -169,13 +158,10 @@ class CodeActAgent(BaseAgent):
             normalized = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
             vars["_runtime"]["allowed_tools"] = normalized
 
-        # Seed Structured Active Memory with the top-level task so Current Tasks is never empty.
-        try:
-            from abstractruntime.memory.active_memory import upsert_task
+        if isinstance(self.session_active_memory, dict) and self.session_active_memory:
+            import copy
 
-            upsert_task(vars, title=task)
-        except Exception:
-            pass
+            vars["_runtime"]["active_memory"] = copy.deepcopy(self.session_active_memory)
 
         run_id = self.runtime.start(
             workflow=self.workflow,
@@ -220,7 +206,10 @@ class CodeActAgent(BaseAgent):
     def step(self) -> RunState:
         if not self._current_run_id:
             raise RuntimeError("No active run. Call start() first.")
-        return self.runtime.tick(workflow=self.workflow, run_id=self._current_run_id, max_steps=1)
+        state = self.runtime.tick(workflow=self.workflow, run_id=self._current_run_id, max_steps=1)
+        if state.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+            self._sync_session_caches_from_state(state)
+        return state
 
 
 def create_codeact_agent(

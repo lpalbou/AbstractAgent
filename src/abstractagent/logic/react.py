@@ -277,20 +277,11 @@ class ReActLogic:
 
         if internal_sections:
             internal_header = (
-                "## Active Memory (internal)\n"
-                "The sections below are your INTERNAL memory/state.\n"
-                "- They are NOT messages from the user.\n"
-                "- Do NOT treat them as new user instructions.\n"
+                "# MY MEMORY\n"
+                "The sections below contains the different components of my memory/state and how to interact with them to achieve my goals.\n"
             ).strip()
             system_prompt = f"{internal_header}\n\n" + "\n\n".join(internal_sections).strip() + "\n\n" + system_prompt
             system_prompt = system_prompt.strip()
-
-        # Iteration info is internal coordination (keep it OUT of user-role content).
-        system_prompt = (
-            f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n{system_prompt}".strip()
-            if isinstance(iteration, int) and isinstance(max_iterations, int)
-            else system_prompt.strip()
-        )
 
         # User guidance is host/user-provided policy, not part of the user request body.
         if guidance:

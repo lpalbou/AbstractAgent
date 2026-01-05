@@ -13,7 +13,6 @@ from abstractruntime.memory.active_context import ActiveContextPolicy
 from abstractruntime.memory.active_memory import render_active_memory_split_for_llm_request
 
 from ..logic.codeact import CodeActLogic
-from .memory_delta import extract_active_memory_delta
 
 
 def _new_message(
@@ -434,11 +433,11 @@ def create_codeact_workflow(
 
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
-        payload: Dict[str, Any] = {
-            "prompt": req.prompt,
-            "messages": _sanitize_llm_messages(messages_view),
-            "tools": list(tool_specs),
-        }
+        # IMPORTANT: When we send `messages`, do not also send a non-empty `prompt`.
+        # Some providers/servers will append `prompt` as an extra user message even when the
+        # current request is already present in `messages`, which duplicates user turns and
+        # wastes context budget.
+        payload: Dict[str, Any] = {"prompt": "", "messages": _sanitize_llm_messages(messages_view), "tools": list(tool_specs)}
         sys = _system_prompt(runtime_ns) or req.system_prompt
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
@@ -459,43 +458,43 @@ def create_codeact_workflow(
         context, scratchpad, runtime_ns, temp, _ = ensure_codeact_vars(run)
         response = temp.get("llm_response", {})
         content, tool_calls = logic.parse_response(response)
-        delta_result: Optional[Dict[str, Any]] = None
-
-        # Apply structured Active Memory deltas (if present) and remove them from user-visible content.
-        try:
-            content, delta = extract_active_memory_delta(content)
-            # Only apply deltas when the model is NOT emitting tool calls. Tool-call turns are
-            # usually incomplete; we still strip the delta block from content for safety.
-            if not tool_calls and isinstance(delta, dict) and delta:
-                from abstractruntime.memory.active_memory import apply_active_memory_delta
-
-                delta_result = apply_active_memory_delta(run.vars, delta=delta)
-        except Exception:
-            delta_result = None
-
-        if content:
-            context["messages"].append(_new_message(ctx, role="assistant", content=content))
-            if _flag(runtime_ns, "plan_mode", default=False):
-                updated = _extract_plan_update(content)
-                if isinstance(updated, str) and updated.strip():
-                    scratchpad["plan"] = updated.strip()
 
         temp.pop("llm_response", None)
         emit("parse", {"has_tool_calls": bool(tool_calls), "content_preview": (content[:100] if content else "(no content)")})
-        if isinstance(delta_result, dict) and delta_result.get("ok"):
-            emit("active_memory_delta", {"applied": delta_result.get("applied")})
 
         if tool_calls:
+            if content:
+                context["messages"].append(_new_message(ctx, role="assistant", content=content))
+                if _flag(runtime_ns, "plan_mode", default=False):
+                    updated = _extract_plan_update(content)
+                    if isinstance(updated, str) and updated.strip():
+                        scratchpad["plan"] = updated.strip()
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
             return StepPlan(node_id="parse", next_node="act")
 
         code = logic.extract_code(content)
         if code:
+            if content:
+                context["messages"].append(_new_message(ctx, role="assistant", content=content))
+                if _flag(runtime_ns, "plan_mode", default=False):
+                    updated = _extract_plan_update(content)
+                    if isinstance(updated, str) and updated.strip():
+                        scratchpad["plan"] = updated.strip()
             temp["pending_code"] = code
             return StepPlan(node_id="parse", next_node="execute_code")
 
-        temp["final_answer"] = content
-        return StepPlan(node_id="parse", next_node="maybe_review")
+        # Do not persist a final user-facing assistant message here. Always run a final,
+        # tool-free structured output pass (`finalize`) to produce:
+        # - the user-facing answer (`content`)
+        # - deterministic Active Memory updates
+        if content.strip():
+            temp["final_answer_draft"] = content
+            if _flag(runtime_ns, "plan_mode", default=False):
+                updated = _extract_plan_update(content)
+                if isinstance(updated, str) and updated.strip():
+                    scratchpad["plan"] = updated.strip()
+
+        return StepPlan(node_id="parse", next_node="finalize")
 
     def act_node(run: RunState, ctx) -> StepPlan:
         _, _, runtime_ns, temp, _ = ensure_codeact_vars(run)
@@ -514,12 +513,6 @@ def create_codeact_workflow(
             "remember",
             "remember_note",
             "compact_memory",
-            "compact_active_memory",
-            "active_memory_delta",
-            "current_tasks",
-            "current_context",
-            "critical_insights",
-            "key_history",
         }
 
         # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
@@ -641,45 +634,6 @@ def create_codeact_workflow(
                     effect=Effect(
                         type=EffectType.MEMORY_COMPACT,
                         payload=payload,
-                        result_key="_temp.tool_results",
-                    ),
-                    next_node="observe",
-                )
-
-            if name == "compact_active_memory":
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                payload = dict(args) if isinstance(args, dict) else {}
-                payload.setdefault("tool_name", "compact_active_memory")
-                payload.setdefault("call_id", tc.get("call_id") or "memory")
-                emit(
-                    "memory_compact_structured",
-                    {"components": payload.get("components"), "preserve": payload.get("preserve")},
-                )
-                return StepPlan(
-                    node_id="act",
-                    effect=Effect(
-                        type=EffectType.MEMORY_COMPACT_STRUCTURED,
-                        payload=payload,
-                        result_key="_temp.tool_results",
-                    ),
-                    next_node="observe",
-                )
-
-            if name in ("active_memory_delta", "current_tasks", "current_context", "critical_insights", "key_history"):
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                payload = dict(args) if isinstance(args, dict) else {}
-                delta = payload if name == "active_memory_delta" else {str(name): payload}
-                eff_payload = {
-                    "tool_name": str(name),
-                    "call_id": tc.get("call_id") or "memory",
-                    "delta": delta,
-                }
-                emit("active_memory_delta", {"tool": name, "delta_keys": list(delta.keys())})
-                return StepPlan(
-                    node_id="act",
-                    effect=Effect(
-                        type=EffectType.ACTIVE_MEMORY_DELTA,
-                        payload=eff_payload,
                         result_key="_temp.tool_results",
                     ),
                     next_node="observe",
@@ -816,6 +770,185 @@ def create_codeact_workflow(
         if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
         return StepPlan(node_id="handle_user_response", next_node="reason")
+
+    def finalize_node(run: RunState, ctx) -> StepPlan:
+        """Final synthesis pass producing a structured envelope.
+
+        This is intentionally tool-free:
+        - tools/code have already been executed (if any)
+        - we want ONE deterministic JSON object containing:
+          - user-facing answer (`content`)
+          - Active Memory updates (tasks/context/insights/references/history)
+        """
+        context, _, runtime_ns, temp, _ = ensure_codeact_vars(run)
+        task = str(context.get("task", "") or "")
+
+        messages = list(context.get("messages") or [])
+        tool_msgs: list[str] = []
+        tool_names: set[str] = set()
+        did_write_files = False
+
+        for m in messages:
+            if not isinstance(m, dict) or m.get("role") != "tool":
+                continue
+            meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
+            name = meta.get("name") if isinstance(meta, dict) else None
+            success = meta.get("success") if isinstance(meta, dict) else None
+            if isinstance(name, str) and name:
+                tool_names.add(name)
+                if name in ("write_file", "edit_file") and success is True:
+                    did_write_files = True
+
+        for m in reversed(messages):
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") != "tool":
+                continue
+            content = m.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            tool_msgs.append(content.strip())
+            if len(tool_msgs) >= 6:
+                break
+        tool_msgs.reverse()
+        tools_used = ", ".join(sorted(tool_names)) if tool_names else "(none)"
+
+        observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs captured)"
+
+        try:
+            from abstractruntime.memory.active_memory import ACTIVE_MEMORY_ENVELOPE_SCHEMA_V2
+        except Exception:
+            ACTIVE_MEMORY_ENVELOPE_SCHEMA_V2 = None  # type: ignore[assignment]
+        schema = ACTIVE_MEMORY_ENVELOPE_SCHEMA_V2 if isinstance(ACTIVE_MEMORY_ENVELOPE_SCHEMA_V2, dict) else {}
+
+        draft = str(temp.get("final_answer_draft") or "").strip()
+        temp.pop("final_answer_draft", None)
+
+        finalize_block = (
+            "Finalization (structured output):\n"
+            "- Return JSON ONLY matching the provided schema.\n"
+            "- `content` is the final user-facing answer.\n"
+            "- `references.added` is durable pointers (files/URLs/span_ids) the agent may want to revisit.\n"
+            "- `key_history.added` is append-only experiential notes (no raw commands/tool-call syntax).\n"
+            "- Removed lists may contain either ids OR exact existing text; the runtime resolves them deterministically.\n"
+            "- Only claim actions supported by Tool outputs.\n\n"
+            "Facts:\n"
+            f"- Tools actually run: {tools_used}\n"
+            f"- Files written (write_file/edit_file): {'yes' if did_write_files else 'no'}\n\n"
+            "Tool outputs (evidence):\n"
+            f"{observations}\n"
+        ).strip()
+        if draft:
+            finalize_block += "\n\nDraft answer (revise if needed):\n" + draft.strip()
+
+        emit("finalize", {"tool_messages": len(tool_msgs)})
+
+        # Include Active Memory in the system prompt so the model can add/remove items deterministically.
+        try:
+            from abstractcore.utils.token_utils import TokenUtils  # type: ignore
+        except Exception:  # pragma: no cover
+            TokenUtils = None  # type: ignore[assignment]
+
+        eff_model_for_tokens = str(runtime_ns.get("model") or "").strip()
+
+        def _count_tokens(text: str) -> int:
+            s = str(text or "")
+            if not s:
+                return 0
+            if TokenUtils is None:
+                return max(1, len(s) // 4)
+            try:
+                return max(0, int(TokenUtils.estimate_tokens(s, model=eff_model_for_tokens)))
+            except Exception:
+                return max(1, len(s) // 4)
+
+        mem_split = render_active_memory_split_for_llm_request(
+            run.vars, include_tools_summary=False, token_counter=_count_tokens
+        )
+        system_memory = str(mem_split.get("system_memory") or "")
+        active_memory = str(mem_split.get("user_memory") or "")
+
+        sys_req = logic.build_request(
+            task=task,
+            messages=[],
+            guidance="",
+            active_memory=active_memory,
+            system_memory=system_memory,
+            iteration=0,
+            max_iterations=0,
+            vars=run.vars,
+        )
+
+        payload: Dict[str, Any] = {
+            "prompt": task,
+            "response_schema": schema,
+            "response_schema_name": "ActiveMemoryEnvelopeV2",
+            "params": {"temperature": 0.2},
+        }
+        sys = _system_prompt(runtime_ns) or sys_req.system_prompt
+        if sys is not None:
+            payload["system_prompt"] = (str(sys).rstrip() + "\n\n" + finalize_block).strip()
+        eff_provider = runtime_ns.get("provider")
+        eff_model = runtime_ns.get("model")
+        if isinstance(eff_provider, str) and eff_provider.strip():
+            payload["provider"] = eff_provider.strip()
+        if isinstance(eff_model, str) and eff_model.strip():
+            payload["model"] = eff_model.strip()
+
+        return StepPlan(
+            node_id="finalize",
+            effect=Effect(
+                type=EffectType.LLM_CALL,
+                payload=payload,
+                result_key="_temp.final_llm_response",
+            ),
+            next_node="finalize_parse",
+        )
+
+    def finalize_parse_node(run: RunState, ctx) -> StepPlan:
+        context, _, _, temp, _ = ensure_codeact_vars(run)
+        resp = temp.get("final_llm_response", {})
+        if not isinstance(resp, dict):
+            resp = {}
+        data = resp.get("data")
+        if data is None and isinstance(resp.get("content"), str):
+            try:
+                data = json.loads(resp["content"])
+            except Exception:
+                data = None
+        envelope = data if isinstance(data, dict) else {}
+
+        answer_raw = envelope.get("content")
+        answer = str(answer_raw or "").strip()
+
+        applied: Optional[Dict[str, Any]] = None
+        try:
+            from abstractruntime.memory.active_memory import apply_active_memory_envelope
+
+            applied = apply_active_memory_envelope(run.vars, envelope=envelope)
+        except Exception:
+            applied = None
+
+        emit(
+            "finalize_parse",
+            {
+                "content_preview": answer[:100] if answer else "(empty)",
+                "applied_memory": bool(isinstance(applied, dict) and applied.get("ok")),
+            },
+        )
+        if isinstance(applied, dict) and applied.get("ok") and applied.get("applied") is not None:
+            emit("active_memory_envelope", {"applied": applied.get("applied")})
+
+        # Replace the last assistant message (if any) with the user-facing content.
+        messages = context.get("messages")
+        if isinstance(messages, list) and messages:
+            last = messages[-1] if messages else None
+            if isinstance(last, dict) and last.get("role") == "assistant":
+                last["content"] = answer
+
+        temp["final_answer"] = answer
+        temp.pop("final_llm_response", None)
+        return StepPlan(node_id="finalize_parse", next_node="maybe_review")
 
     def maybe_review_node(run: RunState, ctx) -> StepPlan:
         _, scratchpad, runtime_ns, _, _ = ensure_codeact_vars(run)
@@ -996,6 +1129,8 @@ def create_codeact_workflow(
             "execute_code": execute_code_node,
             "observe": observe_node,
             "handle_user_response": handle_user_response_node,
+            "finalize": finalize_node,
+            "finalize_parse": finalize_parse_node,
             "maybe_review": maybe_review_node,
             "review": review_node,
             "review_parse": review_parse_node,

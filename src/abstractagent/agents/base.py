@@ -8,6 +8,7 @@ All agent types (ReAct, CodeAct, etc.) inherit from BaseAgent to get:
 """
 
 from abc import ABC, abstractmethod
+import copy
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractruntime import Runtime, RunState, RunStatus, WorkflowSpec
@@ -53,6 +54,27 @@ class BaseAgent(ABC):
         self.actor_id: Optional[str] = actor_id
         self.session_id: Optional[str] = session_id
         self.session_messages: List[Dict[str, Any]] = []
+        self.session_active_memory: Optional[Dict[str, Any]] = None
+
+    def _sync_session_caches_from_state(self, state: Optional[RunState]) -> None:
+        if state is None or not hasattr(state, "vars") or not isinstance(state.vars, dict):
+            return
+
+        messages: Optional[List[Dict[str, Any]]] = None
+        output = getattr(state, "output", None)
+        if isinstance(output, dict) and isinstance(output.get("messages"), list):
+            messages = [dict(m) for m in output["messages"] if isinstance(m, dict)]
+        else:
+            ctx = state.vars.get("context")
+            if isinstance(ctx, dict) and isinstance(ctx.get("messages"), list):
+                messages = [dict(m) for m in ctx["messages"] if isinstance(m, dict)]
+
+        if messages is not None:
+            self.session_messages = list(messages)
+
+        runtime_ns = state.vars.get("_runtime")
+        if isinstance(runtime_ns, dict) and isinstance(runtime_ns.get("active_memory"), dict):
+            self.session_active_memory = copy.deepcopy(runtime_ns["active_memory"])
 
     def _ensure_actor_id(self) -> str:
         if self.actor_id:
@@ -236,12 +258,15 @@ class BaseAgent(ABC):
         
         wait_key = state.waiting.wait_key if state.waiting else None
         
-        return self.runtime.resume(
+        state2 = self.runtime.resume(
             workflow=self.workflow,
             run_id=self._current_run_id,
             wait_key=wait_key,
             payload={"response": response},
         )
+        if state2.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+            self._sync_session_caches_from_state(state2)
+        return state2
     
     def attach(self, run_id: str) -> RunState:
         """Attach to an existing run for resume.
@@ -275,6 +300,7 @@ class BaseAgent(ABC):
             self.session_id = state_session_id
 
         self._current_run_id = run_id
+        self._sync_session_caches_from_state(state)
         return state
     
     def save_state(self, filepath: str) -> None:

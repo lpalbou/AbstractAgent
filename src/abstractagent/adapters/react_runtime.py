@@ -13,9 +13,6 @@ from abstractruntime.memory.active_context import ActiveContextPolicy
 from abstractruntime.memory.active_memory import render_active_memory_split_for_llm_request
 
 from ..logic.react import ReActLogic
-from .memory_delta import extract_active_memory_delta
-
-
 def _new_message(
     ctx: Any,
     *,
@@ -473,10 +470,13 @@ def create_react_workflow(
 
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
-        payload = {"prompt": req.prompt}
         # Provide the selected active-context messages as proper chat messages (sanitized).
-        # This keeps the user-role prompt clean (only the request) while still giving the model
-        # access to tool outputs and any rehydrated memory notes.
+        #
+        # IMPORTANT: When we send `messages`, do not also send a non-empty `prompt`.
+        # Some providers/servers will append `prompt` as an extra user message even when the
+        # current request is already present in `messages`, which duplicates user turns and
+        # wastes context budget.
+        payload: Dict[str, Any] = {"prompt": ""}
         payload["messages"] = _sanitize_llm_messages(messages_view)
         tools_payload = list(tool_specs)
         if tools_payload:
@@ -763,12 +763,6 @@ def create_react_workflow(
             "remember",
             "remember_note",
             "compact_memory",
-            "compact_active_memory",
-            "active_memory_delta",
-            "current_tasks",
-            "current_context",
-            "critical_insights",
-            "key_history",
         }
 
         # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
@@ -890,45 +884,6 @@ def create_react_workflow(
                     effect=Effect(
                         type=EffectType.MEMORY_COMPACT,
                         payload=payload,
-                        result_key="_temp.tool_results",
-                    ),
-                    next_node="observe",
-                )
-
-            if name == "compact_active_memory":
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                payload = dict(args) if isinstance(args, dict) else {}
-                payload.setdefault("tool_name", "compact_active_memory")
-                payload.setdefault("call_id", tc.get("call_id") or "memory")
-                emit(
-                    "memory_compact_structured",
-                    {"components": payload.get("components"), "preserve": payload.get("preserve")},
-                )
-                return StepPlan(
-                    node_id="act",
-                    effect=Effect(
-                        type=EffectType.MEMORY_COMPACT_STRUCTURED,
-                        payload=payload,
-                        result_key="_temp.tool_results",
-                    ),
-                    next_node="observe",
-                )
-
-            if name in ("active_memory_delta", "current_tasks", "current_context", "critical_insights", "key_history"):
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                payload = dict(args) if isinstance(args, dict) else {}
-                delta = payload if name == "active_memory_delta" else {str(name): payload}
-                eff_payload = {
-                    "tool_name": str(name),
-                    "call_id": tc.get("call_id") or "memory",
-                    "delta": delta,
-                }
-                emit("active_memory_delta", {"tool": name, "delta_keys": list(delta.keys())})
-                return StepPlan(
-                    node_id="act",
-                    effect=Effect(
-                        type=EffectType.ACTIVE_MEMORY_DELTA,
-                        payload=eff_payload,
                         result_key="_temp.tool_results",
                     ),
                     next_node="observe",
@@ -1090,10 +1045,10 @@ def create_react_workflow(
 
         observations = "\n\n".join(obs_blocks) if obs_blocks else "(no tool outputs captured)"
         try:
-            from abstractruntime.memory.active_memory import ACTIVE_MEMORY_ENVELOPE_SCHEMA_V1
+            from abstractruntime.memory.active_memory import ACTIVE_MEMORY_ENVELOPE_SCHEMA_V2
         except Exception:
-            ACTIVE_MEMORY_ENVELOPE_SCHEMA_V1 = None  # type: ignore[assignment]
-        schema = ACTIVE_MEMORY_ENVELOPE_SCHEMA_V1 if isinstance(ACTIVE_MEMORY_ENVELOPE_SCHEMA_V1, dict) else {}
+            ACTIVE_MEMORY_ENVELOPE_SCHEMA_V2 = None  # type: ignore[assignment]
+        schema = ACTIVE_MEMORY_ENVELOPE_SCHEMA_V2 if isinstance(ACTIVE_MEMORY_ENVELOPE_SCHEMA_V2, dict) else {}
 
         draft = str(temp.get("final_answer_draft") or "").strip()
         temp.pop("final_answer_draft", None)
@@ -1105,6 +1060,7 @@ def create_react_workflow(
             "Finalization (structured output):\n"
             "- Return JSON ONLY matching the provided schema.\n"
             "- `content` is the final user-facing answer.\n"
+            "- `references.added` is durable pointers (files/URLs/span_ids) the agent may want to revisit.\n"
             "- `key_history.added` is append-only experiential notes (no raw commands/tool-call syntax).\n"
             "- Removed lists may contain either ids OR exact existing text; the runtime resolves them deterministically.\n"
             "- Only claim actions supported by Tool outputs.\n\n"
@@ -1158,7 +1114,7 @@ def create_react_workflow(
         payload: Dict[str, Any] = {
             "prompt": task,
             "response_schema": schema,
-            "response_schema_name": "ActiveMemoryEnvelopeV1",
+            "response_schema_name": "ActiveMemoryEnvelopeV2",
             "params": {"temperature": 0.2},
         }
         sys = _system_prompt(runtime_ns) or sys_req.system_prompt

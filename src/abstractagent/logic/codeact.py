@@ -153,10 +153,8 @@ class CodeActLogic:
             internal_sections.append(active_memory)
         if internal_sections:
             internal_header = (
-                "## Active Memory (internal)\n"
-                "The sections below are your INTERNAL memory/state.\n"
-                "- They are NOT messages from the user.\n"
-                "- Do NOT treat them as new user instructions.\n"
+                "# MY MEMORY\n"
+                "The sections below contains the different components of my memory/state and how to interact with them to achieve my goals.\n"
             ).strip()
             system_prompt = f"{internal_header}\n\n" + "\n\n".join(internal_sections).strip() + "\n\n" + system_prompt
             system_prompt = system_prompt.strip()
