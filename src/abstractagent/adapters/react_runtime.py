@@ -565,6 +565,84 @@ def create_react_workflow(
             next_node="parse",
         )
 
+    def empty_response_retry_node(run: RunState, ctx) -> StepPlan:
+        """Recovery path when the model returns an empty message (no content, no tool calls).
+
+        This is treated as an invalid agent step. We re-prompt with the original task plus
+        recent tool evidence and explicitly require either tool calls or a substantive answer.
+        """
+        context, scratchpad, runtime_ns, _, _ = ensure_react_vars(run)
+        task = str(context.get("task", "") or "")
+
+        allow = _effective_allowlist(runtime_ns)
+        allowed_defs = _allowed_tool_defs(allow)
+        tool_specs = [t.to_dict() for t in allowed_defs]
+        include_examples = bool(runtime_ns.get("tool_prompt_examples", True))
+        if not include_examples:
+            tool_specs = [{k: v for k, v in spec.items() if k != "examples"} for spec in tool_specs if isinstance(spec, dict)]
+        runtime_ns["tool_specs"] = tool_specs
+        runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
+        runtime_ns.setdefault("allowed_tools", allow)
+
+        # Include recent tool outputs and user messages as evidence (bounded).
+        messages = list(context.get("messages") or [])
+        evidence_lines: list[str] = []
+        tool_count = 0
+        user_count = 0
+        for m in reversed(messages):
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content")
+            if role == "tool" and isinstance(content, str) and content.strip():
+                evidence_lines.append(content.strip())
+                tool_count += 1
+            elif role == "user" and isinstance(content, str) and content.strip():
+                # Avoid duplicating the original task.
+                if content.strip() != task.strip():
+                    evidence_lines.append(content.strip())
+                    user_count += 1
+            if tool_count >= 6 and user_count >= 2:
+                break
+        evidence_lines.reverse()
+        evidence = "\n\n".join(evidence_lines) if evidence_lines else "(no prior evidence captured)"
+
+        # Build a strong corrective prompt. Prefer tools; allow a direct answer if truly possible.
+        prompt = (
+            "The previous assistant message was EMPTY (no content and no tool calls). This is invalid.\n"
+            "Recover by continuing the task using the evidence below.\n\n"
+            f"Task:\n{task}\n\n"
+            f"Evidence (recent tool outputs + user messages):\n{evidence}\n\n"
+            "Now do EXACTLY ONE of the following:\n"
+            "1) CALL one or more tools to make progress (preferred).\n"
+            "2) If you already have enough evidence, provide a concise final answer.\n\n"
+            "Rules:\n"
+            "- Do not output an empty message.\n"
+            "- Do not ask the user a question in plain text; use the `ask_user` tool.\n"
+            "- If you call tools, include the tool call(s) directly (no preamble).\n"
+        )
+
+        payload: Dict[str, Any] = {"prompt": prompt}
+        if tool_specs:
+            payload["tools"] = list(tool_specs)
+        sys = _system_prompt(runtime_ns)
+        if isinstance(sys, str) and sys.strip():
+            payload["system_prompt"] = sys
+        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
+        if isinstance(eff_provider, str) and eff_provider.strip():
+            payload["provider"] = eff_provider.strip()
+        if isinstance(eff_model, str) and eff_model.strip():
+            payload["model"] = eff_model.strip()
+        payload["params"] = {"temperature": 0.2}
+
+        emit("empty_response_retry", {"tools": allow, "evidence": bool(evidence_lines)})
+        return StepPlan(
+            node_id="empty_response_retry",
+            effect=Effect(type=EffectType.LLM_CALL, payload=payload, result_key="_temp.llm_response"),
+            next_node="parse",
+        )
+
     def parse_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
         response = temp.get("llm_response", {})
@@ -640,6 +718,28 @@ def create_react_workflow(
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
             return StepPlan(node_id="parse", next_node="act")
 
+        # Empty response is an invalid step: recover with a bounded retry that carries evidence.
+        if not isinstance(content, str) or not content.strip():
+            try:
+                empty_retries = int(scratchpad.get("empty_response_retry_count") or 0)
+            except Exception:
+                empty_retries = 0
+
+            if empty_retries < 2:
+                scratchpad["empty_response_retry_count"] = empty_retries + 1
+                emit("parse_retry_empty_response", {"retries": empty_retries + 1})
+                return StepPlan(node_id="parse", next_node="empty_response_retry")
+
+            safe = (
+                "I can't proceed: the model repeatedly returned empty outputs (no content, no tool calls).\n"
+                "Please retry, reduce context, or switch models."
+            )
+            context["messages"].append(_new_message(ctx, role="assistant", content=safe, metadata={"kind": "error"}))
+            temp["final_answer"] = safe
+            temp["pending_tool_calls"] = []
+            scratchpad["empty_response_retry_count"] = 0
+            return StepPlan(node_id="parse", next_node="maybe_review")
+
         # If the model appears to have produced a fake "observation[tool]" transcript instead of
         # calling tools, give it one corrective retry before treating the message as final.
         if not bool(scratchpad.get("used_tools")) and _should_retry_for_missing_tool_call(content):
@@ -714,6 +814,7 @@ def create_react_workflow(
         temp["final_answer"] = final or "No answer provided"
         temp["pending_tool_calls"] = []
         scratchpad["tool_retry_count"] = 0
+        scratchpad["empty_response_retry_count"] = 0
         return StepPlan(node_id="parse", next_node="maybe_review")
 
     def act_node(run: RunState, ctx) -> StepPlan:
@@ -1216,6 +1317,31 @@ def create_react_workflow(
             emit("review_tool_calls", {"count": len(next_tool_calls)})
             return StepPlan(node_id="review_parse", next_node="act")
 
+        # Behavioral validation: if incomplete but no tool calls, re-ask reviewer once with stricter rules.
+        if not complete and not next_tool_calls:
+            try:
+                retry_count = int(runtime_ns.get("review_retry_count") or 0)
+            except Exception:
+                retry_count = 0
+            if retry_count < 1:
+                runtime_ns["review_retry_count"] = retry_count + 1
+                inbox = runtime_ns.get("inbox")
+                if not isinstance(inbox, list):
+                    inbox = []
+                    runtime_ns["inbox"] = inbox
+                inbox.append(
+                    {
+                        "content": (
+                            "[Review] Your last review output was not actionable. "
+                            "If incomplete, you MUST return at least one `next_tool_call` "
+                            "(use `ask_user` if you need clarification). Return JSON only."
+                        )
+                    }
+                )
+                emit("review_retry_unactionable", {"retry": retry_count + 1})
+                return StepPlan(node_id="review_parse", next_node="review")
+
+        runtime_ns["review_retry_count"] = 0
         if next_prompt_text:
             inbox = runtime_ns.get("inbox")
             if not isinstance(inbox, list):
@@ -1297,6 +1423,7 @@ def create_react_workflow(
             "plan_parse": plan_parse_node,
             "reason": reason_node,
             "tool_retry_minimal": tool_retry_minimal_node,
+            "empty_response_retry": empty_response_retry_node,
             "parse": parse_node,
             "act": act_node,
             "observe": observe_node,

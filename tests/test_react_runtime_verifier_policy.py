@@ -75,8 +75,21 @@ def test_review_parse_routes_to_reason_when_verifier_emits_next_prompt_only() ->
         },
     )
 
-    plan = wf.get_node("review_parse")(run, _Ctx())
-    assert plan.next_node == "reason"
+    # New contract: "incomplete + no tool calls" is behaviorally invalid → re-ask reviewer once.
+    plan1 = wf.get_node("review_parse")(run, _Ctx())
+    assert plan1.next_node == "review"
+
+    # If the reviewer remains unactionable, we fall back to prompting the agent back to reason.
+    run.vars["_temp"]["review_llm_response"] = {
+        "data": {
+            "complete": False,
+            "missing": ["x"],
+            "next_prompt": "Call read_file.",
+            "next_tool_calls": [],
+        }
+    }
+    plan2 = wf.get_node("review_parse")(run, _Ctx())
+    assert plan2.next_node == "reason"
     inbox = run.vars["_runtime"].get("inbox")
     assert isinstance(inbox, list)
     assert inbox and "[Review]" in str(inbox[-1].get("content", ""))

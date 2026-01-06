@@ -82,8 +82,16 @@ def test_react_review_mode_can_self_prompt_back_to_reason() -> None:
     run.vars["_temp"]["review_llm_response"] = {
         "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
     }
-    review_parse = wf.get_node("review_parse")(run, _Ctx())
-    assert review_parse.next_node == "reason"
+    # New contract: "incomplete + no tool calls" is behaviorally invalid → re-ask reviewer once.
+    review_parse_1 = wf.get_node("review_parse")(run, _Ctx())
+    assert review_parse_1.next_node == "review"
+
+    # If the reviewer remains unactionable, we fall back to prompting the agent back to reason.
+    run.vars["_temp"]["review_llm_response"] = {
+        "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
+    }
+    review_parse_2 = wf.get_node("review_parse")(run, _Ctx())
+    assert review_parse_2.next_node == "reason"
 
     inbox = run.vars["_runtime"].get("inbox")
     assert isinstance(inbox, list)
@@ -116,8 +124,16 @@ def test_codeact_review_mode_routes_to_reason_when_incomplete() -> None:
     run.vars["_temp"]["review_llm_response"] = {
         "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
     }
-    review_parse = wf.get_node("review_parse")(run, _Ctx())
-    assert review_parse.next_node == "reason"
+    # New contract: "incomplete + no tool calls" is behaviorally invalid → re-ask reviewer once.
+    review_parse_1 = wf.get_node("review_parse")(run, _Ctx())
+    assert review_parse_1.next_node == "review"
+
+    # If the reviewer remains unactionable, we fall back to prompting the agent back to reason.
+    run.vars["_temp"]["review_llm_response"] = {
+        "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
+    }
+    review_parse_2 = wf.get_node("review_parse")(run, _Ctx())
+    assert review_parse_2.next_node == "reason"
     inbox = run.vars["_runtime"].get("inbox")
     assert isinstance(inbox, list)
     assert inbox and "[Review]" in str(inbox[-1].get("content", ""))

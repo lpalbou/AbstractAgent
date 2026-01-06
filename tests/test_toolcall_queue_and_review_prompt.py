@@ -124,6 +124,49 @@ def test_react_toolcall_queue_executes_tools_before_ask_user_and_continues() -> 
     )
 
 
+def test_react_empty_llm_response_triggers_recovery_retry() -> None:
+    logic = ReActLogic(tools=[ToolDefinition(name="read_file", description="read", parameters={})])
+    wf = create_react_workflow(logic=logic, workflow_id="wf")
+
+    run = _run(
+        current_node="parse",
+        vars={
+            "context": {"task": "t", "messages": [{"role": "user", "content": "t"}]},
+            "scratchpad": {"iteration": 0, "max_iterations": 2},
+            "_runtime": {"inbox": [], "allowed_tools": ["read_file"]},
+            "_temp": {"llm_response": {"content": "", "tool_calls": []}},
+            "_limits": {"max_history_messages": -1, "max_tokens": 32768},
+        },
+    )
+
+    plan = wf.get_node("parse")(run, _Ctx())
+    assert plan.next_node == "empty_response_retry"
+
+
+def test_react_review_parse_retries_when_incomplete_without_tool_calls() -> None:
+    logic = ReActLogic(tools=[ToolDefinition(name="read_file", description="read", parameters={})])
+    wf = create_react_workflow(logic=logic, workflow_id="wf")
+
+    run = _run(
+        current_node="review_parse",
+        vars={
+            "context": {"task": "t", "messages": [{"role": "user", "content": "t"}]},
+            "scratchpad": {"review_count": 1},
+            "_runtime": {"inbox": [], "review_mode": True, "review_max_rounds": 3, "allowed_tools": ["read_file"]},
+            "_temp": {
+                "final_answer": "candidate",
+                "review_llm_response": {"data": {"complete": False, "missing": ["x"], "next_prompt": "Do something", "next_tool_calls": []}},
+            },
+            "_limits": {"max_history_messages": -1, "max_tokens": 32768},
+        },
+    )
+
+    plan = wf.get_node("review_parse")(run, _Ctx())
+    assert plan.next_node == "review"
+    inbox = run.vars["_runtime"].get("inbox")
+    assert isinstance(inbox, list) and inbox
+
+
 def test_codeact_review_prompt_includes_user_responses_and_ask_prompts() -> None:
     logic = CodeActLogic(
         tools=[
@@ -197,5 +240,50 @@ def test_codeact_toolcall_queue_executes_tools_before_ask_user_and_continues() -
     step3 = wf.get_node("act")(run, _Ctx())
     assert step3.effect is not None
     assert step3.effect.type == EffectType.ASK_USER
+
+
+def test_codeact_empty_llm_response_triggers_recovery_retry() -> None:
+    logic = CodeActLogic(tools=[ToolDefinition(name="edit_file", description="edit", parameters={})])
+    wf = create_codeact_workflow(logic=logic, on_step=None)
+
+    run = _run(
+        current_node="parse",
+        vars={
+            "context": {"task": "t", "messages": [{"role": "user", "content": "t"}]},
+            "scratchpad": {"iteration": 0, "max_iterations": 2},
+            "_runtime": {"inbox": [], "allowed_tools": ["edit_file"]},
+            "_temp": {"llm_response": {"content": "", "tool_calls": []}},
+            "_limits": {"max_history_messages": -1, "max_tokens": 32768},
+        },
+    )
+
+    plan = wf.get_node("parse")(run, _Ctx())
+    assert plan.next_node == "reason"
+    inbox = run.vars["_runtime"].get("inbox")
+    assert isinstance(inbox, list) and inbox
+
+
+def test_codeact_review_parse_retries_when_incomplete_without_tool_calls() -> None:
+    logic = CodeActLogic(tools=[ToolDefinition(name="edit_file", description="edit", parameters={})])
+    wf = create_codeact_workflow(logic=logic, on_step=None)
+
+    run = _run(
+        current_node="review_parse",
+        vars={
+            "context": {"task": "t", "messages": [{"role": "user", "content": "t"}]},
+            "scratchpad": {"review_count": 1},
+            "_runtime": {"inbox": [], "review_mode": True, "review_max_rounds": 3, "allowed_tools": ["edit_file"]},
+            "_temp": {
+                "final_answer": "candidate",
+                "review_llm_response": {"data": {"complete": False, "missing": ["x"], "next_prompt": "Do something", "next_tool_calls": []}},
+            },
+            "_limits": {"max_history_messages": -1, "max_tokens": 32768},
+        },
+    )
+
+    plan = wf.get_node("review_parse")(run, _Ctx())
+    assert plan.next_node == "review"
+    inbox = run.vars["_runtime"].get("inbox")
+    assert isinstance(inbox, list) and inbox
 
 

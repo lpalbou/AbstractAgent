@@ -465,6 +465,40 @@ def create_codeact_workflow(
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
             return StepPlan(node_id="parse", next_node="act")
 
+        # Empty response is an invalid step: recover with a bounded retry that carries evidence.
+        if not isinstance(content, str) or not content.strip():
+            try:
+                empty_retries = int(scratchpad.get("empty_response_retry_count") or 0)
+            except Exception:
+                empty_retries = 0
+
+            if empty_retries < 2:
+                scratchpad["empty_response_retry_count"] = empty_retries + 1
+                emit("parse_retry_empty_response", {"retries": empty_retries + 1})
+                inbox = runtime_ns.get("inbox")
+                if not isinstance(inbox, list):
+                    inbox = []
+                    runtime_ns["inbox"] = inbox
+                inbox.append(
+                    {
+                        "content": (
+                            "[Recover] Your last message was empty. Continue the task now. "
+                            "If you need info, CALL tools (preferred). Do not output an empty message."
+                        )
+                    }
+                )
+                return StepPlan(node_id="parse", next_node="reason")
+
+            safe = (
+                "I can't proceed: the model repeatedly returned empty outputs (no content, no tool calls).\n"
+                "Please retry, reduce context, or switch models."
+            )
+            context["messages"].append(_new_message(ctx, role="assistant", content=safe, metadata={"kind": "error"}))
+            temp["final_answer"] = safe
+            temp["pending_tool_calls"] = []
+            scratchpad["empty_response_retry_count"] = 0
+            return StepPlan(node_id="parse", next_node="maybe_review")
+
         code = logic.extract_code(content)
         if code:
             if content:
@@ -506,6 +540,7 @@ def create_codeact_workflow(
                     scratchpad["plan"] = updated.strip()
         temp["final_answer"] = raw or "No answer provided"
         temp["pending_tool_calls"] = []
+        scratchpad["empty_response_retry_count"] = 0
         return StepPlan(node_id="parse", next_node="maybe_review")
 
     def act_node(run: RunState, ctx) -> StepPlan:
@@ -1026,6 +1061,31 @@ def create_codeact_workflow(
             emit("review_tool_calls", {"count": len(next_tool_calls)})
             return StepPlan(node_id="review_parse", next_node="act")
 
+        # Behavioral validation: if incomplete but no tool calls, re-ask reviewer once with stricter rules.
+        if not complete and not next_tool_calls:
+            try:
+                retry_count = int(runtime_ns.get("review_retry_count") or 0)
+            except Exception:
+                retry_count = 0
+            if retry_count < 1:
+                runtime_ns["review_retry_count"] = retry_count + 1
+                inbox = runtime_ns.get("inbox")
+                if not isinstance(inbox, list):
+                    inbox = []
+                    runtime_ns["inbox"] = inbox
+                inbox.append(
+                    {
+                        "content": (
+                            "[Review] Your last review output was not actionable. "
+                            "If incomplete, you MUST return at least one `next_tool_call` "
+                            "(use `ask_user` if you need clarification). Return JSON only."
+                        )
+                    }
+                )
+                emit("review_retry_unactionable", {"retry": retry_count + 1})
+                return StepPlan(node_id="review_parse", next_node="review")
+
+        runtime_ns["review_retry_count"] = 0
         if next_prompt_text:
             inbox = runtime_ns.get("inbox")
             if not isinstance(inbox, list):
