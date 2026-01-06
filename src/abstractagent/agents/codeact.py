@@ -5,11 +5,18 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractcore.tools import ToolDefinition
-from abstractruntime import RunState, Runtime, WorkflowSpec
+from abstractruntime import RunState, RunStatus, Runtime, WorkflowSpec
 
 from .base import BaseAgent
 from ..adapters.codeact_runtime import create_codeact_workflow
-from ..logic.builtins import ASK_USER_TOOL, COMPACT_MEMORY_TOOL, INSPECT_VARS_TOOL, RECALL_MEMORY_TOOL, REMEMBER_TOOL
+from ..logic.builtins import (
+    ASK_USER_TOOL,
+    COMPACT_MEMORY_TOOL,
+    INSPECT_VARS_TOOL,
+    RECALL_MEMORY_TOOL,
+    REMEMBER_TOOL,
+    REMEMBER_NOTE_TOOL,
+)
 from ..logic.codeact import CodeActLogic
 
 
@@ -44,7 +51,10 @@ class CodeActAgent(BaseAgent):
         on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         max_iterations: int = 25,
         max_history_messages: int = -1,
-        max_tokens: Optional[int] = 32768,
+        max_tokens: Optional[int] = None,
+        plan_mode: bool = False,
+        review_mode: bool = True,
+        review_max_rounds: int = 3,
         actor_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
@@ -56,6 +66,11 @@ class CodeActAgent(BaseAgent):
         if self._max_history_messages != -1 and self._max_history_messages < 1:
             self._max_history_messages = 1
         self._max_tokens = max_tokens
+        self._plan_mode = bool(plan_mode)
+        self._review_mode = bool(review_mode)
+        self._review_max_rounds = int(review_max_rounds)
+        if self._review_max_rounds < 0:
+            self._review_max_rounds = 0
 
         self.logic: Optional[CodeActLogic] = None
         super().__init__(
@@ -68,7 +83,15 @@ class CodeActAgent(BaseAgent):
 
     def _create_workflow(self) -> WorkflowSpec:
         tool_defs = _tool_definitions_from_callables(self.tools)
-        tool_defs = [ASK_USER_TOOL, RECALL_MEMORY_TOOL, INSPECT_VARS_TOOL, REMEMBER_TOOL, COMPACT_MEMORY_TOOL, *tool_defs]
+        tool_defs = [
+            ASK_USER_TOOL,
+            RECALL_MEMORY_TOOL,
+            INSPECT_VARS_TOOL,
+            REMEMBER_TOOL,
+            REMEMBER_NOTE_TOOL,
+            COMPACT_MEMORY_TOOL,
+            *tool_defs,
+        ]
         logic = CodeActLogic(
             tools=tool_defs,
             max_history_messages=self._max_history_messages,
@@ -77,27 +100,67 @@ class CodeActAgent(BaseAgent):
         self.logic = logic
         return create_codeact_workflow(logic=logic, on_step=self.on_step)
 
-    def start(self, task: str) -> str:
+    def start(
+        self,
+        task: str,
+        *,
+        plan_mode: Optional[bool] = None,
+        review_mode: Optional[bool] = None,
+        review_max_rounds: Optional[int] = None,
+        allowed_tools: Optional[List[str]] = None,
+    ) -> str:
         task = str(task or "").strip()
         if not task:
             raise ValueError("task must be a non-empty string")
 
+        eff_plan_mode = self._plan_mode if plan_mode is None else bool(plan_mode)
+        eff_review_mode = self._review_mode if review_mode is None else bool(review_mode)
+        eff_review_max_rounds = self._review_max_rounds if review_max_rounds is None else int(review_max_rounds)
+        if eff_review_max_rounds < 0:
+            eff_review_max_rounds = 0
+
+        # Base limits come from the Runtime config so model capabilities (max context)
+        # are respected by default, unless explicitly overridden by the agent/session.
+        try:
+            base_limits = dict(self.runtime.config.to_limits_dict())
+        except Exception:
+            base_limits = {}
+        limits: Dict[str, Any] = dict(base_limits)
+        limits.setdefault("warn_iterations_pct", 80)
+        limits.setdefault("warn_tokens_pct", 80)
+        limits["max_iterations"] = int(self._max_iterations)
+        limits["current_iteration"] = 0
+        limits["max_history_messages"] = int(self._max_history_messages)
+        # Message-size guards for LLM-visible context (character-level).
+        # Disabled by default (-1): enable by setting a positive character budget.
+        limits.setdefault("max_message_chars", -1)
+        limits.setdefault("max_tool_message_chars", -1)
+        limits["estimated_tokens_used"] = 0
+        try:
+            max_tokens_override = int(self._max_tokens) if self._max_tokens is not None else None
+        except Exception:
+            max_tokens_override = None
+        if isinstance(max_tokens_override, int) and max_tokens_override > 0:
+            limits["max_tokens"] = max_tokens_override
+        if not isinstance(limits.get("max_tokens"), int) or int(limits.get("max_tokens") or 0) <= 0:
+            limits["max_tokens"] = 32768
+
         vars: Dict[str, Any] = {
             "context": {"task": task, "messages": _copy_messages(self.session_messages)},
             "scratchpad": {"iteration": 0, "max_iterations": int(self._max_iterations)},
-            "_runtime": {"inbox": []},
+            "_runtime": {
+                "inbox": [],
+                "plan_mode": eff_plan_mode,
+                "review_mode": eff_review_mode,
+                "review_max_rounds": eff_review_max_rounds,
+            },
             "_temp": {},
             # Canonical _limits namespace for runtime awareness
-            "_limits": {
-                "max_iterations": int(self._max_iterations),
-                "current_iteration": 0,
-                "max_tokens": self._max_tokens,
-                "max_history_messages": int(self._max_history_messages),
-                "estimated_tokens_used": 0,
-                "warn_iterations_pct": 80,
-                "warn_tokens_pct": 80,
-            },
+            "_limits": limits,
         }
+        if isinstance(allowed_tools, list):
+            normalized = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
+            vars["_runtime"]["allowed_tools"] = normalized
 
         run_id = self.runtime.start(
             workflow=self.workflow,
@@ -142,7 +205,10 @@ class CodeActAgent(BaseAgent):
     def step(self) -> RunState:
         if not self._current_run_id:
             raise RuntimeError("No active run. Call start() first.")
-        return self.runtime.tick(workflow=self.workflow, run_id=self._current_run_id, max_steps=1)
+        state = self.runtime.tick(workflow=self.workflow, run_id=self._current_run_id, max_steps=1)
+        if state.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+            self._sync_session_caches_from_state(state)
+        return state
 
 
 def create_codeact_agent(
@@ -153,7 +219,10 @@ def create_codeact_agent(
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     max_iterations: int = 25,
     max_history_messages: int = -1,
-    max_tokens: Optional[int] = 32768,
+    max_tokens: Optional[int] = None,
+    plan_mode: bool = False,
+    review_mode: bool = True,
+    review_max_rounds: int = 3,
     llm_kwargs: Optional[Dict[str, Any]] = None,
     run_store: Optional[Any] = None,
     ledger_store: Optional[Any] = None,
@@ -185,6 +254,9 @@ def create_codeact_agent(
         max_iterations=max_iterations,
         max_history_messages=max_history_messages,
         max_tokens=max_tokens,
+        plan_mode=plan_mode,
+        review_mode=review_mode,
+        review_max_rounds=review_max_rounds,
         actor_id=actor_id,
         session_id=session_id,
     )

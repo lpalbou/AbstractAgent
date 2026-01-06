@@ -6,6 +6,7 @@ workflow wiring lives under `abstractagent.adapters`.
 
 from .builtins import ASK_USER_TOOL
 from .codeact import CodeActLogic
+from .memact import MemActLogic
 from .react import ReActLogic
 from .types import AskUserAction, FinalAnswer, LLMRequest
 
@@ -16,4 +17,5 @@ __all__ = [
     "FinalAnswer",
     "ReActLogic",
     "CodeActLogic",
+    "MemActLogic",
 ]

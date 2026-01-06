@@ -1,6 +1,6 @@
 # AbstractAgent — Architecture (Current)
 
-> Updated: 2025-12-27  
+> Updated: 2026-01-02  
 > Scope: this describes **what is implemented today** in this monorepo (no “future” design claims).
 
 AbstractAgent is the **agent-pattern library** of the AbstractFramework. It provides portable agent behaviors implemented as:
@@ -15,7 +15,7 @@ Agents run on **AbstractRuntime** (durable execution + persistence) and use **Ab
 ```
 abstractagent/
   src/abstractagent/
-    agents/         # BaseAgent + concrete agents (ReAct / CodeAct)
+    agents/         # BaseAgent + concrete agents (ReAct / CodeAct / MemAct)
     adapters/       # logic -> WorkflowSpec (effects + durable vars schema)
     logic/          # Pure prompting/parsing logic (no runtime imports)
     tools/          # Agent-facing tool bundles
@@ -47,7 +47,7 @@ Both ReAct and CodeAct store conversation history under `context["messages"]` as
 - `reason` → `EffectType.LLM_CALL` with `{prompt, tools?, system_prompt?, provider?, model?, params}`
 - `parse` → parse tool calls (native or fallback parse-from-content); decide next step
 - `act` → either:
-  - schema-only built-ins → `ASK_USER` / `MEMORY_QUERY` / `MEMORY_TAG` / `MEMORY_COMPACT`, or
+  - schema-only built-ins → `ASK_USER` / `MEMORY_QUERY` / `MEMORY_TAG` / `MEMORY_NOTE` / `MEMORY_COMPACT`, or
   - regular tool calls → `TOOL_CALLS`
 - `observe` → append tool observations to `context.messages`, then loop
 - `finalize` / `finalize_parse` → optional final synthesis pass if tools were used
@@ -80,7 +80,36 @@ CodeAct is ReAct-like, but the primary action is executing Python:
 - the model can call tools like `execute_python`, or include fenced ` ```python ... ``` ` blocks
 - the adapter translates code execution into `EffectType.TOOL_CALLS` with a single call to `execute_python`
 
-It supports the same schema-only built-ins as ReAct (`ask_user`, `recall_memory`, `remember`, `compact_memory`) via runtime effects.
+It supports the same schema-only built-ins as ReAct (`ask_user`, `recall_memory`, `remember`, `remember_note`, `compact_memory`) via runtime effects.
+
+Notes:
+- `recall_memory` supports `scope` routing (`run|session|global|all`) for cross-subrun recall without extra host glue.
+- `remember_note` supports `scope` routing (`run|session|global`) for durable note storage into session/global indexes.
+
+## MemAct Agent (Implemented)
+
+MemAct is a **memory-enhanced** agent (Letta-like) that uses a runtime-owned Active Memory system.
+
+Key separation boundary:
+- **ReAct/CodeAct** are conventional SOTA agents (chat history + tool loop).
+- **MemAct** is the only agent that leverages `abstractruntime.memory.active_memory`.
+
+### Pieces
+- API wrapper: `abstractagent/src/abstractagent/agents/memact.py` (`MemActAgent`)
+- Pure logic: `abstractagent/src/abstractagent/logic/memact.py` (`MemActLogic`)
+- Runtime workflow: `abstractagent/src/abstractagent/adapters/memact_runtime.py` (`create_memact_workflow`)
+
+### Runtime workflow shape (high level)
+- `init` → seed `context.messages`, ensure `_runtime.active_memory`
+- `reason` → `EffectType.LLM_CALL` with:
+  - chat history (`context.messages`)
+  - a **system prompt** containing memory blocks rendered by `render_memact_system_prompt(...)`
+- `parse` → parse tool calls; route to `act/observe` loop or to `finalize`
+- `finalize` → enforce a single structured JSON envelope (`response_schema`)
+- `finalize_parse` → apply the envelope deterministically to `_runtime.active_memory` (`apply_memact_envelope`)
+- `done` → append final answer to history and complete
+
+MemAct’s memory blocks are updated by the model via the structured envelope; timestamps are runtime-owned.
 
 ## BaseAgent API (Durable lifecycle)
 

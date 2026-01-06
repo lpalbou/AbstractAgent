@@ -93,3 +93,42 @@ def test_react_workflow_runtime_system_prompt_and_tools_override() -> None:
     act_payload = act_plan.effect.payload if isinstance(act_plan.effect.payload, dict) else {}
     assert act_payload.get("allowed_tools") == ["tool_b"]
 
+
+def test_react_workflow_can_disable_tool_examples_in_payload() -> None:
+    tool_a = ToolDefinition(
+        name="tool_a",
+        description="A",
+        parameters={"x": {"type": "string"}},
+        examples=[{"description": "Example", "arguments": {"x": "y"}}],
+    )
+
+    wf = create_react_workflow(
+        logic=ReActLogic(tools=[tool_a]),
+        workflow_id="wf",
+        allowed_tools=["tool_a"],
+    )
+
+    vars = _base_vars(allowed_tools=["tool_a"])
+    runtime_ns = vars.get("_runtime")
+    assert isinstance(runtime_ns, dict)
+    runtime_ns["tool_prompt_examples"] = False
+
+    run = _run(vars=vars)
+    wf.get_node("init")(run, _Ctx())
+
+    plan = wf.get_node("reason")(run, _Ctx())
+    assert plan.effect is not None
+    assert plan.effect.type == EffectType.LLM_CALL
+
+    payload = plan.effect.payload if isinstance(plan.effect.payload, dict) else {}
+    tools_payload = payload.get("tools")
+    assert isinstance(tools_payload, list)
+    assert tools_payload
+    assert "examples" not in tools_payload[0]
+
+    runtime_ns2 = run.vars.get("_runtime")
+    assert isinstance(runtime_ns2, dict)
+    specs = runtime_ns2.get("tool_specs")
+    assert isinstance(specs, list)
+    assert specs
+    assert "examples" not in specs[0]
