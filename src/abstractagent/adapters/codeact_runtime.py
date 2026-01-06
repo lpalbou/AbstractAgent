@@ -509,12 +509,12 @@ def create_codeact_workflow(
         return StepPlan(node_id="parse", next_node="maybe_review")
 
     def act_node(run: RunState, ctx) -> StepPlan:
-        _, _, runtime_ns, temp, _ = ensure_codeact_vars(run)
-        tool_calls = temp.get("pending_tool_calls", [])
-        if not isinstance(tool_calls, list):
-            tool_calls = []
-
-        if not tool_calls:
+        # Treat `_temp.pending_tool_calls` as a durable queue to avoid dropping tool calls when
+        # schema-only tools (ask_user/memory/etc.) are interleaved with normal tools.
+        context, _, runtime_ns, temp, _ = ensure_codeact_vars(run)
+        raw_queue = temp.get("pending_tool_calls", [])
+        if not isinstance(raw_queue, list) or not raw_queue:
+            temp["pending_tool_calls"] = []
             return StepPlan(node_id="act", next_node="reason")
 
         allow = _effective_allowlist(runtime_ns)
@@ -527,36 +527,68 @@ def create_codeact_workflow(
             "compact_memory",
         }
 
-        # Handle schema-only built-ins specially (ASK_USER, MEMORY_QUERY).
-        for i, tc in enumerate(tool_calls):
-            if not isinstance(tc, dict):
+        tool_queue: List[Dict[str, Any]] = []
+        for idx, item in enumerate(raw_queue, start=1):
+            if isinstance(item, ToolCall):
+                d: Dict[str, Any] = {"name": item.name, "arguments": item.arguments, "call_id": item.call_id}
+            elif isinstance(item, dict):
+                d = dict(item)
+            else:
                 continue
-            name = tc.get("name")
-            args = tc.get("arguments") or {}
+            call_id = str(d.get("call_id") or "").strip()
+            if not call_id:
+                d["call_id"] = str(idx)
+            tool_queue.append(d)
 
-            if isinstance(name, str) and name in builtin_effect_tools:
-                if name not in allow:
-                    temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                    temp["tool_results"] = {
-                        "results": [
-                            {
-                                "call_id": str(tc.get("call_id") or ""),
-                                "name": name,
-                                "success": False,
-                                "output": None,
-                                "error": f"Tool '{name}' is not allowed for this agent",
-                            }
-                        ]
-                    }
-                    emit("act_blocked", {"tool": name})
-                    return StepPlan(node_id="act", next_node="observe")
+        if not tool_queue:
+            temp["pending_tool_calls"] = []
+            return StepPlan(node_id="act", next_node="reason")
+
+        def _is_builtin(tc: Dict[str, Any]) -> bool:
+            name = tc.get("name")
+            return isinstance(name, str) and name in builtin_effect_tools
+
+        if _is_builtin(tool_queue[0]):
+            tc = tool_queue[0]
+            name = str(tc.get("name") or "").strip()
+            args = tc.get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {}
+
+            # Pop builtin.
+            temp["pending_tool_calls"] = list(tool_queue[1:])
+
+            if name and name not in allow:
+                temp["tool_results"] = {
+                    "results": [
+                        {
+                            "call_id": str(tc.get("call_id") or ""),
+                            "name": name,
+                            "success": False,
+                            "output": None,
+                            "error": f"Tool '{name}' is not allowed for this agent",
+                        }
+                    ]
+                }
+                emit("act_blocked", {"tool": name})
+                return StepPlan(node_id="act", next_node="observe")
 
             if name == "ask_user":
                 question = str(args.get("question") or "Please provide input:")
                 choices = args.get("choices")
                 choices = list(choices) if isinstance(choices, list) else None
 
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
+                msgs = context.get("messages")
+                if isinstance(msgs, list):
+                    content = f"[Agent question]: {question}"
+                    last = msgs[-1] if msgs else None
+                    last_role = last.get("role") if isinstance(last, dict) else None
+                    last_meta = last.get("metadata") if isinstance(last, dict) else None
+                    last_kind = last_meta.get("kind") if isinstance(last_meta, dict) else None
+                    last_content = last.get("content") if isinstance(last, dict) else None
+                    if not (last_role == "assistant" and last_kind == "ask_user_prompt" and str(last_content or "") == content):
+                        msgs.append(_new_message(ctx, role="assistant", content=content, metadata={"kind": "ask_user_prompt"}))
+
                 emit("ask_user", {"question": question, "choices": choices or []})
                 return StepPlan(
                     node_id="act",
@@ -569,114 +601,88 @@ def create_codeact_workflow(
                 )
 
             if name == "recall_memory":
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                payload = dict(args) if isinstance(args, dict) else {}
+                payload = dict(args)
                 payload.setdefault("tool_name", "recall_memory")
                 payload.setdefault("call_id", tc.get("call_id") or "memory")
                 emit("memory_query", {"query": payload.get("query"), "span_id": payload.get("span_id")})
                 return StepPlan(
                     node_id="act",
-                    effect=Effect(
-                        type=EffectType.MEMORY_QUERY,
-                        payload=payload,
-                        result_key="_temp.tool_results",
-                    ),
+                    effect=Effect(type=EffectType.MEMORY_QUERY, payload=payload, result_key="_temp.tool_results"),
                     next_node="observe",
                 )
 
             if name == "inspect_vars":
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                payload = dict(args) if isinstance(args, dict) else {}
+                payload = dict(args)
                 payload.setdefault("tool_name", "inspect_vars")
                 payload.setdefault("call_id", tc.get("call_id") or "vars")
                 emit("vars_query", {"path": payload.get("path")})
                 return StepPlan(
                     node_id="act",
-                    effect=Effect(
-                        type=EffectType.VARS_QUERY,
-                        payload=payload,
-                        result_key="_temp.tool_results",
-                    ),
+                    effect=Effect(type=EffectType.VARS_QUERY, payload=payload, result_key="_temp.tool_results"),
                     next_node="observe",
                 )
 
             if name == "remember":
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                payload = dict(args) if isinstance(args, dict) else {}
+                payload = dict(args)
                 payload.setdefault("tool_name", "remember")
                 payload.setdefault("call_id", tc.get("call_id") or "memory")
                 emit("memory_tag", {"span_id": payload.get("span_id"), "tags": payload.get("tags")})
                 return StepPlan(
                     node_id="act",
-                    effect=Effect(
-                        type=EffectType.MEMORY_TAG,
-                        payload=payload,
-                        result_key="_temp.tool_results",
-                    ),
+                    effect=Effect(type=EffectType.MEMORY_TAG, payload=payload, result_key="_temp.tool_results"),
                     next_node="observe",
                 )
 
             if name == "remember_note":
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                payload = dict(args) if isinstance(args, dict) else {}
+                payload = dict(args)
                 payload.setdefault("tool_name", "remember_note")
                 payload.setdefault("call_id", tc.get("call_id") or "memory")
                 emit("memory_note", {"note": payload.get("note"), "tags": payload.get("tags")})
                 return StepPlan(
                     node_id="act",
-                    effect=Effect(
-                        type=EffectType.MEMORY_NOTE,
-                        payload=payload,
-                        result_key="_temp.tool_results",
-                    ),
+                    effect=Effect(type=EffectType.MEMORY_NOTE, payload=payload, result_key="_temp.tool_results"),
                     next_node="observe",
                 )
 
             if name == "compact_memory":
-                temp["pending_tool_calls"] = tool_calls[i + 1 :]
-                payload = dict(args) if isinstance(args, dict) else {}
+                payload = dict(args)
                 payload.setdefault("tool_name", "compact_memory")
                 payload.setdefault("call_id", tc.get("call_id") or "compact")
                 emit(
                     "memory_compact",
-                    {"preserve_recent": payload.get("preserve_recent"), "mode": payload.get("compression_mode"), "focus": payload.get("focus")},
+                    {
+                        "preserve_recent": payload.get("preserve_recent"),
+                        "mode": payload.get("compression_mode"),
+                        "focus": payload.get("focus"),
+                    },
                 )
                 return StepPlan(
                     node_id="act",
-                    effect=Effect(
-                        type=EffectType.MEMORY_COMPACT,
-                        payload=payload,
-                        result_key="_temp.tool_results",
-                    ),
+                    effect=Effect(type=EffectType.MEMORY_COMPACT, payload=payload, result_key="_temp.tool_results"),
                     next_node="observe",
                 )
 
-        for i, tc in enumerate(tool_calls, start=1):
-            if isinstance(tc, dict):
-                call_id_raw = tc.get("call_id")
-                call_id = str(call_id_raw).strip() if call_id_raw is not None else ""
-                if not call_id:
-                    call_id = str(i)
-                emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {}), "call_id": call_id})
-            elif isinstance(tc, ToolCall):
-                call_id = str(tc.call_id).strip() if tc.call_id is not None else ""
-                if not call_id:
-                    call_id = str(i)
-                emit("act", {"tool": tc.name, "args": tc.arguments, "call_id": call_id})
+            if temp.get("pending_tool_calls"):
+                return StepPlan(node_id="act", next_node="act")
+            return StepPlan(node_id="act", next_node="reason")
+
+        batch: List[Dict[str, Any]] = []
+        for tc in tool_queue:
+            if _is_builtin(tc):
+                break
+            batch.append(tc)
+
+        remaining = tool_queue[len(batch) :]
+        temp["pending_tool_calls"] = list(remaining)
+
+        for tc in batch:
+            emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")})
 
         formatted_calls: List[Dict[str, Any]] = []
-        for i, tc in enumerate(tool_calls, start=1):
-            if isinstance(tc, dict):
-                call_id_raw = tc.get("call_id")
-                call_id = str(call_id_raw).strip() if call_id_raw is not None else ""
-                if not call_id:
-                    call_id = str(i)
-                formatted_calls.append({"name": tc.get("name", ""), "arguments": tc.get("arguments", {}), "call_id": call_id})
-            elif isinstance(tc, ToolCall):
-                call_id = str(tc.call_id).strip() if tc.call_id is not None else ""
-                if not call_id:
-                    call_id = str(i)
-                formatted_calls.append({"name": tc.name, "arguments": tc.arguments, "call_id": call_id})
+        for tc in batch:
+            formatted_calls.append(
+                {"name": tc.get("name", ""), "arguments": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")}
+            )
 
         return StepPlan(
             node_id="act",
@@ -765,10 +771,13 @@ def create_codeact_workflow(
             )
 
         temp.pop("tool_results", None)
-        temp["pending_tool_calls"] = []
         # Reset verifier/review rounds after executing tools so the verifier can run
         # again on the next candidate answer.
         scratchpad["review_count"] = 0
+        pending = temp.get("pending_tool_calls", [])
+        if isinstance(pending, list) and pending:
+            return StepPlan(node_id="observe", next_node="act")
+        temp["pending_tool_calls"] = []
         return StepPlan(node_id="observe", next_node="reason")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
@@ -871,6 +880,44 @@ def create_codeact_workflow(
         tool_msgs.reverse()
         observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
 
+        # Include recent user messages (especially ask_user responses) so the reviewer can
+        # avoid re-asking questions the user already answered.
+        try:
+            user_limit = int(limits.get("review_max_user_message_chars", -1))
+        except Exception:
+            user_limit = -1
+
+        user_msgs: list[str] = []
+        ask_prompts: list[str] = []
+        for m in reversed(messages):
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content")
+            if role == "user" and isinstance(content, str) and content.strip():
+                if content.strip() != task.strip():
+                    user_msgs.append(_truncate_block(content.strip(), max_chars=user_limit))
+                    if len(user_msgs) >= 4:
+                        break
+        for m in reversed(messages):
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") != "assistant":
+                continue
+            meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
+            if not isinstance(meta, dict) or meta.get("kind") != "ask_user_prompt":
+                continue
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                ask_prompts.append(_truncate_block(content.strip(), max_chars=user_limit))
+                if len(ask_prompts) >= 4:
+                    break
+
+        user_msgs.reverse()
+        ask_prompts.reverse()
+        user_context = "\n\n".join(user_msgs) if user_msgs else "(no additional user messages)"
+        asked_context = "\n\n".join(ask_prompts) if ask_prompts else "(no ask_user prompts recorded)"
+
         answer_raw = str(run.vars.get("_temp", {}).get("final_answer") or "")
         answer_excerpt = ""
         if not tool_msgs and answer_raw.strip():
@@ -884,6 +931,8 @@ def create_codeact_workflow(
             "Return JSON ONLY.\n\n"
             f"User request:\n{task}\n\n"
             f"Plan:\n{plan_text}\n\n"
+            f"Recent ask_user prompts:\n{asked_context}\n\n"
+            f"Recent user messages:\n{user_context}\n\n"
             + (f"Current answer (excerpt):\n{answer_excerpt}\n\n" if answer_excerpt else "")
             + f"Tool outputs:\n{observations}\n\n"
             f"Allowed tools:\n{_format_allowed_tools()}\n\n"
