@@ -1,6 +1,6 @@
 # AbstractAgent — Architecture (Current)
 
-> Updated: 2026-01-02  
+> Updated: 2026-01-07  
 > Scope: this describes **what is implemented today** in this monorepo (no “future” design claims).
 
 AbstractAgent is the **agent-pattern library** of the AbstractFramework. It provides portable agent behaviors implemented as:
@@ -9,6 +9,17 @@ AbstractAgent is the **agent-pattern library** of the AbstractFramework. It prov
 - a small **Agent API** wrapper (`BaseAgent`) for start/step/resume/attach/cancel
 
 Agents run on **AbstractRuntime** (durable execution + persistence) and use **AbstractCore** for tool schemas and tool-call parsing.
+
+## High-level agent loop (data flow)
+
+```
+Runtime (durable) executes agent workflow:
+  reason  -> EffectType.LLM_CALL  -> provider response (+ tool_calls)
+  parse   -> decide next action
+  act     -> EffectType.TOOL_CALLS (or runtime memory/user effects)
+  observe -> append observations to context.messages
+  loop until done / max_iterations
+```
 
 ## Repository Layout
 
@@ -57,10 +68,13 @@ Both ReAct and CodeAct store conversation history under `context["messages"]` as
 - Tool **schemas** are `abstractcore.tools.ToolDefinition` objects serialized with `to_dict()`.
 - ReAct stores durable tool metadata under `run.vars["_runtime"]`:
   - `tool_specs`: list of tool schema dicts
-  - `toolset_id`: SHA-256 hash of the ordered tool specs (audit/debug)
+  - `toolset_id`: SHA-256 hash of a **canonical** representation of the tool specs (name-sorted) for stable audit/debug across hosts
   - `allowed_tools`: allowlist of tool names (defaults to the workflow’s tool list; can be overridden durably)
-- The adapter enforces `allowed_tools` before requesting `EffectType.TOOL_CALLS`.
 - Tool **execution** is performed by the runtime’s configured `ToolExecutor` (e.g. `MappingToolExecutor`).
+- **Allowlist enforcement (code reality)**:
+  - the agent adapter passes `allowed_tools` as metadata in the TOOL_CALLS payload,
+  - the runtime-side tool-calls handler enforces it for local execution,
+  - for passthrough/approval modes (external execution), hosts must also treat `allowed_tools` as authoritative (or the runtime should store the filtered list in the wait details).
 
 ### Tool-call parsing robustness
 `ReActLogic.parse_response(...)` parses:
