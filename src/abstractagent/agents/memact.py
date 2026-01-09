@@ -131,6 +131,8 @@ class MemActAgent(BaseAgent):
         review_mode: Optional[bool] = None,
         review_max_rounds: Optional[int] = None,
         allowed_tools: Optional[List[str]] = None,
+        temperature: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> str:
         task = str(task or "").strip()
         if not task:
@@ -168,6 +170,16 @@ class MemActAgent(BaseAgent):
             "review_mode": eff_review_mode,
             "review_max_rounds": eff_review_max_rounds,
         }
+        if temperature is not None:
+            try:
+                runtime_ns["temperature"] = float(temperature)
+            except Exception:
+                pass
+        if seed is not None:
+            try:
+                runtime_ns["seed"] = int(seed)
+            except Exception:
+                pass
         if isinstance(self.session_active_memory, dict):
             runtime_ns["active_memory"] = _deepcopy_json(self.session_active_memory)
         if isinstance(allowed_tools, list):

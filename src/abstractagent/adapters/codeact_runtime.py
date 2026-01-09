@@ -11,6 +11,7 @@ from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
 
+from .generation_params import runtime_llm_params
 from ..logic.codeact import CodeActLogic
 
 
@@ -335,7 +336,7 @@ def create_codeact_workflow(
 
         emit("plan_request", {"tools": allow})
 
-        payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
+        payload: Dict[str, Any] = {"prompt": prompt, "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2})}
         sys = _system_prompt(runtime_ns)
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
@@ -434,8 +435,10 @@ def create_codeact_workflow(
         sys = _system_prompt(runtime_ns) or req.system_prompt
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
+        params: Dict[str, Any] = {}
         if req.max_tokens is not None:
-            payload["params"] = {"max_tokens": req.max_tokens}
+            params["max_tokens"] = req.max_tokens
+        payload["params"] = runtime_llm_params(runtime_ns, extra=params)
 
         return StepPlan(
             node_id="reason",
@@ -1002,7 +1005,7 @@ def create_codeact_workflow(
             "prompt": prompt,
             "response_schema": schema,
             "response_schema_name": "CodeActVerifier",
-            "params": {"temperature": 0.2},
+            "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2}),
         }
         sys = _system_prompt(runtime_ns)
         if sys is not None:

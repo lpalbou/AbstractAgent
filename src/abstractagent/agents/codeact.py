@@ -108,6 +108,8 @@ class CodeActAgent(BaseAgent):
         review_mode: Optional[bool] = None,
         review_max_rounds: Optional[int] = None,
         allowed_tools: Optional[List[str]] = None,
+        temperature: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> str:
         task = str(task or "").strip()
         if not task:
@@ -158,6 +160,16 @@ class CodeActAgent(BaseAgent):
             # Canonical _limits namespace for runtime awareness
             "_limits": limits,
         }
+        if temperature is not None:
+            try:
+                vars["_runtime"]["temperature"] = float(temperature)
+            except Exception:
+                pass
+        if seed is not None:
+            try:
+                vars["_runtime"]["seed"] = int(seed)
+            except Exception:
+                pass
         if isinstance(allowed_tools, list):
             normalized = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
             vars["_runtime"]["allowed_tools"] = normalized

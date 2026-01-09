@@ -11,6 +11,7 @@ from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
 
+from .generation_params import runtime_llm_params
 from ..logic.memact import MemActLogic
 
 
@@ -299,7 +300,7 @@ def create_memact_workflow(
         params: Dict[str, Any] = {"temperature": 0.2 if tool_specs else 0.7}
         if req.max_tokens is not None:
             params["max_tokens"] = req.max_tokens
-        payload["params"] = params
+        payload["params"] = runtime_llm_params(runtime_ns, extra=params)
 
         return StepPlan(
             node_id="reason",
@@ -621,7 +622,7 @@ def create_memact_workflow(
             "system_prompt": system_prompt,
             "response_schema": MEMACT_ENVELOPE_SCHEMA_V1,
             "response_schema_name": "MemActEnvelopeV1",
-            "params": {"temperature": 0.2},
+            "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2}),
         }
 
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")

@@ -11,6 +11,7 @@ from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
 
+from .generation_params import runtime_llm_params
 from ..logic.react import ReActLogic
 
 def _new_message(
@@ -364,7 +365,7 @@ def create_react_workflow(
 
         emit("plan_request", {"tools": allow})
 
-        payload: Dict[str, Any] = {"prompt": prompt, "params": {"temperature": 0.2}}
+        payload: Dict[str, Any] = {"prompt": prompt, "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2})}
         sys = _system_prompt(runtime_ns)
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
@@ -484,7 +485,7 @@ def create_react_workflow(
             params["max_tokens"] = req.max_tokens
         # Tool calling is formatting-sensitive; bias toward deterministic output when tools are present.
         params["temperature"] = 0.2 if tools_payload else 0.7
-        payload["params"] = params
+        payload["params"] = runtime_llm_params(runtime_ns, extra=params)
 
         return StepPlan(
             node_id="reason",
@@ -552,7 +553,7 @@ def create_react_workflow(
         if isinstance(eff_model, str) and eff_model.strip():
             payload["model"] = eff_model.strip()
 
-        payload["params"] = {"temperature": 0.2}
+        payload["params"] = runtime_llm_params(runtime_ns, extra={"temperature": 0.2})
 
         emit("tool_retry_minimal", {"tools": allow, "has_excerpt": bool(bad_excerpt)})
         return StepPlan(
@@ -634,7 +635,7 @@ def create_react_workflow(
             payload["provider"] = eff_provider.strip()
         if isinstance(eff_model, str) and eff_model.strip():
             payload["model"] = eff_model.strip()
-        payload["params"] = {"temperature": 0.2}
+        payload["params"] = runtime_llm_params(runtime_ns, extra={"temperature": 0.2})
 
         emit("empty_response_retry", {"tools": allow, "evidence": bool(evidence_lines)})
         return StepPlan(
@@ -1252,7 +1253,7 @@ def create_react_workflow(
             "prompt": prompt,
             "response_schema": schema,
             "response_schema_name": "ReActVerifier",
-            "params": {"temperature": 0.2},
+            "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2}),
         }
         sys = _system_prompt(runtime_ns)
         if sys is not None:
