@@ -279,9 +279,7 @@ def test_codeact_review_parse_retries_when_incomplete_without_tool_calls() -> No
             },
             "_limits": {"max_history_messages": -1, "max_tokens": 32768},
         },
-    )
-
-    plan = wf.get_node("review_parse")(run, _Ctx())
+    )    plan = wf.get_node("review_parse")(run, _Ctx())
     assert plan.next_node == "review"
     inbox = run.vars["_runtime"].get("inbox")
     assert isinstance(inbox, list) and inbox
