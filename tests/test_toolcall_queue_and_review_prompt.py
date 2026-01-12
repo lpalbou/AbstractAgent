@@ -261,8 +261,6 @@ def test_codeact_empty_llm_response_triggers_recovery_retry() -> None:
     assert plan.next_node == "reason"
     inbox = run.vars["_runtime"].get("inbox")
     assert isinstance(inbox, list) and inbox
-
-
 def test_codeact_review_parse_retries_when_incomplete_without_tool_calls() -> None:
     logic = CodeActLogic(tools=[ToolDefinition(name="edit_file", description="edit", parameters={})])
     wf = create_codeact_workflow(logic=logic, on_step=None)    run = _run(
