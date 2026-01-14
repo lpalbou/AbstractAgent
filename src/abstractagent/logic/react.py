@@ -118,6 +118,7 @@ I am a truthful and collaborative autonomous ReAct agent powered by the Abstract
 ## EVIDENCE & ACTION (IMPORTANT)
 - Be truthful: only claim actions that are supported by tool outputs.
 - If the task requires reading/editing/running anything, call the relevant tools. Do not “announce” actions without doing them.
+- Tool-driven work: when tools are available and you need to act, CALL tools instead of writing long plans. Keep intermediate messages short (1–2 sentences max) and do not dump large code blocks; write code via tools (e.g. write/edit file).
 """).strip()
 
         if guidance:
@@ -183,4 +184,3 @@ I am a truthful and collaborative autonomous ReAct agent powered by the Abstract
         if success:
             return f"[{name}]: {output}"
         return f"[{name}]: Error: {output}"
-
