@@ -71,9 +71,10 @@ class ReActLogic:
         - The user request belongs in the user-role message (prompt), not in the system prompt.
         - Conversation + tool history is provided via `messages` by the runtime adapter.
         """
-        _ = messages  # history is carried out-of-band via chat messages
+        # History is carried out-of-band via `messages`; keep logic pure.
+        _ = messages
 
-        task = str(task or "")
+        task = str(task or "").strip()
         guidance = str(guidance or "").strip()
 
         # Output token cap (provider max_tokens) comes from `_limits.max_output_tokens`.
@@ -84,62 +85,28 @@ class ReActLogic:
                 max_output_tokens = int(max_output_tokens)
             except Exception:
                 max_output_tokens = None
-
-        runtime_ns = (vars or {}).get("_runtime", {})
-        scratchpad = (vars or {}).get("scratchpad", {})
-        plan_mode = bool(runtime_ns.get("plan_mode")) if isinstance(runtime_ns, dict) else False
-        plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
-        plan = str(plan_text).strip() if isinstance(plan_text, str) and plan_text.strip() else ""
-
-        prompt = task.strip()
-
-        output_budget_line = ""
-        if isinstance(max_output_tokens, int) and max_output_tokens > 0:
-            output_budget_line = (
-                f"- Output token limit for this response: {max_output_tokens}.\n"
-            )
+        if not isinstance(max_output_tokens, int) or max_output_tokens <= 0:
+            max_output_tokens = None
 
         system_prompt = (
-            f"CYCLE: {int(iteration)}/{int(max_iterations)}\n\n"
-            """## MY PERSONA
-I am a truthful and highly autonomous ReAct agent powered by the AbstractFramework. I am a creative critical thinker who balances ideas with constructive skepticism and always think of long term consequences of my actions. I strive to be ethical and successful in all my decisions and undertakings. I am precise, clear, concise and provide direct responses avoiding unnecessary verbosity.
-
-## AGENCY / AUTONOMY
-- I start by analyzing the intent behind the user request to identify and further clarify the EXPECTED OUTCOMES
-- I build a plan of actions to achieve the desired outcome
-- DURING each CYCLE, I follow the following steps :
-  - I THINK : I evaluate the current state of the conversation, in particular the previous tool executions, and I list the next best action(s) that can be carried out by the available tools
-  - I ACT : request the execution of the tools(s) you selected in the THINK phase
-  - I OBSERVE : discuss the results of the tool executions and give a feedback on if I achieved the desired outcome. if not, make a recommendation
-- This CYCLE (THINK -> ACT -> OBSERVE) is repeated until I achieve ALL the EXPECTED OUTCOMES and there is no more tools to call
-- My PRIMARY GOAL is to achieve the EXPECTED OUTCOMES by calling iteratively the appropriate set of tools, make discoveries and adjust my next steps
-
-CRITICAL: 
-- I can not execute a tool by myself, I can only request the execution of tools to my host and then observe the results of those executions to adjust my plan
-- I must continue iterating new CYCLES until I achieve ALL the EXPECTED OUTCOMES and there is no more tools to call""").strip()
+            f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
+            "You are an autonomous ReAct agent (Reason → Act → Observe).\n\n"
+            "Loop contract:\n"
+            "- THINK briefly using the full transcript and prior observations.\n"
+            "- If you need to ACT, CALL one or more tools (function calls).\n"
+            "- If you are DONE, respond with the final answer and NO tool calls.\n\n"
+            "Rules:\n"
+            "- Never ask the user which tool to run; choose tools yourself.\n"
+            "- Do not write a long plan before tool calls.\n"
+            "- Use tool outputs as evidence; do not claim actions without tool outputs.\n"
+            "- Continue iterating until the task is complete.\n"
+        ).strip()
 
         if guidance:
-            system_prompt = (system_prompt + "\n\nGuidance:\n" + guidance).strip()
+            system_prompt = f"{system_prompt}\n\nGuidance:\n{guidance}".strip()
 
-        if plan_mode and plan:
-            system_prompt = (system_prompt + "\n\nCurrent plan:\n" + plan).strip()
-
-        if plan_mode:
-            system_prompt = (
-                system_prompt
-                + "\n\nPlan mode:\n"
-                "- Maintain and update the plan as you work.\n"
-                "- If the plan changes, include a final section at the END of your message:\n"
-                "  Plan Update:\n"
-                "  <markdown checklist>\n"
-            ).strip()
-
-        return LLMRequest(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            tools=self.tools,
-            max_tokens=max_output_tokens,
-        )
+        # Note: prompt is unused by the runtime adapter (we supply chat `messages`).
+        return LLMRequest(prompt=task, system_prompt=system_prompt, tools=self.tools, max_tokens=max_output_tokens)
 
     def parse_response(self, response: Any) -> Tuple[str, List[ToolCall]]:
         if not isinstance(response, dict):

@@ -132,3 +132,32 @@ def test_react_workflow_can_disable_tool_examples_in_payload() -> None:
     assert isinstance(specs, list)
     assert specs
     assert "examples" not in specs[0]
+
+
+def test_react_workflow_supports_system_prompt_extra_append() -> None:
+    tool_a = ToolDefinition(name="tool_a", description="A", parameters={})
+
+    wf = create_react_workflow(
+        logic=ReActLogic(tools=[tool_a]),
+        workflow_id="wf",
+        allowed_tools=["tool_a"],
+    )
+
+    vars = _base_vars(allowed_tools=["tool_a"])
+    runtime_ns = vars.get("_runtime")
+    assert isinstance(runtime_ns, dict)
+    runtime_ns["system_prompt_extra"] = "EXTRA"
+
+    run = _run(vars=vars)
+    wf.get_node("init")(run, _Ctx())
+
+    plan = wf.get_node("reason")(run, _Ctx())
+    assert plan.effect is not None
+    assert plan.effect.type == EffectType.LLM_CALL
+
+    payload = plan.effect.payload if isinstance(plan.effect.payload, dict) else {}
+    system_prompt = payload.get("system_prompt")
+    assert isinstance(system_prompt, str)
+    assert "autonomous ReAct agent" in system_prompt
+    assert "Additional system instructions:" in system_prompt
+    assert "EXTRA" in system_prompt

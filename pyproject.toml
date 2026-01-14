@@ -23,3 +23,10 @@ where = ["src"]
 
 [project.scripts]
 react-agent = "abstractagent.repl:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "basic: Level A (contract/unit) tests",
+    "integration: Level B (integration/local) tests",
+    "e2e: Level C (end-to-end/real infra) tests (opt-in)",
+]

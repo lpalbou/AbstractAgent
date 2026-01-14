@@ -152,14 +152,16 @@ class ReactAgent(BaseAgent):
         limits.setdefault("max_message_chars", -1)
         limits.setdefault("max_tool_message_chars", -1)
         limits["estimated_tokens_used"] = 0
+        # ReAct output-token capping is controlled via `_limits.max_output_tokens`.
+        # Policy: unset by default (None) to avoid artificial truncation.
         try:
-            max_tokens_override = int(self._max_tokens) if self._max_tokens is not None else None
+            max_output_tokens_override = int(self._max_tokens) if self._max_tokens is not None else None
         except Exception:
-            max_tokens_override = None
-        if isinstance(max_tokens_override, int) and max_tokens_override > 0:
-            limits["max_tokens"] = max_tokens_override
-        if not isinstance(limits.get("max_tokens"), int) or int(limits.get("max_tokens") or 0) <= 0:
-            limits["max_tokens"] = 32768
+            max_output_tokens_override = None
+        if isinstance(max_output_tokens_override, int) and max_output_tokens_override > 0:
+            limits["max_output_tokens"] = max_output_tokens_override
+        else:
+            limits.setdefault("max_output_tokens", None)
 
         vars: Dict[str, Any] = {
             "context": {"task": task, "messages": _copy_messages(self.session_messages)},

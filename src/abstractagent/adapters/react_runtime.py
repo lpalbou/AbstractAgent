@@ -1,18 +1,32 @@
-"""AbstractRuntime adapter for ReAct-like agents."""
+"""AbstractRuntime adapter for canonical ReAct agents.
+
+This adapter implements a deterministic ReAct loop:
+
+  init → reason → parse → (act → observe → reason)* → done
+
+Policy (for now):
+- Do NOT truncate ReAct loop context (history/scratchpad).
+- Do NOT cap tool-steps to tiny token budgets.
+- Do NOT require "FINAL:" markers or other termination hacks.
+
+The loop continues whenever the model emits tool calls.
+It ends only when the model emits **no tool calls** and provides an answer.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractcore.tools import ToolCall
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
-from abstractruntime.memory.active_context import ActiveContextPolicy
 
 from .generation_params import runtime_llm_params
 from ..logic.react import ReActLogic
+
 
 def _new_message(
     ctx: Any,
@@ -43,12 +57,47 @@ def _new_message(
     }
 
 
-def ensure_react_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-    """Ensure namespaced vars exist and migrate legacy flat keys in-place.
+def _new_assistant_message_with_tool_calls(
+    ctx: Any,
+    *,
+    content: str,
+    tool_calls: List[ToolCall],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Create an assistant message that preserves tool call metadata for OpenAI transcripts."""
 
-    Returns:
-        Tuple of (context, scratchpad, runtime_ns, temp, limits) dicts.
-    """
+    msg = _new_message(ctx, role="assistant", content=content, metadata=metadata)
+
+    tc_payload: list[dict[str, Any]] = []
+    for i, tc in enumerate(tool_calls):
+        if not isinstance(tc, ToolCall):
+            continue
+        name = str(tc.name or "").strip()
+        if not name:
+            continue
+        call_id = tc.call_id
+        call_id_str = str(call_id).strip() if call_id is not None else ""
+        if not call_id_str:
+            call_id_str = f"call_{i+1}"
+        args = tc.arguments if isinstance(tc.arguments, dict) else {}
+        tc_payload.append(
+            {
+                "type": "function",
+                "id": call_id_str,
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            }
+        )
+
+    if tc_payload:
+        msg["tool_calls"] = tc_payload
+    return msg
+
+
+def ensure_react_vars(
+    run: RunState,
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Ensure namespaced vars exist and migrate legacy flat keys in-place."""
+
     ensure_namespaces(run.vars)
     limits = ensure_limits(run.vars)
     context = run.vars["context"]
@@ -76,6 +125,9 @@ def ensure_react_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Di
     if not isinstance(runtime_ns.get("inbox"), list):
         runtime_ns["inbox"] = []
 
+    if not isinstance(scratchpad.get("cycles"), list):
+        scratchpad["cycles"] = []
+
     iteration = scratchpad.get("iteration")
     if not isinstance(iteration, int):
         try:
@@ -91,13 +143,9 @@ def ensure_react_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Di
             scratchpad["max_iterations"] = int(max_iterations)
         except (TypeError, ValueError):
             scratchpad["max_iterations"] = 25
-
     if scratchpad["max_iterations"] < 1:
         scratchpad["max_iterations"] = 1
 
-    # Track whether any external tools were actually executed during this run.
-    # This is used to reliably trigger a final "synthesis" pass so the agent
-    # returns a user-facing answer instead of echoing tool observations.
     used_tools = scratchpad.get("used_tools")
     if not isinstance(used_tools, bool):
         scratchpad["used_tools"] = bool(used_tools) if used_tools is not None else False
@@ -110,6 +158,181 @@ def _compute_toolset_id(tool_specs: List[Dict[str, Any]]) -> str:
     payload = json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()
     return f"ts_{digest}"
+
+
+def _tool_call_signature(name: str, args: Any) -> str:
+    n = str(name or "").strip() or "tool"
+    if not isinstance(args, dict) or not args:
+        return f"{n}()"
+    try:
+        arg_str = json.dumps(args, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        arg_str = str(args)
+    return f"{n}({arg_str})"
+
+
+_PLANISH_RE = re.compile(
+    r"(?i)\b("
+    r"let me|let's|i will|i'll|first|next|then|start by|i need to|we need to|"
+    r"i should|plan|set up|setup|create the project|implement|proceed"
+    r")\b"
+)
+
+
+def _looks_like_plan(text: str) -> bool:
+    s = str(text or "").strip()
+    if not s:
+        return False
+    # Heuristic: planning language + no obvious "final" framing.
+    if not _PLANISH_RE.search(s):
+        return False
+    if re.search(r"(?i)\b(final answer|here is|done|completed|in summary)\b", s):
+        return False
+    return True
+
+
+def _push_inbox(runtime_ns: Dict[str, Any], content: str) -> None:
+    if not isinstance(runtime_ns, dict):
+        return
+    inbox = runtime_ns.get("inbox")
+    if not isinstance(inbox, list):
+        inbox = []
+        runtime_ns["inbox"] = inbox
+    inbox.append({"role": "system", "content": str(content or "")})
+
+
+def _drain_inbox(runtime_ns: Dict[str, Any]) -> str:
+    inbox = runtime_ns.get("inbox")
+    if not isinstance(inbox, list) or not inbox:
+        return ""
+    parts: list[str] = []
+    for m in inbox:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and c.strip():
+            parts.append(c.strip())
+    runtime_ns["inbox"] = []
+    return "\n".join(parts).strip()
+
+def _system_prompt_override(runtime_ns: Dict[str, Any]) -> Optional[str]:
+    raw = runtime_ns.get("system_prompt") if isinstance(runtime_ns, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _system_prompt_extra(runtime_ns: Dict[str, Any]) -> Optional[str]:
+    raw = runtime_ns.get("system_prompt_extra") if isinstance(runtime_ns, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _compose_system_prompt(runtime_ns: Dict[str, Any], *, base: str) -> str:
+    override = _system_prompt_override(runtime_ns)
+    extra = _system_prompt_extra(runtime_ns)
+    sys = override if override is not None else base
+    if extra:
+        sys = f"{sys.rstrip()}\n\nAdditional system instructions:\n{extra}"
+    return sys.strip()
+
+
+def _max_output_tokens(runtime_ns: Dict[str, Any], limits: Dict[str, Any]) -> Optional[int]:
+    # Canonical limit: _limits.max_output_tokens (None = unset).
+    raw = None
+    if isinstance(limits, dict) and "max_output_tokens" in limits:
+        raw = limits.get("max_output_tokens")
+    if raw is None and isinstance(runtime_ns, dict):
+        raw = runtime_ns.get("max_output_tokens")
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+    except Exception:
+        return None
+    return val if val > 0 else None
+
+
+def _render_cycles_for_system_prompt(scratchpad: Dict[str, Any]) -> str:
+    cycles = scratchpad.get("cycles")
+    if not isinstance(cycles, list) or not cycles:
+        return ""
+
+    lines: list[str] = []
+    for c in cycles:
+        if not isinstance(c, dict):
+            continue
+        i = c.get("i")
+        thought = str(c.get("thought") or "").strip()
+        tcs = c.get("tool_calls")
+        obs = c.get("observations")
+        if i is None:
+            continue
+        lines.append(f"[cycle {i}]")
+        if thought:
+            lines.append(f"thought: {thought}")
+        if isinstance(tcs, list) and tcs:
+            sigs: list[str] = []
+            for tc in tcs:
+                if isinstance(tc, dict):
+                    sigs.append(_tool_call_signature(tc.get("name", ""), tc.get("arguments")))
+            if sigs:
+                lines.append("actions:")
+                for s in sigs:
+                    lines.append(f"- {s}")
+        if isinstance(obs, list) and obs:
+            lines.append("observations:")
+            for o in obs:
+                if not isinstance(o, dict):
+                    continue
+                name = str(o.get("name") or "tool")
+                ok = bool(o.get("success"))
+                out = o.get("output")
+                err = o.get("error")
+                text = str(out if ok else (err or out) or "").strip()
+                lines.append(f"- [{name}] {'OK' if ok else 'ERR'}: {text}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _render_final_report(task: str, scratchpad: Dict[str, Any]) -> str:
+    cycles = scratchpad.get("cycles")
+    if not isinstance(cycles, list):
+        cycles = []
+    lines: list[str] = []
+    lines.append(f"task: {task}")
+    lines.append(f"cycles: {len([c for c in cycles if isinstance(c, dict)])}")
+    lines.append("")
+    for c in cycles:
+        if not isinstance(c, dict):
+            continue
+        i = c.get("i")
+        lines.append(f"cycle {i}")
+        thought = str(c.get("thought") or "").strip()
+        if thought:
+            lines.append(f"- thought: {thought}")
+        tcs = c.get("tool_calls")
+        if isinstance(tcs, list) and tcs:
+            lines.append("- actions:")
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                lines.append(f"  - {_tool_call_signature(tc.get('name',''), tc.get('arguments'))}")
+        obs = c.get("observations")
+        if isinstance(obs, list) and obs:
+            lines.append("- observations:")
+            for o in obs:
+                if not isinstance(o, dict):
+                    continue
+                name = str(o.get("name") or "tool")
+                ok = bool(o.get("success"))
+                out = o.get("output")
+                err = o.get("error")
+                text = str(out if ok else (err or out) or "").strip()
+                lines.append(f"  - [{name}] {'OK' if ok else 'ERR'}: {text}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def create_react_workflow(
@@ -128,7 +351,6 @@ def create_react_workflow(
             on_step(step, data)
 
     def _current_tool_defs() -> list[Any]:
-        """Return the current tool definitions from the logic (dynamic)."""
         defs = getattr(logic, "tools", None)
         if not isinstance(defs, list):
             try:
@@ -149,7 +371,6 @@ def create_react_workflow(
         if isinstance(allowed_tools, list):
             allow = [str(t).strip() for t in allowed_tools if isinstance(t, str) and t.strip()]
             return allow if allow else []
-        # Default allowlist: all tools currently known to the logic (deduped, order preserved).
         out: list[str] = []
         seen: set[str] = set()
         for t in _current_tool_defs():
@@ -161,7 +382,6 @@ def create_react_workflow(
         return out
 
     def _normalize_allowlist(raw: Any) -> list[str]:
-        items: list[Any]
         if isinstance(raw, list):
             items = raw
         elif isinstance(raw, tuple):
@@ -171,26 +391,20 @@ def create_react_workflow(
         else:
             items = []
 
+        current = _tool_by_name()
         out: list[str] = []
         seen: set[str] = set()
-        current = _tool_by_name()
         for t in items:
             if not isinstance(t, str):
                 continue
             name = t.strip()
-            if not name:
-                continue
-            if name in seen:
-                continue
-            # Only accept tool names known to the workflow's logic (dynamic).
-            if name not in current:
+            if not name or name in seen or name not in current:
                 continue
             seen.add(name)
             out.append(name)
         return out
 
     def _effective_allowlist(runtime_ns: Dict[str, Any]) -> list[str]:
-        # Allow runtime vars to override tool selection (Visual Agent tools pin).
         if isinstance(runtime_ns, dict) and "allowed_tools" in runtime_ns:
             normalized = _normalize_allowlist(runtime_ns.get("allowed_tools"))
             runtime_ns["allowed_tools"] = normalized
@@ -206,650 +420,288 @@ def create_react_workflow(
                 out.append(tool)
         return out
 
-    def _system_prompt(runtime_ns: Dict[str, Any]) -> Optional[str]:
-        raw = runtime_ns.get("system_prompt") if isinstance(runtime_ns, dict) else None
-        if isinstance(raw, str) and raw.strip():
+    def _tool_prompt_examples_enabled(runtime_ns: Dict[str, Any]) -> bool:
+        raw = runtime_ns.get("tool_prompt_examples") if isinstance(runtime_ns, dict) else None
+        if raw is None:
+            return True
+        if isinstance(raw, bool):
             return raw
-        return None
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {"0", "false", "no", "off", "disabled"}:
+                return False
+            if lowered in {"1", "true", "yes", "on", "enabled"}:
+                return True
+        return True
 
-    def _sanitize_llm_messages(messages: Any, *, limits: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
-        """Convert runtime-owned message dicts into OpenAI-style {role, content, ...}.
+    def _materialize_tool_specs(defs: list[Any], *, include_examples: bool) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for t in defs:
+            try:
+                d = t.to_dict()
+            except Exception:
+                continue
+            if isinstance(d, dict):
+                if not include_examples:
+                    d = dict(d)
+                    d.pop("examples", None)
+                out.append(d)
+        return out
 
-        Runtime messages can include extra metadata fields (`timestamp`, `metadata`) that many providers
-        will reject. Keep only the fields the LLM API expects.
-        """
+    def _sanitize_llm_messages(messages: Any) -> List[Dict[str, Any]]:
         if not isinstance(messages, list) or not messages:
             return []
-        # Keep the LLM-visible context bounded even if the durable history contains large
-        # tool outputs or code dumps.
-        def _limit_int(key: str, default: int) -> int:
-            if not isinstance(limits, dict):
-                return default
-            try:
-                return int(limits.get(key, default))
-            except Exception:
-                return default
-        max_message_chars = _limit_int("max_message_chars", -1)
-        max_tool_message_chars = _limit_int("max_tool_message_chars", -1)
+        out: List[Dict[str, Any]] = []
 
-        def _truncate(text: str, *, max_chars: int) -> str:
-            if max_chars <= 0:
-                return text
-            if len(text) <= max_chars:
-                return text
-            suffix = f"\n… (truncated, {len(text):,} chars total)"
-            keep = max_chars - len(suffix)
-            if keep < 200:
-                keep = max_chars
-                suffix = ""
-            return text[:keep].rstrip() + suffix
+        def _sanitize_tool_calls(raw: Any) -> Optional[list[dict[str, Any]]]:
+            if not isinstance(raw, list) or not raw:
+                return None
+            cleaned: list[dict[str, Any]] = []
+            for i, tc in enumerate(raw):
+                if not isinstance(tc, dict):
+                    continue
+                tc_type = str(tc.get("type") or "function")
+                if tc_type != "function":
+                    continue
+                call_id = tc.get("id")
+                call_id_str = str(call_id).strip() if call_id is not None else ""
+                if not call_id_str:
+                    call_id_str = f"call_{i+1}"
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                name = str(fn.get("name") or "").strip()
+                if not name:
+                    continue
+                args = fn.get("arguments")
+                if isinstance(args, dict):
+                    args_str = json.dumps(args, ensure_ascii=False)
+                else:
+                    args_str = "" if args is None else str(args)
+                cleaned.append({"type": "function", "id": call_id_str, "function": {"name": name, "arguments": args_str}})
+            return cleaned or None
 
-        out: List[Dict[str, str]] = []
         for m in messages:
             if not isinstance(m, dict):
                 continue
             role = str(m.get("role") or "").strip()
+            if not role:
+                continue
             content = m.get("content")
-            if not role or content is None:
+            content_str = "" if content is None else str(content)
+            tool_calls_raw = m.get("tool_calls")
+            tool_calls = _sanitize_tool_calls(tool_calls_raw)
+
+            # Assistant tool-calls messages may legitimately have empty content, but must still be included.
+            if not content_str.strip() and not (role == "assistant" and tool_calls):
                 continue
-            content_str = str(content)
-            if not content_str.strip():
-                continue
-            limit = max_tool_message_chars if role == "tool" else max_message_chars
-            entry: Dict[str, str] = {"role": role, "content": _truncate(content_str, max_chars=limit)}
+
+            entry: Dict[str, Any] = {"role": role, "content": content_str}
             if role == "tool":
                 meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
                 call_id = meta.get("call_id") if isinstance(meta, dict) else None
                 if call_id is not None and str(call_id).strip():
-                    # OpenAI-compatible servers accept `tool_call_id` for tool messages.
                     entry["tool_call_id"] = str(call_id).strip()
+            elif role == "assistant" and tool_calls:
+                entry["tool_calls"] = tool_calls
             out.append(entry)
         return out
 
-    def _flag(runtime_ns: Dict[str, Any], key: str, *, default: bool = False) -> bool:
-        if not isinstance(runtime_ns, dict) or key not in runtime_ns:
-            return bool(default)
-        val = runtime_ns.get(key)
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, (int, float)):
-            return bool(val)
-        if isinstance(val, str):
-            lowered = val.strip().lower()
-            if lowered in ("1", "true", "yes", "on", "enabled"):
-                return True
-            if lowered in ("0", "false", "no", "off", "disabled"):
-                return False
-        return bool(default)
-
-    def _int(runtime_ns: Dict[str, Any], key: str, *, default: int) -> int:
-        if not isinstance(runtime_ns, dict) or key not in runtime_ns:
-            return int(default)
-        val = runtime_ns.get(key)
-        try:
-            return int(val)  # type: ignore[arg-type]
-        except Exception:
-            return int(default)
-
-    def _extract_plan_update(content: str) -> Optional[str]:
-        """Extract a plan update block from model content (best-effort).
-
-        Convention (prompted in Plan mode): the model appends a final section:
-
-            Plan Update:
-            - [ ] ...
-            - [x] ...
-        """
-        if not isinstance(content, str) or not content.strip():
-            return None
-        import re
-
-        lines = content.splitlines()
-        header_idx: Optional[int] = None
-        for i, line in enumerate(lines):
-            if re.match(r"(?i)^\s*plan\s*update\s*:\s*$", line.strip()):
-                header_idx = i
-        if header_idx is None:
-            return None
-        plan_lines = lines[header_idx + 1 :]
-        while plan_lines and not plan_lines[0].strip():
-            plan_lines.pop(0)
-        plan_text = "\n".join(plan_lines).strip()
-        if not plan_text:
-            return None
-        # Require at least one bullet/numbered line to avoid accidental captures.
-        if not re.search(r"(?m)^\s*(?:[-*]|\d+\.)\s+", plan_text):
-            return None
-        return plan_text
+    builtin_effect_tools = {
+        "ask_user",
+        "recall_memory",
+        "inspect_vars",
+        "remember",
+        "remember_note",
+        "compact_memory",
+    }
 
     def init_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_react_vars(run)
+
         scratchpad["iteration"] = 0
         limits["current_iteration"] = 0
 
+        # Disable runtime-level input trimming for ReAct loops.
+        if isinstance(runtime_ns, dict):
+            runtime_ns.setdefault("disable_input_trimming", True)
+        # Disable all truncation/capping knobs for ReAct runs (policy: full context for now).
+        # These can be re-enabled later once correctness is proven.
+        if isinstance(limits, dict):
+            limits["max_output_tokens"] = None
+            limits["max_input_tokens"] = None
+            limits["max_history_messages"] = -1
+            limits["max_message_chars"] = -1
+            limits["max_tool_message_chars"] = -1
+
         task = str(context.get("task", "") or "")
         context["task"] = task
-        messages = context["messages"]
+        msgs = context.get("messages")
+        if not isinstance(msgs, list):
+            msgs = []
+            context["messages"] = msgs
 
-        if task and (not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != task):
-            messages.append(_new_message(ctx, role="user", content=task))
+        if task and (not msgs or msgs[-1].get("role") != "user" or msgs[-1].get("content") != task):
+            msgs.append(_new_message(ctx, role="user", content=task))
 
-        # Ensure toolset metadata is present for audit/debug.
         allow = _effective_allowlist(runtime_ns)
         allowed_defs = _allowed_tool_defs(allow)
-        tool_specs = [t.to_dict() for t in allowed_defs]
+        include_examples = _tool_prompt_examples_enabled(runtime_ns)
+        tool_specs = _materialize_tool_specs(allowed_defs, include_examples=include_examples)
         runtime_ns["tool_specs"] = tool_specs
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
-        runtime_ns.setdefault("inbox", [])
 
-        emit("init", {"task": task})
-        if _flag(runtime_ns, "plan_mode", default=False) and not isinstance(scratchpad.get("plan"), str):
-            return StepPlan(node_id="init", next_node="plan")
+        scratchpad.setdefault("cycles", [])
         return StepPlan(node_id="init", next_node="reason")
-
-    def plan_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, runtime_ns, _, _ = ensure_react_vars(run)
-        task = str(context.get("task", "") or "")
-
-        allow = _effective_allowlist(runtime_ns)
-
-        prompt = (
-            "You are preparing a high-level execution plan for the user's request.\n"
-            "Return a concise TODO list (5–12 steps) that is actionable and verifiable.\n"
-            "Do not call tools yet. Do not include role prefixes like 'assistant:'.\n\n"
-            f"User request:\n{task}\n\n"
-            "Plan (markdown checklist):\n"
-            "- [ ] ...\n"
-        )
-
-        emit("plan_request", {"tools": allow})
-
-        payload: Dict[str, Any] = {"prompt": prompt, "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2})}
-        sys = _system_prompt(runtime_ns)
-        if isinstance(sys, str) and sys.strip():
-            payload["system_prompt"] = sys
-        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
-        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
-        if isinstance(eff_provider, str) and eff_provider.strip():
-            payload["provider"] = eff_provider.strip()
-        if isinstance(eff_model, str) and eff_model.strip():
-            payload["model"] = eff_model.strip()
-
-        return StepPlan(
-            node_id="plan",
-            effect=Effect(
-                type=EffectType.LLM_CALL,
-                payload=payload,
-                result_key="_temp.plan_llm_response",
-            ),
-            next_node="plan_parse",
-        )
-
-    def plan_parse_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, temp, _ = ensure_react_vars(run)
-        resp = temp.get("plan_llm_response", {})
-        if not isinstance(resp, dict):
-            resp = {}
-        plan_text = resp.get("content")
-        plan = "" if plan_text is None else str(plan_text).strip()
-        if not plan and isinstance(resp.get("data"), dict):
-            plan = json.dumps(resp.get("data"), ensure_ascii=False, indent=2).strip()
-
-        scratchpad["plan"] = plan
-        temp.pop("plan_llm_response", None)
-
-        if plan:
-            context["messages"].append(_new_message(ctx, role="assistant", content=plan, metadata={"kind": "plan"}))
-        emit("plan", {"plan": plan})
-        return StepPlan(node_id="plan_parse", next_node="reason")
 
     def reason_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_react_vars(run)
 
-        # Read from _limits (canonical) with fallback to scratchpad (backward compat)
-        if "current_iteration" in limits:
-            iteration = int(limits.get("current_iteration", 0) or 0)
-            max_iterations = int(limits.get("max_iterations", 25) or 25)
-        else:
-            # Backward compatibility: use scratchpad
-            iteration = int(scratchpad.get("iteration", 0) or 0)
-            max_iterations = int(scratchpad.get("max_iterations") or 25)
-
+        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
         if max_iterations < 1:
             max_iterations = 1
 
-        if iteration >= max_iterations:
+        iteration = int(scratchpad.get("iteration", 0) or 0) + 1
+        if iteration > max_iterations:
             return StepPlan(node_id="reason", next_node="max_iterations")
 
-        # Update both for transition period
-        scratchpad["iteration"] = iteration + 1
-        limits["current_iteration"] = iteration + 1
+        scratchpad["iteration"] = iteration
+        limits["current_iteration"] = iteration
 
         task = str(context.get("task", "") or "")
-        messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
+        messages_view = list(context.get("messages") or [])
 
-        # Refresh tool metadata BEFORE rendering Active Memory so token fitting stays accurate
-        # (even though we do not render a "Tools (session)" block into Active Memory prompts).
-        allow = _effective_allowlist(runtime_ns)
-        allowed_defs = _allowed_tool_defs(allow)
-        tool_specs = [t.to_dict() for t in allowed_defs]
-        include_examples = bool(runtime_ns.get("tool_prompt_examples", True))
-        if not include_examples:
-            tool_specs = [{k: v for k, v in spec.items() if k != "examples"} for spec in tool_specs if isinstance(spec, dict)]
-        runtime_ns["tool_specs"] = tool_specs
-        runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
-        runtime_ns.setdefault("allowed_tools", allow)
-
-        inbox = runtime_ns.get("inbox", [])
-        guidance = ""
-        if isinstance(inbox, list) and inbox:
-            inbox_messages = [str(m.get("content", "") or "") for m in inbox if isinstance(m, dict)]
-            guidance = " | ".join([m for m in inbox_messages if m])
-            runtime_ns["inbox"] = []
+        guidance = _drain_inbox(runtime_ns)
         req = logic.build_request(
             task=task,
             messages=messages_view,
             guidance=guidance,
-            iteration=iteration + 1,
+            iteration=iteration,
             max_iterations=max_iterations,
-            vars=run.vars,  # Pass vars for _limits access
+            vars=run.vars,
         )
 
-        emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
+        emit("reason", {"iteration": iteration, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
-        # Provide the selected active-context messages as proper chat messages (sanitized).
-        #
-        # IMPORTANT: When we send `messages`, do not also send a non-empty `prompt`.
-        # Some providers/servers will append `prompt` as an extra user message even when the
-        # current request is already present in `messages`, which duplicates user turns and
-        # wastes context budget.
         payload: Dict[str, Any] = {"prompt": ""}
-        payload["messages"] = _sanitize_llm_messages(messages_view, limits=limits)
-        tools_payload = list(tool_specs)
-        if tools_payload:
-            payload["tools"] = tools_payload
-        sys = _system_prompt(runtime_ns) or req.system_prompt
-        if isinstance(sys, str) and sys.strip():
+        payload["messages"] = _sanitize_llm_messages(messages_view)
+
+        tool_specs = runtime_ns.get("tool_specs") if isinstance(runtime_ns, dict) else None
+        if isinstance(tool_specs, list) and tool_specs:
+            payload["tools"] = list(tool_specs)
+
+        sys_base = str(req.system_prompt or "").strip()
+        sys = _compose_system_prompt(runtime_ns, base=sys_base)
+        # Append scratchpad only when not using a full override prompt.
+        if _system_prompt_override(runtime_ns) is None:
+            scratch_txt = _render_cycles_for_system_prompt(scratchpad)
+            if scratch_txt:
+                sys = f"{sys.rstrip()}\n\n## Scratchpad (ReAct cycles so far)\n{scratch_txt}".strip()
+        if sys:
             payload["system_prompt"] = sys
-        # Provider/model can be configured statically (create_react_workflow args)
-        # or injected dynamically through durable vars in `_runtime` (Visual Agent pins).
+
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
         eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
         if isinstance(eff_provider, str) and eff_provider.strip():
             payload["provider"] = eff_provider.strip()
         if isinstance(eff_model, str) and eff_model.strip():
             payload["model"] = eff_model.strip()
+
         params: Dict[str, Any] = {}
-        if req.max_tokens is not None:
-            params["max_tokens"] = req.max_tokens
-        # Tool calling is formatting-sensitive; bias toward deterministic output when tools are present.
-        params["temperature"] = 0.2 if tools_payload else 0.7
+        max_out = _max_output_tokens(runtime_ns, limits)
+        if isinstance(max_out, int) and max_out > 0:
+            params["max_tokens"] = max_out
         payload["params"] = runtime_llm_params(runtime_ns, extra=params)
 
         return StepPlan(
             node_id="reason",
-            effect=Effect(
-                type=EffectType.LLM_CALL,
-                payload=payload,
-                result_key="_temp.llm_response",
-            ),
-            next_node="parse",
-        )
-
-    def tool_retry_minimal_node(run: RunState, ctx) -> StepPlan:
-        """Recovery path when the model fabricates `observation[...]` logs instead of calling tools.
-
-        This intentionally sends a minimal prompt (no History/Scratchpad) to reduce
-        long-context contamination and force either a real tool call or a direct answer.
-        """
-        context, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
-        task = str(context.get("task", "") or "")
-
-        allow = _effective_allowlist(runtime_ns)
-        allowed_defs = _allowed_tool_defs(allow)
-        tool_specs = [t.to_dict() for t in allowed_defs]
-        include_examples = bool(runtime_ns.get("tool_prompt_examples", True))
-        if not include_examples:
-            tool_specs = [{k: v for k, v in spec.items() if k != "examples"} for spec in tool_specs if isinstance(spec, dict)]
-        runtime_ns["tool_specs"] = tool_specs
-        runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
-        runtime_ns.setdefault("allowed_tools", allow)
-        # Reuse the canonical agent rules from ReActLogic (but do not include history in prompt).
-        sys_req = logic.build_request(task=task, messages=[], guidance="", iteration=0, max_iterations=0, vars=run.vars)
-
-        bad_excerpt = str(temp.get("tool_retry_bad_content") or "").strip()
-        temp.pop("tool_retry_bad_content", None)
-        if len(bad_excerpt) > 240:
-            bad_excerpt = bad_excerpt[:240].rstrip() + "…"
-
-        prompt = (
-            "Task:\n"
-            f"{task}\n\n"
-            "Your previous message was invalid: it contained fabricated `observation[...]` tool logs, but no tool was called.\n\n"
-            "Now do ONE of the following:\n"
-            "1) If you need more information to answer correctly, CALL ONE OR MORE TOOLS now using the required tool call format.\n"
-            "2) If you can answer without tools, answer directly WITHOUT mentioning any tool calls or observations.\n\n"
-            "Rules:\n"
-            "- Do NOT write `observation[` anywhere.\n"
-            "- Do NOT fabricate tool results.\n"
-            "- If you call tools, output ONLY tool call block(s) (no extra text).\n"
-            "- You MAY batch multiple tool calls by repeating the tool-call block once per call (prefer independent calls).\n"
-        )
-        if bad_excerpt:
-            prompt += f"\nBad output excerpt (do not copy):\n{bad_excerpt}\n"
-
-        payload: Dict[str, Any] = {"prompt": prompt}
-        if tool_specs:
-            payload["tools"] = tool_specs
-        sys = _system_prompt(runtime_ns) or sys_req.system_prompt
-        if isinstance(sys, str) and sys.strip():
-            payload["system_prompt"] = sys
-
-        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
-        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
-        if isinstance(eff_provider, str) and eff_provider.strip():
-            payload["provider"] = eff_provider.strip()
-        if isinstance(eff_model, str) and eff_model.strip():
-            payload["model"] = eff_model.strip()
-
-        payload["params"] = runtime_llm_params(runtime_ns, extra={"temperature": 0.2})
-
-        emit("tool_retry_minimal", {"tools": allow, "has_excerpt": bool(bad_excerpt)})
-        return StepPlan(
-            node_id="tool_retry_minimal",
-            effect=Effect(
-                type=EffectType.LLM_CALL,
-                payload=payload,
-                result_key="_temp.llm_response",
-            ),
-            next_node="parse",
-        )
-
-    def empty_response_retry_node(run: RunState, ctx) -> StepPlan:
-        """Recovery path when the model returns an empty message (no content, no tool calls).
-
-        This is treated as an invalid agent step. We re-prompt with the original task plus
-        recent tool evidence and explicitly require either tool calls or a substantive answer.
-        """
-        context, scratchpad, runtime_ns, _, _ = ensure_react_vars(run)
-        task = str(context.get("task", "") or "")
-
-        allow = _effective_allowlist(runtime_ns)
-        allowed_defs = _allowed_tool_defs(allow)
-        tool_specs = [t.to_dict() for t in allowed_defs]
-        include_examples = bool(runtime_ns.get("tool_prompt_examples", True))
-        if not include_examples:
-            tool_specs = [{k: v for k, v in spec.items() if k != "examples"} for spec in tool_specs if isinstance(spec, dict)]
-        runtime_ns["tool_specs"] = tool_specs
-        runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
-        runtime_ns.setdefault("allowed_tools", allow)
-
-        # Include recent tool outputs and user messages as evidence (bounded).
-        messages = list(context.get("messages") or [])
-        evidence_lines: list[str] = []
-        tool_count = 0
-        user_count = 0
-        for m in reversed(messages):
-            if not isinstance(m, dict):
-                continue
-            role = m.get("role")
-            content = m.get("content")
-            if role == "tool" and isinstance(content, str) and content.strip():
-                evidence_lines.append(content.strip())
-                tool_count += 1
-            elif role == "user" and isinstance(content, str) and content.strip():
-                # Avoid duplicating the original task.
-                if content.strip() != task.strip():
-                    evidence_lines.append(content.strip())
-                    user_count += 1
-            if tool_count >= 6 and user_count >= 2:
-                break
-        evidence_lines.reverse()
-        evidence = "\n\n".join(evidence_lines) if evidence_lines else "(no prior evidence captured)"
-
-        # Build a strong corrective prompt. Prefer tools; allow a direct answer if truly possible.
-        prompt = (
-            "The previous assistant message was EMPTY (no content and no tool calls). This is invalid.\n"
-            "Recover by continuing the task using the evidence below.\n\n"
-            f"Task:\n{task}\n\n"
-            f"Evidence (recent tool outputs + user messages):\n{evidence}\n\n"
-            "Now do EXACTLY ONE of the following:\n"
-            "1) CALL one or more tools to make progress (preferred).\n"
-            "2) If you already have enough evidence, provide a concise final answer.\n\n"
-            "Rules:\n"
-            "- Do not output an empty message.\n"
-            "- Do not ask the user a question in plain text; use the `ask_user` tool.\n"
-            "- If you call tools, include the tool call(s) directly (no preamble).\n"
-        )
-
-        payload: Dict[str, Any] = {"prompt": prompt}
-        if tool_specs:
-            payload["tools"] = list(tool_specs)
-        sys = _system_prompt(runtime_ns)
-        if isinstance(sys, str) and sys.strip():
-            payload["system_prompt"] = sys
-        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
-        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
-        if isinstance(eff_provider, str) and eff_provider.strip():
-            payload["provider"] = eff_provider.strip()
-        if isinstance(eff_model, str) and eff_model.strip():
-            payload["model"] = eff_model.strip()
-        payload["params"] = runtime_llm_params(runtime_ns, extra={"temperature": 0.2})
-
-        emit("empty_response_retry", {"tools": allow, "evidence": bool(evidence_lines)})
-        return StepPlan(
-            node_id="empty_response_retry",
             effect=Effect(type=EffectType.LLM_CALL, payload=payload, result_key="_temp.llm_response"),
             next_node="parse",
         )
 
     def parse_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
+        context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
         response = temp.get("llm_response", {})
+
         content, tool_calls = logic.parse_response(response)
+        finish_reason = ""
+        if isinstance(response, dict):
+            fr = response.get("finish_reason")
+            finish_reason = str(fr or "").strip().lower() if fr is not None else ""
 
-        def _sanitize_tool_call_content(text: str) -> str:
-            """Remove tool-transcript markers from assistant content before persisting to history.
-
-            Some OSS models may include internal transcript artifacts (e.g. fabricated
-            `observation[...]` lines) or embed the tool call itself inside the message
-            (`Action:` blocks). We keep only the user-facing prose that appears *before*
-            such markers so the runtime doesn't persist fabricated logs into context.
-            """
-            if not isinstance(text, str) or not text.strip():
-                return ""
-            out_lines: list[str] = []
-            for line in text.splitlines():
-                lowered = line.lstrip().lower()
-                if lowered.startswith("observation["):
-                    break
-                if lowered.startswith("action:"):
-                    break
-                if lowered.startswith("<|tool_call|>") or lowered.startswith("<tool_call>"):
-                    break
-                if lowered.startswith("```tool_call") or lowered.startswith("```tool_code"):
-                    break
-                out_lines.append(line)
-            return "\n".join(out_lines).rstrip()
-
-        def _should_retry_for_missing_tool_call(text: str) -> bool:
-            if not isinstance(text, str) or not text.strip():
-                return False
-            # Some models echo our internal History formatting (e.g. `observation[web_search] (success): ...`)
-            # as transcript lines. Treat only *line-start* occurrences as suspicious (avoid false positives
-            # in JSON/code blocks), and only use this signal when no tools have actually run yet.
-            for line in text.splitlines():
-                if line.lstrip().lower().startswith("observation["):
-                    return True
-            return False
-
-        def _extract_final_answer(text: str) -> tuple[bool, str]:
-            """Return (is_explicit_final, stripped_answer)."""
-            if not isinstance(text, str) or not text.strip():
-                return False, ""
-            s = text.lstrip()
-            if s.upper().startswith("FINAL:"):
-                return True, s[len("FINAL:") :].lstrip()
-            return False, text
-
-        emit(
-            "parse",
-            {
-                "has_tool_calls": bool(tool_calls),
-                "content": content,
-                "tool_calls": [{"name": tc.name, "arguments": tc.arguments, "call_id": tc.call_id} for tc in tool_calls],
-            },
-        )
-        temp.pop("llm_response", None)
-
-        # Reset retry counter on any successful tool-call detection.
-        if tool_calls:
-            scratchpad["tool_retry_count"] = 0
-            scratchpad["tool_retry_minimal_used"] = False
+        cycle_i = int(scratchpad.get("iteration", 0) or 0)
+        cycle: Dict[str, Any] = {"i": cycle_i, "thought": content, "tool_calls": [], "observations": []}
+        cycles = scratchpad.get("cycles")
+        if isinstance(cycles, list):
+            cycles.append(cycle)
+        else:
+            scratchpad["cycles"] = [cycle]
 
         if tool_calls:
-            clean = _sanitize_tool_call_content(content)
-            if clean.strip():
-                context["messages"].append(_new_message(ctx, role="assistant", content=clean))
-                if _flag(runtime_ns, "plan_mode", default=False):
-                    updated = _extract_plan_update(clean)
-                    if isinstance(updated, str) and updated.strip():
-                        scratchpad["plan"] = updated.strip()
+            cycle["tool_calls"] = [tc.__dict__ for tc in tool_calls]
+            # Keep tool transcript in context for OpenAI-compatible tool calling.
+            context["messages"].append(
+                _new_assistant_message_with_tool_calls(
+                    ctx,
+                    content="",  # thought is stored in scratchpad (not user-visible history)
+                    tool_calls=tool_calls,
+                    metadata={"kind": "tool_calls", "cycle": cycle_i},
+                )
+            )
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
+            emit("parse_tool_calls", {"count": len(tool_calls)})
             return StepPlan(node_id="parse", next_node="act")
 
-        # Empty response is an invalid step: recover with a bounded retry that carries evidence.
+        # If the model hit an output limit, treat the step as incomplete and continue.
+        if finish_reason in {"length", "max_tokens"}:
+            _push_inbox(
+                runtime_ns,
+                "Your previous response was truncated by an output token limit.\n"
+                "Continue now. If the task is not complete, CALL the next tool(s) needed to make progress.\n"
+                "Do not write a long plan before tool calls.",
+            )
+            emit("parse_retry_truncated", {"cycle": cycle_i})
+            return StepPlan(node_id="parse", next_node="reason")
+
         if not isinstance(content, str) or not content.strip():
-            try:
-                empty_retries = int(scratchpad.get("empty_response_retry_count") or 0)
-            except Exception:
-                empty_retries = 0
+            _push_inbox(runtime_ns, "Your previous response was empty. Continue the task.")
+            emit("parse_retry_empty", {"cycle": cycle_i})
+            return StepPlan(node_id="parse", next_node="reason")
 
-            if empty_retries < 2:
-                scratchpad["empty_response_retry_count"] = empty_retries + 1
-                emit("parse_retry_empty_response", {"retries": empty_retries + 1})
-                return StepPlan(node_id="parse", next_node="empty_response_retry")
-
-            safe = (
-                "I can't proceed: the model repeatedly returned empty outputs (no content, no tool calls).\n"
-                "Please retry, reduce context, or switch models."
+        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
+        if cycle_i < max_iterations and _looks_like_plan(content):
+            _push_inbox(
+                runtime_ns,
+                "You responded without tool calls but appear to still be planning.\n"
+                "If the task requires actions, CALL the next tool(s) now.\n"
+                "Only respond without tool calls when you are truly done and can provide the final answer.",
             )
-            context["messages"].append(_new_message(ctx, role="assistant", content=safe, metadata={"kind": "error"}))
-            temp["final_answer"] = safe
-            temp["pending_tool_calls"] = []
-            scratchpad["empty_response_retry_count"] = 0
-            return StepPlan(node_id="parse", next_node="maybe_review")
+            emit("parse_retry_plan_only", {"cycle": cycle_i})
+            return StepPlan(node_id="parse", next_node="reason")
 
-        # If the model appears to have produced a fake "observation[tool]" transcript instead of
-        # calling tools, give it one corrective retry before treating the message as final.
-        if not bool(scratchpad.get("used_tools")) and _should_retry_for_missing_tool_call(content):
-            try:
-                retries = int(scratchpad.get("tool_retry_count") or 0)
-            except Exception:
-                retries = 0
-            if retries < 2:
-                scratchpad["tool_retry_count"] = retries + 1
-                inbox = runtime_ns.get("inbox")
-                if not isinstance(inbox, list):
-                    inbox = []
-                    runtime_ns["inbox"] = inbox
-                inbox.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "You wrote an `observation[...]` line, but no tool was actually called.\n"
-                            "Do NOT fabricate tool outputs.\n"
-                            "If you need to search/fetch/read/write, CALL a tool now using the required tool call format.\n"
-                            "Never output `observation[...]` markers; those are context-only."
-                        ),
-                    }
-                )
-                emit("parse_retry_missing_tool_call", {"retries": retries + 1})
-                return StepPlan(node_id="parse", next_node="reason")
-
-            # If the model still fails after retries, attempt a single minimal-context recovery call
-            # instead of accepting a fabricated transcript as the final answer.
-            if not bool(scratchpad.get("tool_retry_minimal_used")):
-                scratchpad["tool_retry_minimal_used"] = True
-                scratchpad["tool_retry_count"] = 0
-                temp["tool_retry_bad_content"] = content
-                emit("parse_retry_minimal_context", {"retries": retries})
-                return StepPlan(node_id="parse", next_node="tool_retry_minimal")
-
-            safe = (
-                "I can't proceed safely: the model repeatedly produced fabricated `observation[...]` tool logs instead of calling tools.\n"
-                "Please retry, reduce context, or switch models."
-            )
-            context["messages"].append(_new_message(ctx, role="assistant", content=safe, metadata={"kind": "error"}))
-            temp["final_answer"] = safe
-            scratchpad["tool_retry_count"] = 0
-            return StepPlan(node_id="parse", next_node="maybe_review")
-
-        final_raw = _sanitize_tool_call_content(content)
-        if not final_raw.strip():
-            final_raw = str(content or "").strip()
-
-        is_final, final_text = _extract_final_answer(final_raw)
-        if is_final:
-            if final_text:
-                context["messages"].append(_new_message(ctx, role="assistant", content=final_text))
-                if _flag(runtime_ns, "plan_mode", default=False):
-                    updated = _extract_plan_update(final_text)
-                    if isinstance(updated, str) and updated.strip():
-                        scratchpad["plan"] = updated.strip()
-            temp["final_answer"] = final_text or "No answer provided"
-            temp["pending_tool_calls"] = []
-            scratchpad["tool_retry_count"] = 0
-            return StepPlan(node_id="parse", next_node="maybe_review")
-
-        # Default: treat as a normal final answer even if it lacks an explicit FINAL marker.
-        final = final_raw
-        if final:
-            context["messages"].append(_new_message(ctx, role="assistant", content=final))
-            if _flag(runtime_ns, "plan_mode", default=False):
-                updated = _extract_plan_update(final)
-                if isinstance(updated, str) and updated.strip():
-                    scratchpad["plan"] = updated.strip()
-
-        temp["final_answer"] = final or "No answer provided"
-        temp["pending_tool_calls"] = []
-        scratchpad["tool_retry_count"] = 0
-        scratchpad["empty_response_retry_count"] = 0
-        return StepPlan(node_id="parse", next_node="maybe_review")
+        # Final answer: stop the loop.
+        answer = str(content).strip()
+        temp["final_answer"] = answer
+        emit("parse_final", {"cycle": cycle_i})
+        return StepPlan(node_id="parse", next_node="done")
 
     def act_node(run: RunState, ctx) -> StepPlan:
-        # Treat `_temp.pending_tool_calls` as a durable queue.
-        # This avoids dropping calls when schema-only tools (ask_user/memory/etc.) are interleaved
-        # with normal tools, and avoids re-asking the same question due to missing context.
-        context, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
-        raw_queue = temp.get("pending_tool_calls", [])
-        if not isinstance(raw_queue, list) or not raw_queue:
-            temp["pending_tool_calls"] = []
-            return StepPlan(node_id="act", next_node="reason")
+        context, _, runtime_ns, temp, _ = ensure_react_vars(run)
 
-        allow = _effective_allowlist(runtime_ns)
-        builtin_effect_tools = {
-            "ask_user",
-            "recall_memory",
-            "inspect_vars",
-            "remember",
-            "remember_note",
-            "compact_memory",
-        }
+        pending = temp.get("pending_tool_calls", [])
+        if not isinstance(pending, list):
+            pending = []
 
-        # Normalize queue items and assign stable call_ids once so splitting into batches does not
-        # introduce duplicate ids.
-        tool_queue: List[Dict[str, Any]] = []
-        for idx, item in enumerate(raw_queue, start=1):
-            if isinstance(item, ToolCall):
-                d: Dict[str, Any] = {"name": item.name, "arguments": item.arguments, "call_id": item.call_id}
-            elif isinstance(item, dict):
-                d = dict(item)
+        tool_queue: list[Dict[str, Any]] = []
+        for idx, tc in enumerate(pending):
+            if isinstance(tc, ToolCall):
+                d = tc.__dict__
+            elif isinstance(tc, dict):
+                d = dict(tc)
             else:
                 continue
-            call_id = str(d.get("call_id") or "").strip()
-            if not call_id:
+            if "call_id" not in d or not d.get("call_id"):
                 d["call_id"] = str(idx)
             tool_queue.append(d)
 
@@ -857,12 +709,12 @@ def create_react_workflow(
             temp["pending_tool_calls"] = []
             return StepPlan(node_id="act", next_node="reason")
 
+        allow = _effective_allowlist(runtime_ns)
+
         def _is_builtin(tc: Dict[str, Any]) -> bool:
             name = tc.get("name")
             return isinstance(name, str) and name in builtin_effect_tools
 
-        # Execute one schema-only builtin (if it is next), otherwise execute the longest contiguous
-        # prefix of normal tools. Leave the remainder queued for subsequent act/observe cycles.
         if _is_builtin(tool_queue[0]):
             tc = tool_queue[0]
             name = str(tc.get("name") or "").strip()
@@ -870,7 +722,6 @@ def create_react_workflow(
             if not isinstance(args, dict):
                 args = {}
 
-            # Pop the builtin from the queue.
             temp["pending_tool_calls"] = list(tool_queue[1:])
 
             if name and name not in allow:
@@ -893,18 +744,11 @@ def create_react_workflow(
                 choices = args.get("choices")
                 choices = list(choices) if isinstance(choices, list) else None
 
-                # Persist the asked question in the durable message history so both the main model
-                # and the reviewer can see what was asked (and avoid re-asking).
                 msgs = context.get("messages")
                 if isinstance(msgs, list):
-                    content = f"[Agent question]: {question}"
-                    last = msgs[-1] if msgs else None
-                    last_role = last.get("role") if isinstance(last, dict) else None
-                    last_meta = last.get("metadata") if isinstance(last, dict) else None
-                    last_kind = last_meta.get("kind") if isinstance(last_meta, dict) else None
-                    last_content = last.get("content") if isinstance(last, dict) else None
-                    if not (last_role == "assistant" and last_kind == "ask_user_prompt" and str(last_content or "") == content):
-                        msgs.append(_new_message(ctx, role="assistant", content=content, metadata={"kind": "ask_user_prompt"}))
+                    msgs.append(
+                        _new_message(ctx, role="assistant", content=f"[Agent question]: {question}", metadata={"kind": "ask_user_prompt"})
+                    )
 
                 emit("ask_user", {"question": question, "choices": choices or []})
                 return StepPlan(
@@ -965,26 +809,16 @@ def create_react_workflow(
                 payload = dict(args)
                 payload.setdefault("tool_name", "compact_memory")
                 payload.setdefault("call_id", tc.get("call_id") or "compact")
-                emit(
-                    "memory_compact",
-                    {
-                        "preserve_recent": payload.get("preserve_recent"),
-                        "mode": payload.get("compression_mode"),
-                        "focus": payload.get("focus"),
-                    },
-                )
+                emit("memory_compact", {"preserve_recent": payload.get("preserve_recent"), "mode": payload.get("compression_mode")})
                 return StepPlan(
                     node_id="act",
                     effect=Effect(type=EffectType.MEMORY_COMPACT, payload=payload, result_key="_temp.tool_results"),
                     next_node="observe",
                 )
 
-            # Unknown builtin: continue with the queue (best-effort).
-            if temp.get("pending_tool_calls"):
-                return StepPlan(node_id="act", next_node="act")
-            return StepPlan(node_id="act", next_node="reason")
+            # Unknown builtin: continue.
+            return StepPlan(node_id="act", next_node="act" if temp.get("pending_tool_calls") else "reason")
 
-        # Normal tools: execute contiguous prefix until the next builtin.
         batch: List[Dict[str, Any]] = []
         for tc in tool_queue:
             if _is_builtin(tc):
@@ -994,23 +828,16 @@ def create_react_workflow(
         remaining = tool_queue[len(batch) :]
         temp["pending_tool_calls"] = list(remaining)
 
-        # Emit observability events for the batch.
-        for tc in batch:
-            emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")})
-
         formatted_calls: List[Dict[str, Any]] = []
         for tc in batch:
+            emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")})
             formatted_calls.append(
                 {"name": tc.get("name", ""), "arguments": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")}
             )
 
         return StepPlan(
             node_id="act",
-            effect=Effect(
-                type=EffectType.TOOL_CALLS,
-                payload={"tool_calls": formatted_calls, "allowed_tools": list(allow)},
-                result_key="_temp.tool_results",
-            ),
+            effect=Effect(type=EffectType.TOOL_CALLS, payload={"tool_calls": formatted_calls, "allowed_tools": list(allow)}, result_key="_temp.tool_results"),
             next_node="observe",
         )
 
@@ -1023,10 +850,19 @@ def create_react_workflow(
         results = tool_results.get("results", [])
         if not isinstance(results, list):
             results = []
+
         if results:
             scratchpad["used_tools"] = True
 
-        # Prefer a tool-supplied human/LLM-friendly rendering when present.
+        # Attach observations to the most recent cycle.
+        cycles = scratchpad.get("cycles")
+        last_cycle: Optional[Dict[str, Any]] = None
+        if isinstance(cycles, list):
+            for c in reversed(cycles):
+                if isinstance(c, dict) and int(c.get("i") or -1) == int(scratchpad.get("iteration") or -1):
+                    last_cycle = c
+                    break
+
         def _display(v: Any) -> str:
             if isinstance(v, dict):
                 rendered = v.get("rendered")
@@ -1034,6 +870,7 @@ def create_react_workflow(
                     return rendered.strip()
             return "" if v is None else str(v)
 
+        obs_list: list[dict[str, Any]] = []
         for r in results:
             if not isinstance(r, dict):
                 continue
@@ -1043,313 +880,39 @@ def create_react_workflow(
             error = r.get("error", "")
             display = _display(output)
             if not success:
-                # Preserve structured outputs for provenance, but show a clean string to the LLM/UI.
                 display = _display(output) if isinstance(output, dict) else str(error or output)
-            rendered = logic.format_observation(
-                name=name,
-                output=display,
-                success=success,
-            )
-            emit("observe", {"tool": name, "success": success, "result": rendered})
+            rendered = logic.format_observation(name=name, output=display, success=success)
+            emit("observe", {"tool": name, "success": success})
 
             context["messages"].append(
                 _new_message(
                     ctx,
                     role="tool",
                     content=rendered,
-                    metadata={
-                        "name": name,
-                        "call_id": r.get("call_id"),
-                        "success": success,
-                    },
+                    metadata={"name": name, "call_id": r.get("call_id"), "success": success},
                 )
             )
 
+            obs_list.append(
+                {
+                    "call_id": r.get("call_id"),
+                    "name": name,
+                    "success": success,
+                    "output": output,
+                    "error": error,
+                    "rendered": rendered,
+                }
+            )
+
+        if last_cycle is not None:
+            last_cycle["observations"] = obs_list
+
         temp.pop("tool_results", None)
-        # Reset verifier/review rounds after executing tools. This enables repeated
-        # verify→act→observe cycles without immediately hitting review_max_rounds.
-        scratchpad["review_count"] = 0
         pending = temp.get("pending_tool_calls", [])
         if isinstance(pending, list) and pending:
             return StepPlan(node_id="observe", next_node="act")
         temp["pending_tool_calls"] = []
         return StepPlan(node_id="observe", next_node="reason")
-
-    def maybe_review_node(run: RunState, ctx) -> StepPlan:
-        _, scratchpad, runtime_ns, _, _ = ensure_react_vars(run)
-
-        if not _flag(runtime_ns, "review_mode", default=False):
-            return StepPlan(node_id="maybe_review", next_node="done")
-
-        max_rounds = _int(runtime_ns, "review_max_rounds", default=1)
-        if max_rounds < 0:
-            max_rounds = 0
-        count = scratchpad.get("review_count")
-        try:
-            count_int = int(count or 0)
-        except Exception:
-            count_int = 0
-
-        if count_int >= max_rounds:
-            return StepPlan(node_id="maybe_review", next_node="done")
-
-        scratchpad["review_count"] = count_int + 1
-        return StepPlan(node_id="maybe_review", next_node="review")
-
-    def review_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, runtime_ns, _, limits = ensure_react_vars(run)
-
-        task = str(context.get("task", "") or "")
-        plan = scratchpad.get("plan")
-        plan_text = str(plan).strip() if isinstance(plan, str) and plan.strip() else "(no plan)"
-
-        allow = _effective_allowlist(runtime_ns)
-
-        def _truncate_block(text: str, *, max_chars: int) -> str:
-            s = str(text or "")
-            if max_chars <= 0:
-                return s
-            if len(s) <= max_chars:
-                return s
-            suffix = f"\n… (truncated, {len(s):,} chars total)"
-            keep = max_chars - len(suffix)
-            if keep < 200:
-                keep = max_chars
-                suffix = ""
-            return s[:keep].rstrip() + suffix
-
-        def _format_allowed_tools() -> str:
-            # Prefer the already-computed tool_specs (created in reason_node) to avoid
-            # re-materializing tool definitions and to keep formatting stable.
-            specs = runtime_ns.get("tool_specs")
-            if not isinstance(specs, list) or not specs:
-                defs = _allowed_tool_defs(allow)
-                specs = [t.to_dict() for t in defs]
-            lines: list[str] = []
-            for spec in specs:
-                if not isinstance(spec, dict):
-                    continue
-                name = str(spec.get("name") or "").strip()
-                if not name:
-                    continue
-                params = spec.get("parameters")
-                props = params.get("properties", {}) if isinstance(params, dict) else {}
-                keys = sorted([k for k in props.keys() if isinstance(k, str)])
-                if keys:
-                    lines.append(f"- {name}({', '.join(keys)})")
-                else:
-                    lines.append(f"- {name}()")
-            return "\n".join(lines) if lines else "(no tools available)"
-
-        # Include recent tool outputs for evidence-based review.
-        messages = list(context.get("messages") or [])
-        tool_msgs: list[str] = []
-        try:
-            tool_limit = int(limits.get("review_max_tool_output_chars", -1))
-        except Exception:
-            tool_limit = -1
-        try:
-            answer_limit = int(limits.get("review_max_answer_chars", -1))
-        except Exception:
-            answer_limit = -1
-
-        for m in reversed(messages):
-            if not isinstance(m, dict) or m.get("role") != "tool":
-                continue
-            content = m.get("content")
-            if isinstance(content, str) and content.strip():
-                tool_msgs.append(_truncate_block(content.strip(), max_chars=tool_limit))
-            if len(tool_msgs) >= 8:
-                break
-        tool_msgs.reverse()
-        observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
-
-        # Include recent user messages (especially ask_user responses) so the reviewer can
-        # avoid re-asking questions the user already answered.
-        try:
-            user_limit = int(limits.get("review_max_user_message_chars", -1))
-        except Exception:
-            user_limit = -1
-
-        user_msgs: list[str] = []
-        ask_prompts: list[str] = []
-        for m in reversed(messages):
-            if not isinstance(m, dict):
-                continue
-            role = m.get("role")
-            content = m.get("content")
-            if role == "user" and isinstance(content, str) and content.strip():
-                if content.strip() != task.strip():
-                    user_msgs.append(_truncate_block(content.strip(), max_chars=user_limit))
-                    if len(user_msgs) >= 4:
-                        break
-        for m in reversed(messages):
-            if not isinstance(m, dict):
-                continue
-            if m.get("role") != "assistant":
-                continue
-            meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
-            if not isinstance(meta, dict) or meta.get("kind") != "ask_user_prompt":
-                continue
-            content = m.get("content")
-            if isinstance(content, str) and content.strip():
-                ask_prompts.append(_truncate_block(content.strip(), max_chars=user_limit))
-                if len(ask_prompts) >= 4:
-                    break
-
-        user_msgs.reverse()
-        ask_prompts.reverse()
-        user_context = "\n\n".join(user_msgs) if user_msgs else "(no additional user messages)"
-        asked_context = "\n\n".join(ask_prompts) if ask_prompts else "(no ask_user prompts recorded)"
-
-        # The verifier should primarily judge based on tool outputs. Only include an answer
-        # excerpt when we have no tool evidence (pure Q&A runs).
-        answer_raw = str(run.vars.get("_temp", {}).get("final_answer") or "")
-        answer_excerpt = ""
-        if not tool_msgs and answer_raw.strip():
-            answer_excerpt = _truncate_block(answer_raw.strip(), max_chars=answer_limit)
-
-        prompt = (
-            "You are a verifier. Review whether the user's request has been fully satisfied.\n"
-            "Be strict: only count actions that are supported by the tool outputs.\n"
-            "If anything is missing, propose the NEXT ACTIONS.\n"
-            "Prefer returning `next_tool_calls` over `next_prompt`.\n"
-            "Return JSON ONLY.\n\n"
-            f"User request:\n{task}\n\n"
-            f"Plan:\n{plan_text}\n\n"
-            f"Recent ask_user prompts:\n{asked_context}\n\n"
-            f"Recent user messages:\n{user_context}\n\n"
-            + (f"Current answer (excerpt):\n{answer_excerpt}\n\n" if answer_excerpt else "")
-            + f"Tool outputs:\n{observations}\n\n"
-            f"Allowed tools:\n{_format_allowed_tools()}\n\n"
-        )
-
-        schema = {
-            "type": "object",
-            "properties": {
-                "complete": {"type": "boolean"},
-                "missing": {"type": "array", "items": {"type": "string"}},
-                "next_prompt": {"type": "string"},
-                "next_tool_calls": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "arguments": {"type": "object"},
-                        },
-                        "required": ["name", "arguments"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["complete", "missing", "next_prompt", "next_tool_calls"],
-            "additionalProperties": False,
-        }
-
-        emit("review_request", {"tool_messages": len(tool_msgs)})
-
-        payload: Dict[str, Any] = {
-            "prompt": prompt,
-            "response_schema": schema,
-            "response_schema_name": "ReActVerifier",
-            "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2}),
-        }
-        sys = _system_prompt(runtime_ns)
-        if sys is not None:
-            payload["system_prompt"] = sys
-        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
-        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
-        if isinstance(eff_provider, str) and eff_provider.strip():
-            payload["provider"] = eff_provider.strip()
-        if isinstance(eff_model, str) and eff_model.strip():
-            payload["model"] = eff_model.strip()
-
-        return StepPlan(
-            node_id="review",
-            effect=Effect(
-                type=EffectType.LLM_CALL,
-                payload=payload,
-                result_key="_temp.review_llm_response",
-            ),
-            next_node="review_parse",
-        )
-
-    def review_parse_node(run: RunState, ctx) -> StepPlan:
-        _, _, runtime_ns, temp, _ = ensure_react_vars(run)
-        resp = temp.get("review_llm_response", {})
-        if not isinstance(resp, dict):
-            resp = {}
-
-        data = resp.get("data")
-        if data is None and isinstance(resp.get("content"), str):
-            try:
-                data = json.loads(resp["content"])
-            except Exception:
-                data = None
-        if not isinstance(data, dict):
-            data = {}
-
-        complete = bool(data.get("complete"))
-        missing = data.get("missing") if isinstance(data.get("missing"), list) else []
-        next_prompt = data.get("next_prompt")
-        next_prompt_text = str(next_prompt or "").strip()
-        next_tool_calls_raw = data.get("next_tool_calls")
-        next_tool_calls: list[dict[str, Any]] = []
-        if isinstance(next_tool_calls_raw, list):
-            for item in next_tool_calls_raw:
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("name") or "").strip()
-                args = item.get("arguments")
-                if not isinstance(args, dict):
-                    args = {}
-                if name:
-                    next_tool_calls.append({"name": name, "arguments": args})
-
-        emit("review", {"complete": complete, "missing": missing})
-        temp.pop("review_llm_response", None)
-
-        if complete:
-            return StepPlan(node_id="review_parse", next_node="done")
-
-        if next_tool_calls:
-            temp["pending_tool_calls"] = next_tool_calls
-            emit("review_tool_calls", {"count": len(next_tool_calls)})
-            return StepPlan(node_id="review_parse", next_node="act")
-
-        # Behavioral validation: if incomplete but no tool calls, re-ask reviewer once with stricter rules.
-        if not complete and not next_tool_calls:
-            try:
-                retry_count = int(runtime_ns.get("review_retry_count") or 0)
-            except Exception:
-                retry_count = 0
-            if retry_count < 1:
-                runtime_ns["review_retry_count"] = retry_count + 1
-                inbox = runtime_ns.get("inbox")
-                if not isinstance(inbox, list):
-                    inbox = []
-                    runtime_ns["inbox"] = inbox
-                inbox.append(
-                    {
-                        "content": (
-                            "[Review] Your last review output was not actionable. "
-                            "If incomplete, you MUST return at least one `next_tool_call` "
-                            "(use `ask_user` if you need clarification). Return JSON only."
-                        )
-                    }
-                )
-                emit("review_retry_unactionable", {"retry": retry_count + 1})
-                return StepPlan(node_id="review_parse", next_node="review")
-
-        runtime_ns["review_retry_count"] = 0
-        if next_prompt_text:
-            inbox = runtime_ns.get("inbox")
-            if not isinstance(inbox, list):
-                inbox = []
-                runtime_ns["inbox"] = inbox
-            inbox.append({"content": f"[Review] {next_prompt_text}"})
-        return StepPlan(node_id="review_parse", next_node="reason")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
         context, _, _, temp, _ = ensure_react_vars(run)
@@ -1359,9 +922,7 @@ def create_react_workflow(
         response_text = str(user_response.get("response", "") or "")
         emit("user_response", {"response": response_text})
 
-        context["messages"].append(
-            _new_message(ctx, role="user", content=f"[User response]: {response_text}")
-        )
+        context["messages"].append(_new_message(ctx, role="user", content=f"[User response]: {response_text}"))
         temp.pop("user_response", None)
 
         if temp.get("pending_tool_calls"):
@@ -1370,14 +931,11 @@ def create_react_workflow(
 
     def done_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, _, temp, limits = ensure_react_vars(run)
+        task = str(context.get("task", "") or "")
         answer = str(temp.get("final_answer") or "No answer provided")
+
         emit("done", {"answer": answer})
 
-        # Prefer _limits.current_iteration, fall back to scratchpad
-        iterations = int(limits.get("current_iteration", 0) or scratchpad.get("iteration", 0) or 0)
-
-        # Persist the final user-facing answer into the conversation history so it shows up
-        # in /history and becomes part of the next run's seed context.
         messages = context.get("messages")
         if isinstance(messages, list):
             last = messages[-1] if messages else None
@@ -1386,19 +944,22 @@ def create_react_workflow(
             if last_role != "assistant" or str(last_content or "") != answer:
                 messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer"}))
 
+        iterations = int(limits.get("current_iteration", 0) or scratchpad.get("iteration", 0) or 0)
+        report = _render_final_report(task, scratchpad)
+
         return StepPlan(
             node_id="done",
             complete_output={
                 "answer": answer,
+                "report": report,
                 "iterations": iterations,
                 "messages": list(context.get("messages") or []),
+                "scratchpad": dict(scratchpad),
             },
         )
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, _, limits = ensure_react_vars(run)
-
-        # Prefer _limits, fall back to scratchpad
+        context, scratchpad, _, temp, limits = ensure_react_vars(run)
         max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
         if max_iterations < 1:
             max_iterations = 1
@@ -1406,12 +967,16 @@ def create_react_workflow(
 
         messages = list(context.get("messages") or [])
         last_content = messages[-1]["content"] if messages else "Max iterations reached"
+        temp["final_answer"] = str(last_content)
+        report = _render_final_report(str(context.get("task") or ""), scratchpad)
         return StepPlan(
             node_id="max_iterations",
             complete_output={
-                "answer": last_content,
+                "answer": str(last_content),
+                "report": report,
                 "iterations": max_iterations,
                 "messages": messages,
+                "scratchpad": dict(scratchpad),
             },
         )
 
@@ -1420,18 +985,11 @@ def create_react_workflow(
         entry_node="init",
         nodes={
             "init": init_node,
-            "plan": plan_node,
-            "plan_parse": plan_parse_node,
             "reason": reason_node,
-            "tool_retry_minimal": tool_retry_minimal_node,
-            "empty_response_retry": empty_response_retry_node,
             "parse": parse_node,
             "act": act_node,
             "observe": observe_node,
             "handle_user_response": handle_user_response_node,
-            "maybe_review": maybe_review_node,
-            "review": review_node,
-            "review_parse": review_parse_node,
             "done": done_node,
             "max_iterations": max_iterations_node,
         },

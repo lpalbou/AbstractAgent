@@ -56,7 +56,7 @@ def _run(*, vars: dict) -> RunState:
     )
 
 
-def test_react_adapter_uses_runtime_active_context_policy() -> None:
+def test_react_adapter_does_not_truncate_in_loop_history() -> None:
     agent = ReactAgent(runtime=_runtime(), tools=[], max_iterations=5, max_history_messages=2, max_tokens=1024)
     reason_node = agent.workflow.get_node("reason")
     run = _run(vars=_run_vars(max_history_messages=2))
@@ -68,12 +68,12 @@ def test_react_adapter_uses_runtime_active_context_policy() -> None:
     assert isinstance(msgs, list)
     rendered = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in msgs if isinstance(m, dict))
 
-    # System preserved, history limit applied to non-system only.
+    # ReAct must not truncate its in-loop scratchpad/history based on max_history_messages.
     assert "system: SYS" in rendered
+    assert "user: m1" in rendered
+    assert "assistant: m2" in rendered
     assert "user: m3" in rendered
     assert "assistant: m4" in rendered
-    assert "user: m1" not in rendered
-    assert "assistant: m2" not in rendered
 
 
 def test_codeact_adapter_uses_runtime_active_context_policy() -> None:

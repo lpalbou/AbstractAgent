@@ -1,4 +1,4 @@
-"""Test script for the ReAct agent."""
+"""Manual script for the ReAct agent (not collected by pytest)."""
 
 import sys
 sys.path.insert(0, "src")

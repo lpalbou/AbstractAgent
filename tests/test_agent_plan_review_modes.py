@@ -46,56 +46,20 @@ def _base_vars(*, runtime_ns: dict | None = None) -> dict:
     }
 
 
-def test_react_plan_mode_routes_to_plan_node() -> None:
+def test_react_workflow_ignores_plan_and_review_modes() -> None:
+    """Canonical ReAct workflow no longer has separate plan/review nodes.
+
+    Plan/review are higher-level UX patterns; the ReAct core is a simple loop:
+    reason → act → observe until no tool calls.
+    """
     tool = ToolDefinition(name="tool_a", description="A", parameters={})
-    wf = create_react_workflow(
-        logic=ReActLogic(tools=[tool]),
-        workflow_id="wf",
-        allowed_tools=["tool_a"],
-    )
-    run = _run(vars=_base_vars(runtime_ns={"plan_mode": True}))
+    wf = create_react_workflow(logic=ReActLogic(tools=[tool]), workflow_id="wf", allowed_tools=["tool_a"])
+
+    run = _run(vars=_base_vars(runtime_ns={"plan_mode": True, "review_mode": True, "review_max_rounds": 1}))
     init_plan = wf.get_node("init")(run, _Ctx())
-    assert init_plan.next_node == "plan"
-
-    plan_step = wf.get_node("plan")(run, _Ctx())
-    assert plan_step.effect is not None
-    assert plan_step.effect.type == EffectType.LLM_CALL
-    payload = plan_step.effect.payload if isinstance(plan_step.effect.payload, dict) else {}
-    assert "tools" not in payload  # planning must be tool-free
-
-
-def test_react_review_mode_can_self_prompt_back_to_reason() -> None:
-    tool = ToolDefinition(name="tool_a", description="A", parameters={})
-    wf = create_react_workflow(
-        logic=ReActLogic(tools=[tool]),
-        workflow_id="wf",
-        allowed_tools=["tool_a"],
-    )
-    run = _run(vars=_base_vars(runtime_ns={"review_mode": True, "review_max_rounds": 1}))
-
-    # Simulate that the agent reached a final answer.
-    run.vars["_temp"]["final_answer"] = "answer"
-
-    maybe = wf.get_node("maybe_review")(run, _Ctx())
-    assert maybe.next_node == "review"
-
-    run.vars["_temp"]["review_llm_response"] = {
-        "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
-    }
-    # New contract: "incomplete + no tool calls" is behaviorally invalid → re-ask reviewer once.
-    review_parse_1 = wf.get_node("review_parse")(run, _Ctx())
-    assert review_parse_1.next_node == "review"
-
-    # If the reviewer remains unactionable, we fall back to prompting the agent back to reason.
-    run.vars["_temp"]["review_llm_response"] = {
-        "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
-    }
-    review_parse_2 = wf.get_node("review_parse")(run, _Ctx())
-    assert review_parse_2.next_node == "reason"
-
-    inbox = run.vars["_runtime"].get("inbox")
-    assert isinstance(inbox, list)
-    assert inbox and "[Review]" in str(inbox[-1].get("content", ""))
+    assert init_plan.next_node == "reason"
+    assert "plan" not in wf.nodes
+    assert "maybe_review" not in wf.nodes
 
 
 def test_codeact_plan_mode_routes_to_plan_node() -> None:
@@ -137,4 +101,3 @@ def test_codeact_review_mode_routes_to_reason_when_incomplete() -> None:
     inbox = run.vars["_runtime"].get("inbox")
     assert isinstance(inbox, list)
     assert inbox and "[Review]" in str(inbox[-1].get("content", ""))
-
