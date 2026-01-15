@@ -26,6 +26,7 @@ def test_build_request_includes_history_and_memory_instruction() -> None:
     assert "Iteration: 2/10" in req.system_prompt
     assert "autonomous ReAct agent" in req.system_prompt
     assert "keep tool call arguments small" in req.system_prompt.lower()
+    assert "multiple tool calls" in req.system_prompt.lower()
     assert "fetch_url" in req.system_prompt
     assert "include_full_content" in req.system_prompt
     assert "keep_links" in req.system_prompt
