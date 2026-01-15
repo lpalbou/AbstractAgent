@@ -104,6 +104,7 @@ class ReActLogic:
             "  Examples: read_file for multiple files/ranges, search_files with different queries, list_files across folders, analyze_code on multiple targets.\n"
             "  If reading nearby ranges of the same file, prefer ONE read_file call with a wider range.\n"
             "  Only split tool calls across turns when later calls depend on earlier outputs; do NOT batch side-effectful tools (write_file/edit_file/execute_command).\n"
+            "- When context is getting large, use delegate_agent(task, context, tools) to offload an independent subtask with minimal context.\n"
             "- Keep tool call arguments small and valid; avoid embedding huge blobs (large file contents / giant JSON) directly in arguments.\n"
             "- For fetch_url: use include_full_content=False for shorter previews; set keep_links=False to strip links when not needed.\n"
             "- For large files, create a small skeleton first, then refine via multiple smaller edits/tool calls.\n"

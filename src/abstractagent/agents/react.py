@@ -22,6 +22,7 @@ from ..adapters.react_runtime import create_react_workflow
 from ..logic.builtins import (
     ASK_USER_TOOL,
     COMPACT_MEMORY_TOOL,
+    DELEGATE_AGENT_TOOL,
     INSPECT_VARS_TOOL,
     RECALL_MEMORY_TOOL,
     REMEMBER_TOOL,
@@ -101,6 +102,7 @@ class ReactAgent(BaseAgent):
             REMEMBER_TOOL,
             REMEMBER_NOTE_TOOL,
             COMPACT_MEMORY_TOOL,
+            DELEGATE_AGENT_TOOL,
             *tool_defs,
         ]
 

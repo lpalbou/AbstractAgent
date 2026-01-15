@@ -49,10 +49,41 @@ class BaseAgent(ABC):
         self.tools = tools or []
         self.on_step = on_step
         self.workflow = self._create_workflow()
+        self._ensure_workflow_registered()
         self._current_run_id: Optional[str] = None
         self.actor_id: Optional[str] = actor_id
         self.session_id: Optional[str] = session_id
         self.session_messages: List[Dict[str, Any]] = []
+
+    def _ensure_workflow_registered(self) -> None:
+        """Ensure this agent's workflow is registered for subworkflow composition.
+
+        START_SUBWORKFLOW requires a runtime workflow_registry. Registering here keeps
+        agent-created runtimes usable for delegation/subflows without extra host wiring.
+        """
+        try:
+            wf = getattr(self, "workflow", None)
+            wid = getattr(wf, "workflow_id", None)
+            if not isinstance(wid, str) or not wid.strip():
+                return
+
+            reg = getattr(self.runtime, "workflow_registry", None)
+            if reg is None:
+                from abstractruntime.scheduler.registry import WorkflowRegistry
+
+                reg = WorkflowRegistry()
+                setter = getattr(self.runtime, "set_workflow_registry", None)
+                if callable(setter):
+                    setter(reg)
+            getter = getattr(reg, "get", None)
+            if callable(getter) and getter(wid) is not None:
+                return
+            register = getattr(reg, "register", None)
+            if callable(register):
+                register(wf)
+        except Exception:
+            # Never block agent creation due to registry wiring; hosts can still inject their own registry.
+            return
 
     def _sync_session_caches_from_state(self, state: Optional[RunState]) -> None:
         if state is None or not hasattr(state, "vars") or not isinstance(state.vars, dict):

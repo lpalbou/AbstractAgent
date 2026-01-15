@@ -563,6 +563,7 @@ def create_codeact_workflow(
             "remember",
             "remember_note",
             "compact_memory",
+            "delegate_agent",
         }
 
         tool_queue: List[Dict[str, Any]] = []
@@ -636,6 +637,68 @@ def create_codeact_workflow(
                         result_key="_temp.user_response",
                     ),
                     next_node="handle_user_response",
+                )
+
+            if name == "delegate_agent":
+                delegated_task = str(args.get("task") or "").strip()
+                delegated_context = str(args.get("context") or "").strip()
+
+                tools_raw = args.get("tools")
+                if tools_raw is None:
+                    # Inherit the current allowlist, but avoid recursive delegation and avoid waiting on ask_user
+                    # unless explicitly enabled.
+                    child_allow = [t for t in allow if t not in {"delegate_agent", "ask_user"}]
+                else:
+                    child_allow = _normalize_allowlist(tools_raw)
+
+                if not delegated_task:
+                    temp["tool_results"] = {
+                        "results": [
+                            {
+                                "call_id": str(tc.get("call_id") or ""),
+                                "name": "delegate_agent",
+                                "success": False,
+                                "output": None,
+                                "error": "delegate_agent requires a non-empty task",
+                            }
+                        ]
+                    }
+                    return StepPlan(node_id="act", next_node="observe")
+
+                combined_task = delegated_task
+                if delegated_context:
+                    combined_task = f"{delegated_task}\n\nContext:\n{delegated_context}"
+
+                sub_vars: Dict[str, Any] = {
+                    "context": {"task": combined_task, "messages": []},
+                    "_runtime": {
+                        "allowed_tools": list(child_allow),
+                        "system_prompt_extra": (
+                            "You are a delegated sub-agent.\n"
+                            "- Focus ONLY on the delegated task.\n"
+                            "- Use ONLY the allowed tools when needed.\n"
+                            "- Do not ask the user questions; if blocked, state assumptions and proceed.\n"
+                            "- Return a concise result suitable for the parent agent to act on.\n"
+                        ),
+                    },
+                    "_limits": {"max_iterations": 10},
+                }
+
+                payload = {
+                    "workflow_id": str(getattr(run, "workflow_id", "") or "codeact_agent"),
+                    "vars": sub_vars,
+                    "async": False,
+                    "include_traces": False,
+                    # Tool-mode wrapper so the parent receives a normal tool observation (no run failure on child failure).
+                    "wrap_as_tool_result": True,
+                    "tool_name": "delegate_agent",
+                    "call_id": str(tc.get("call_id") or ""),
+                }
+                emit("delegate_agent", {"tools": list(child_allow), "call_id": payload.get("call_id")})
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(type=EffectType.START_SUBWORKFLOW, payload=payload, result_key="_temp.tool_results"),
+                    next_node="observe",
                 )
 
             if name == "recall_memory":

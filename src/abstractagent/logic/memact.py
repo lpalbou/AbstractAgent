@@ -72,6 +72,8 @@ class MemActLogic:
             "- Be truthful: only claim actions supported by tool outputs.\n"
             "- Be autonomous: do not ask the user for confirmation to proceed; keep going until the task is done.\n"
             "- If you need to create/edit files, run commands, fetch URLs, or search, you MUST call an appropriate tool.\n"
+            "- Efficiency: batch independent read-only tool calls into a single turn (multiple tool calls) when possible.\n"
+            "- When context is getting large, use delegate_agent(task, context, tools) to offload an independent subtask with minimal context.\n"
             "- Never fabricate tool outputs.\n"
             "- Only ask the user a question when required information is missing.\n"
             f"{output_budget_line}"
@@ -124,4 +126,3 @@ class MemActLogic:
         if success:
             return f"[{name}]: {output}"
         return f"[{name}]: Error: {output}"
-

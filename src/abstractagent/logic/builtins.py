@@ -234,3 +234,32 @@ COMPACT_MEMORY_TOOL = ToolDefinition(
     },
     when_to_use="Use when the active context is too large and you need to reduce it while keeping provenance.",
 )
+
+DELEGATE_AGENT_TOOL = ToolDefinition(
+    name="delegate_agent",
+    description="Delegate a subtask to a fresh agent run with smaller context and restricted tools.",
+    parameters={
+        "task": {
+            "type": "string",
+            "description": "The delegated task (required). Keep it specific and self-contained.",
+        },
+        "context": {
+            "type": "string",
+            "description": "Minimal supporting context for the delegated task (optional).",
+            "default": "",
+        },
+        "tools": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Tool allowlist for the delegated agent (optional). "
+                "When omitted, the delegated agent inherits the current allowlist."
+            ),
+            "default": None,
+        },
+    },
+    when_to_use=(
+        "Use when you can split off a subtask that can be completed with a small context (e.g., "
+        "inspect a few files, search for specific symbols, summarize findings)."
+    ),
+)
