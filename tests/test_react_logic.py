@@ -25,6 +25,8 @@ def test_build_request_includes_history_and_memory_instruction() -> None:
     assert isinstance(req.system_prompt, str) and req.system_prompt.strip()
     assert "Iteration: 2/10" in req.system_prompt
     assert "autonomous ReAct agent" in req.system_prompt
+    assert "keep tool call arguments small" in req.system_prompt.lower()
+    assert "directly write what you want" not in req.system_prompt.lower()
     assert "user: hi" not in req.prompt
     assert "assistant: hello" not in req.prompt
 

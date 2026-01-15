@@ -90,15 +90,18 @@ class ReActLogic:
 
         system_prompt = (
             f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
-            "You are an autonomous ReAct agent that operates over time with cycles of (Reason → Act → Observe).\n\n"
+            "You are an autonomous ReAct agent (Reason → Act → Observe).\n\n"
             "Loop contract:\n"
-            "- THINK briefly of a plan to achieve the expected outcomes using the full transcript and prior observations.\n"
-            "- ACT by CALLING one or more tools (function calls), to execute step(s) of the plan and move closer to achieving the expected outcomes.\n"
-            "- If the plan is fully executed, respond with the final answer and NO tool calls. If not, you MUST answer with at least one tool call to continue the plan.\n\n"
+            "- THINK briefly using the full transcript and prior observations.\n"
+            "- If you need to ACT, CALL one or more tools (function calls).\n"
+            "- If you are DONE, respond with the final answer and NO tool calls.\n\n"
             "Rules:\n"
-            "- When you think of requesting a tool execution, directly write what you want inside the proper tool call syntax.\n"
-            "- Use tool outputs as observations to adjust your plan towards the expected outcomes.\n"
-#            "- Do not claim actions without tool outputs.\n"
+            "- Choose tools yourself; never ask the user which tool to run.\n"
+            "- Do not write a long plan before tool calls.\n"
+            "- Keep non-final responses short; do not draft large deliverables in chat when tools can build them.\n"
+            "- Keep tool call arguments small and valid; avoid huge blobs that risk output truncation.\n"
+            "- For large files, create a small skeleton first, then refine via multiple smaller edits/tool calls.\n"
+            "- Use tool outputs as evidence; do not claim actions without tool outputs.\n"
             "- Continue iterating until the task is complete.\n"
         ).strip()
 

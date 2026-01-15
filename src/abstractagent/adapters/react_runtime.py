@@ -657,8 +657,10 @@ def create_react_workflow(
         if finish_reason in {"length", "max_tokens"}:
             _push_inbox(
                 runtime_ns,
-                "Your previous response was truncated by an output token limit.\n"
-                "Continue now. If the task is not complete, CALL the next tool(s) needed to make progress.\n"
+                "Your previous response hit an output token limit before producing a complete tool call.\n"
+                "Retry now: emit ONLY the next tool call(s) needed to make progress.\n"
+                "Keep tool call arguments small (avoid large file contents / giant JSON blobs) to prevent tool-call truncation.\n"
+                "For large files, create a small skeleton first, then refine via multiple smaller edits/tool calls.\n"
                 "Do not write a long plan before tool calls.",
             )
             emit("parse_retry_truncated", {"cycle": cycle_i})

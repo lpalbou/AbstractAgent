@@ -53,6 +53,7 @@ def test_react_truncated_output_retries_and_continues() -> None:
         if idx == 3:
             sys = str(payload.get("system_prompt") or "")
             assert "output token limit" in sys.lower()
+            assert "keep tool call arguments small" in sys.lower()
             msgs = payload.get("messages")
             assert isinstance(msgs, list) and msgs
             assert str(payload.get("prompt") or "") == ""
