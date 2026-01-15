@@ -101,6 +101,9 @@ class CodeActLogic:
             "- Be truthful: only claim actions supported by tool outputs.\n"
             "- Be autonomous: do not ask the user for confirmation to proceed; keep going until the task is done.\n"
             "- If you need to run code, call `execute_python` (preferred) or output a fenced ```python code block.\n"
+            "- Efficiency: batch independent read-only tool calls into a single turn (multiple tool calls) to reduce iterations.\n"
+            "  Examples: read_file for multiple files/ranges, search_files with different queries, list_files across folders, analyze_code on multiple targets.\n"
+            "  Only split tool calls across turns when later calls depend on earlier outputs; avoid batching side-effectful tools (write/edit/execute).\n"
             "- Never fabricate tool outputs.\n"
             "- Only ask the user a question when required information is missing.\n"
             f"{output_budget_line}"
@@ -170,4 +173,3 @@ class CodeActLogic:
         if success:
             return f"[{name}]: {out}"
         return f"[{name}]: Error: {out}"
-
