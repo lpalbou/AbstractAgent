@@ -161,14 +161,107 @@ def _compute_toolset_id(tool_specs: List[Dict[str, Any]]) -> str:
 
 
 def _tool_call_signature(name: str, args: Any) -> str:
+    def _abbrev(v: Any, *, max_chars: int = 140) -> str:
+        if v is None:
+            return ""
+        s = str(v)
+        if len(s) <= max_chars:
+            return s
+        return f"{s[: max(0, max_chars - 1)]}…"
+
+    def _hash_str(s: str) -> str:
+        try:
+            return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+        except Exception:
+            return "sha256_err"
+
     n = str(name or "").strip() or "tool"
     if not isinstance(args, dict) or not args:
         return f"{n}()"
+
+    # Special-case common large-argument tools so the system prompt doesn't explode.
+    if n == "write_file":
+        fp = args.get("file_path") if isinstance(args.get("file_path"), str) else args.get("path")
+        mode = args.get("mode") if isinstance(args.get("mode"), str) else "w"
+        content = args.get("content")
+        if isinstance(content, str):
+            tag = f"<str len={len(content)} sha256={_hash_str(content)}>"
+        else:
+            tag = "<str len=0>"
+        return f"write_file(file_path={_abbrev(fp)!r}, mode={_abbrev(mode)!r}, content={tag})"
+
+    if n == "edit_file":
+        fp = args.get("file_path") if isinstance(args.get("file_path"), str) else args.get("path")
+        edits = args.get("edits")
+        n_edits = len(edits) if isinstance(edits, list) else 0
+        return f"edit_file(file_path={_abbrev(fp)!r}, edits={n_edits})"
+
+    if n == "fetch_url":
+        url = args.get("url")
+        include_full = args.get("include_full_content")
+        return f"fetch_url(url={_abbrev(url)!r}, include_full_content={include_full})"
+
+    if n == "web_search":
+        q = args.get("query")
+        num = args.get("num_results")
+        return f"web_search(query={_abbrev(q)!r}, num_results={num})"
+
+    if n == "execute_command":
+        cmd = args.get("command")
+        return f"execute_command(command={_abbrev(cmd, max_chars=220)!r})"
+
+    # Generic, but bounded: hash long strings to avoid leaking large blobs into the prompt.
+    summarized: Dict[str, Any] = {}
+    for k, v in args.items():
+        if isinstance(v, str) and len(v) > 160:
+            summarized[str(k)] = f"<str len={len(v)} sha256={_hash_str(v)}>"
+        else:
+            summarized[str(k)] = v
     try:
-        arg_str = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        arg_str = json.dumps(summarized, ensure_ascii=False, sort_keys=True)
     except Exception:
-        arg_str = str(args)
+        arg_str = str(summarized)
+    arg_str = _abbrev(arg_str, max_chars=260)
     return f"{n}({arg_str})"
+
+
+def _tool_call_fingerprint(name: str, args: Any) -> str:
+    """Return a stable, bounded fingerprint for tool-call repeat detection.
+
+    Important: do not embed large string blobs (file contents / web pages) in the fingerprint.
+    """
+
+    def _hash_str(s: str) -> str:
+        try:
+            return hashlib.sha256(s.encode("utf-8")).hexdigest()
+        except Exception:
+            return "sha256_err"
+
+    def _canon(v: Any) -> Any:
+        if v is None or isinstance(v, (bool, int, float)):
+            return v
+        if isinstance(v, str):
+            if len(v) <= 200:
+                return v
+            return {"_type": "str", "len": len(v), "sha256": _hash_str(v)[:16]}
+        if isinstance(v, list):
+            return [_canon(x) for x in v[:25]]
+        if isinstance(v, dict):
+            out: Dict[str, Any] = {}
+            for k in sorted(v.keys(), key=lambda x: str(x)):
+                out[str(k)] = _canon(v.get(k))
+            return out
+        return {"_type": type(v).__name__}
+
+    payload = {"name": str(name or "").strip(), "args": _canon(args if isinstance(args, dict) else {})}
+    try:
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        raw = str(payload)
+    try:
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return "fingerprint_err"
 
 
 _PLANISH_RE = re.compile(
@@ -259,12 +352,21 @@ def _render_cycles_for_system_prompt(scratchpad: Dict[str, Any]) -> str:
     if not isinstance(cycles, list) or not cycles:
         return ""
 
+    # Keep the system prompt bounded: tool outputs can be very large (fetch_url/web_search).
+    max_cycles = 6
+    max_thought_chars = 600
+    max_obs_chars = 220
+
+    view = [c for c in cycles if isinstance(c, dict)]
+    if len(view) > max_cycles:
+        view = view[-max_cycles:]
+
     lines: list[str] = []
-    for c in cycles:
-        if not isinstance(c, dict):
-            continue
+    for c in view:
         i = c.get("i")
         thought = str(c.get("thought") or "").strip()
+        if len(thought) > max_thought_chars:
+            thought = f"{thought[: max(0, max_thought_chars - 1)]}…"
         tcs = c.get("tool_calls")
         obs = c.get("observations")
         if i is None:
@@ -290,7 +392,30 @@ def _render_cycles_for_system_prompt(scratchpad: Dict[str, Any]) -> str:
                 ok = bool(o.get("success"))
                 out = o.get("output")
                 err = o.get("error")
-                text = str(out if ok else (err or out) or "").strip()
+                if not ok:
+                    text = str(err or out or "").strip()
+                else:
+                    if isinstance(out, dict):
+                        # Prefer metadata-ish fields; do not dump full `rendered` bodies into the prompt.
+                        url = out.get("url") if isinstance(out.get("url"), str) else None
+                        status = out.get("status_code") if out.get("status_code") is not None else None
+                        content_type = out.get("content_type") if isinstance(out.get("content_type"), str) else None
+                        rendered = out.get("rendered") if isinstance(out.get("rendered"), str) else None
+                        rendered_len = len(rendered) if isinstance(rendered, str) else None
+                        parts: list[str] = []
+                        if url:
+                            parts.append(f"url={url}")
+                        if status is not None:
+                            parts.append(f"status={status}")
+                        if content_type:
+                            parts.append(f"type={content_type}")
+                        if rendered_len is not None:
+                            parts.append(f"rendered_len={rendered_len}")
+                        text = ", ".join(parts) if parts else f"keys={list(out.keys())[:8]}"
+                    else:
+                        text = str(out or "").strip()
+                if len(text) > max_obs_chars:
+                    text = f"{text[: max(0, max_obs_chars - 1)]}…"
                 lines.append(f"- [{name}] {'OK' if ok else 'ERR'}: {text}")
         lines.append("")
     return "\n".join(lines).strip()
@@ -641,6 +766,67 @@ def create_react_workflow(
 
         if tool_calls:
             cycle["tool_calls"] = [tc.__dict__ for tc in tool_calls]
+
+            # Loop guard: some models may repeat the exact same tool calls (including side effects)
+            # even after receiving successful observations. Skip executing duplicates to avoid
+            # repeatedly overwriting files or re-running commands.
+            try:
+                side_effect_tools = {"write_file", "edit_file", "execute_command"}
+                has_side_effect = any(
+                    isinstance(getattr(tc, "name", None), str) and str(getattr(tc, "name") or "").strip() in side_effect_tools
+                    for tc in tool_calls
+                )
+
+                if has_side_effect:
+                    cycles_list = scratchpad.get("cycles")
+                    prev_cycle: Optional[Dict[str, Any]] = None
+                    if isinstance(cycles_list, list) and len(cycles_list) >= 2:
+                        for c in reversed(cycles_list[:-1]):
+                            if not isinstance(c, dict):
+                                continue
+                            prev_tcs = c.get("tool_calls")
+                            if isinstance(prev_tcs, list) and prev_tcs:
+                                prev_cycle = c
+                                break
+
+                    def _cycle_fps(c: Dict[str, Any]) -> list[str]:
+                        tcs2 = c.get("tool_calls")
+                        if not isinstance(tcs2, list) or not tcs2:
+                            return []
+                        fps: list[str] = []
+                        for tc in tcs2:
+                            if not isinstance(tc, dict):
+                                continue
+                            fps.append(_tool_call_fingerprint(tc.get("name", ""), tc.get("arguments")))
+                        return fps
+
+                    def _cycle_obs_all_ok(c: Dict[str, Any]) -> bool:
+                        obs2 = c.get("observations")
+                        if not isinstance(obs2, list) or not obs2:
+                            return False
+                        for o in obs2:
+                            if not isinstance(o, dict):
+                                return False
+                            if o.get("success") is not True:
+                                return False
+                        return True
+
+                    if prev_cycle is not None and _cycle_obs_all_ok(prev_cycle):
+                        prev_fps = _cycle_fps(prev_cycle)
+                        cur_fps = [_tool_call_fingerprint(tc.name, tc.arguments) for tc in tool_calls]
+                        if prev_fps and prev_fps == cur_fps:
+                            _push_inbox(
+                                runtime_ns,
+                                "You are repeating the exact same tool calls as the previous cycle, and they already succeeded.\n"
+                                "Do NOT execute them again (to avoid duplicate side effects).\n"
+                                "Instead, use the existing tool outputs and provide the final answer with NO tool calls.",
+                            )
+                            emit("parse_repeat_tool_calls", {"cycle": cycle_i, "count": len(tool_calls)})
+                            temp["pending_tool_calls"] = []
+                            return StepPlan(node_id="parse", next_node="reason")
+            except Exception:
+                pass
+
             # Keep tool transcript in context for OpenAI-compatible tool calling.
             context["messages"].append(
                 _new_assistant_message_with_tool_calls(
