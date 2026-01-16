@@ -25,6 +25,7 @@ from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 
 from .generation_params import runtime_llm_params
+from .media import extract_media_from_context
 from ..logic.react import ReActLogic
 
 
@@ -265,10 +266,15 @@ def _tool_call_fingerprint(name: str, args: Any) -> str:
 
 
 _PLANISH_RE = re.compile(
-    r"(?i)\b("
-    r"let me|let's|i will|i'll|first|next|then|start by|i need to|we need to|"
-    r"i should|plan|set up|setup|create the project|implement|proceed"
-    r")\b"
+    # Strong “planning” signals, but avoid false positives like “plan mode”.
+    r"(?i)("
+    # Common planning language (inline).
+    r"\b(let me|let's|i will|i'll|first|next|then|start by|i need to|we need to|i should|set up|setup|"
+    r"create the project|implement|proceed)\b"
+    r"|"
+    # Explicit planning headings.
+    r"(^|\n)\s*(plan|approach|steps)\s*[:\-]\s*"
+    r")"
 )
 
 
@@ -712,6 +718,9 @@ def create_react_workflow(
 
         payload: Dict[str, Any] = {"prompt": ""}
         payload["messages"] = _sanitize_llm_messages(messages_view)
+        media = extract_media_from_context(context)
+        if media:
+            payload["media"] = media
 
         tool_specs = runtime_ns.get("tool_specs") if isinstance(runtime_ns, dict) else None
         if isinstance(tool_specs, list) and tool_specs:

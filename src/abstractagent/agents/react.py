@@ -124,6 +124,7 @@ class ReactAgent(BaseAgent):
         allowed_tools: Optional[List[str]] = None,
         temperature: Optional[float] = None,
         seed: Optional[int] = None,
+        attachments: Optional[List[Any]] = None,
     ) -> str:
         task = str(task or "").strip()
         if not task:
@@ -178,6 +179,25 @@ class ReactAgent(BaseAgent):
             # Canonical _limits namespace for runtime awareness
             "_limits": limits,
         }
+        if attachments:
+            items: list[Any]
+            if isinstance(attachments, tuple):
+                items = list(attachments)
+            else:
+                items = attachments if isinstance(attachments, list) else []
+            normalized: list[Any] = []
+            for item in items:
+                if isinstance(item, str) and item.strip():
+                    normalized.append(item.strip())
+                    continue
+                if isinstance(item, dict):
+                    aid = item.get("$artifact")
+                    if not (isinstance(aid, str) and aid.strip()):
+                        aid = item.get("artifact_id")
+                    if isinstance(aid, str) and aid.strip():
+                        normalized.append(dict(item))
+            if normalized:
+                vars["context"]["attachments"] = normalized
         if temperature is not None:
             try:
                 vars["_runtime"]["temperature"] = float(temperature)

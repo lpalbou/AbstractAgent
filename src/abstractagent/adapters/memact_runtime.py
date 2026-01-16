@@ -12,6 +12,7 @@ from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
 
 from .generation_params import runtime_llm_params
+from .media import extract_media_from_context
 from ..logic.memact import MemActLogic
 
 
@@ -286,6 +287,9 @@ def create_memact_workflow(
 
         payload: Dict[str, Any] = {"prompt": ""}
         payload["messages"] = _sanitize_llm_messages(messages_view)
+        media = extract_media_from_context(context)
+        if media:
+            payload["media"] = media
         if tool_specs:
             payload["tools"] = list(tool_specs)
         if system_prompt:

@@ -12,6 +12,7 @@ from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
 
 from .generation_params import runtime_llm_params
+from .media import extract_media_from_context
 from ..logic.codeact import CodeActLogic
 
 
@@ -337,6 +338,9 @@ def create_codeact_workflow(
         emit("plan_request", {"tools": allow})
 
         payload: Dict[str, Any] = {"prompt": prompt, "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2})}
+        media = extract_media_from_context(context)
+        if media:
+            payload["media"] = media
         sys = _system_prompt(runtime_ns)
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
@@ -432,6 +436,9 @@ def create_codeact_workflow(
             "messages": _sanitize_llm_messages(messages_view, limits=limits),
             "tools": list(tool_specs),
         }
+        media = extract_media_from_context(context)
+        if media:
+            payload["media"] = media
         sys = _system_prompt(runtime_ns) or req.system_prompt
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
@@ -1070,6 +1077,9 @@ def create_codeact_workflow(
             "response_schema_name": "CodeActVerifier",
             "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2}),
         }
+        media = extract_media_from_context(context)
+        if media:
+            payload["media"] = media
         sys = _system_prompt(runtime_ns)
         if sys is not None:
             payload["system_prompt"] = sys
