@@ -90,6 +90,7 @@ class ReActLogic:
 
         system_prompt = (
             f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
+            "## MY PERSONA\n"
             "You are an autonomous ReAct agent (Reason → Act → Observe).\n\n"
             "Loop contract:\n"
             "- THINK briefly using the full transcript and prior observations.\n"

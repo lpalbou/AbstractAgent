@@ -738,7 +738,10 @@ def create_react_workflow(
         max_out = _max_output_tokens(runtime_ns, limits)
         if isinstance(max_out, int) and max_out > 0:
             params["max_tokens"] = max_out
-        payload["params"] = runtime_llm_params(runtime_ns, extra=params)
+        # Tool calling is formatting-sensitive; bias toward a lower temperature when tools are present,
+        # unless the caller explicitly sets `_runtime.temperature`.
+        default_temp = 0.2 if isinstance(tool_specs, list) and tool_specs else 0.7
+        payload["params"] = runtime_llm_params(runtime_ns, extra=params, default_temperature=default_temp)
 
         return StepPlan(
             node_id="reason",
