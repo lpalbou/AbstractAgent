@@ -717,7 +717,15 @@ def create_react_workflow(
         emit("reason", {"iteration": iteration, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
 
         payload: Dict[str, Any] = {"prompt": ""}
-        payload["messages"] = _sanitize_llm_messages(messages_view)
+        sanitized_messages = _sanitize_llm_messages(messages_view)
+        if sanitized_messages:
+            payload["messages"] = sanitized_messages
+        else:
+            # Ensure LLM_CALL contract is satisfied even for one-shot runs where callers
+            # provide only `context.task` and no `context.messages`.
+            task_text = str(task or "").strip()
+            if task_text:
+                payload["prompt"] = task_text
         media = extract_media_from_context(context)
         if media:
             payload["media"] = media
@@ -1145,7 +1153,7 @@ def create_react_workflow(
             if not success:
                 display = _display(output) if isinstance(output, dict) else str(error or output)
             rendered = logic.format_observation(name=name, output=display, success=success)
-            emit("observe", {"tool": name, "success": success})
+            emit("observe", {"tool": name, "success": success, "result": rendered})
 
             context["messages"].append(
                 _new_message(
