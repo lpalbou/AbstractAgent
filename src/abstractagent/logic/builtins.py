@@ -25,6 +25,23 @@ ASK_USER_TOOL = ToolDefinition(
     when_to_use="Use when the task is ambiguous or you need user input to proceed.",
 )
 
+OPEN_ATTACHMENT_TOOL = ToolDefinition(
+    name="open_attachment",
+    description="Read an attachment (artifact) from the current session with bounded output.",
+    parameters={
+        "artifact_id": {"type": "string", "description": "Attachment artifact id (preferred).", "default": None},
+        "handle": {"type": "string", "description": "Attachment handle (usually '@path').", "default": None},
+        "expected_sha256": {"type": "string", "description": "Optional sha256 to disambiguate versions.", "default": None},
+        "start_line": {"type": "integer", "description": "1-based start line (default 1).", "default": 1},
+        "end_line": {"type": "integer", "description": "Optional end line (inclusive).", "default": None},
+        "max_chars": {"type": "integer", "description": "Maximum characters to return (default 8000).", "default": 8000},
+    },
+    when_to_use=(
+        "Use to re-open a previously attached file without re-sending its full contents in the chat context. "
+        "Prefer artifact_id when available; otherwise use handle."
+    ),
+)
+
 RECALL_MEMORY_TOOL = ToolDefinition(
     name="recall_memory",
     description="Recall archived memory spans with provenance (by span_id/query/tags/time range).",

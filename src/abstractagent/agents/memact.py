@@ -19,6 +19,7 @@ from ..logic.builtins import (
     COMPACT_MEMORY_TOOL,
     DELEGATE_AGENT_TOOL,
     INSPECT_VARS_TOOL,
+    OPEN_ATTACHMENT_TOOL,
     RECALL_MEMORY_TOOL,
     REMEMBER_TOOL,
     REMEMBER_NOTE_TOOL,
@@ -98,6 +99,7 @@ class MemActAgent(BaseAgent):
         tool_defs = _tool_definitions_from_callables(self.tools)
         tool_defs = [
             ASK_USER_TOOL,
+            OPEN_ATTACHMENT_TOOL,
             RECALL_MEMORY_TOOL,
             INSPECT_VARS_TOOL,
             REMEMBER_TOOL,
