@@ -266,14 +266,14 @@ def _tool_call_fingerprint(name: str, args: Any) -> str:
 
 
 _PLANISH_RE = re.compile(
-    # Strong “planning” signals, but avoid false positives like “plan mode”.
+    # “Planning” signals. Keep this conservative: false positives cause wasted ReAct
+    # iterations when no tools are needed.
     r"(?i)("
-    # Common planning language (inline).
-    r"\b(let me|let's|i will|i'll|first|next|then|start by|i need to|we need to|i should|set up|setup|"
-    r"create the project|implement|proceed)\b"
-    r"|"
     # Explicit planning headings.
-    r"(^|\n)\s*(plan|approach|steps)\s*[:\-]\s*"
+    r"(^|\n)\s*(plan|approach|steps)\s*[:\\-]\s*"
+    r"|"
+    # Strong planning language (inline).
+    r"\b(let me|let's|i will|i'll|i am going to|i'm going to|i need to|we need to|we should)\b"
     r")"
 )
 
@@ -285,7 +285,11 @@ def _looks_like_plan(text: str) -> bool:
     # Heuristic: planning language + no obvious "final" framing.
     if not _PLANISH_RE.search(s):
         return False
-    if re.search(r"(?i)\b(final answer|here is|done|completed|in summary)\b", s):
+    # Common “final answer” framing (incl. typographic apostrophes).
+    if re.search(r"(?i)\b(final answer|here is|here['’]s|here are|below is|below are|done|completed|in summary|summary|result)\b", s):
+        return False
+    # If the model already produced a structured answer (headings/sections), don't retry.
+    if re.search(r"(?m)^(#{1,6}\s+\\S|\\*\\*\\S)", s):
         return False
     return True
 
