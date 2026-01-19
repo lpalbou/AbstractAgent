@@ -318,6 +318,17 @@ def _drain_inbox(runtime_ns: Dict[str, Any]) -> str:
     runtime_ns["inbox"] = []
     return "\n".join(parts).strip()
 
+
+def _boolish(value: Any) -> bool:
+    """Best-effort coercion for runtime flags (bool/int/str)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+    return False
+
 def _system_prompt_override(runtime_ns: Dict[str, Any]) -> Optional[str]:
     raw = runtime_ns.get("system_prompt") if isinstance(runtime_ns, dict) else None
     if isinstance(raw, str) and raw.strip():
@@ -781,6 +792,28 @@ def create_react_workflow(
             finish_reason = str(fr or "").strip().lower() if fr is not None else ""
 
         cycle_i = int(scratchpad.get("iteration", 0) or 0)
+        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
+        if max_iterations < 1:
+            max_iterations = 1
+        reasoning_text = ""
+        try:
+            if isinstance(response, dict):
+                rc = response.get("reasoning")
+                if rc is None:
+                    rc = response.get("reasoning_content")
+                reasoning_text = str(rc or "")
+        except Exception:
+            reasoning_text = ""
+        emit(
+            "parse",
+            {
+                "iteration": cycle_i,
+                "max_iterations": max_iterations,
+                "has_tool_calls": bool(tool_calls),
+                "content": str(content or ""),
+                "reasoning": reasoning_text,
+            },
+        )
         cycle: Dict[str, Any] = {"i": cycle_i, "thought": content, "tool_calls": [], "observations": []}
         cycles = scratchpad.get("cycles")
         if isinstance(cycles, list):
@@ -882,8 +915,10 @@ def create_react_workflow(
             emit("parse_retry_empty", {"cycle": cycle_i})
             return StepPlan(node_id="parse", next_node="reason")
 
-        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
-        if cycle_i < max_iterations and _looks_like_plan(content):
+        # Optional heuristic: if enabled, retry when the model seems to be "still planning"
+        # without emitting tool calls. Default OFF (can be toggled by clients via runtime_ns.check_plan).
+        check_plan = _boolish(runtime_ns.get("check_plan")) if isinstance(runtime_ns, dict) else False
+        if check_plan and cycle_i < max_iterations and _looks_like_plan(content):
             _push_inbox(
                 runtime_ns,
                 "You responded without tool calls but appear to still be planning.\n"
@@ -900,11 +935,16 @@ def create_react_workflow(
         return StepPlan(node_id="parse", next_node="done")
 
     def act_node(run: RunState, ctx) -> StepPlan:
-        context, _, runtime_ns, temp, _ = ensure_react_vars(run)
+        context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
 
         pending = temp.get("pending_tool_calls", [])
         if not isinstance(pending, list):
             pending = []
+
+        cycle_i = int(scratchpad.get("iteration", 0) or 0)
+        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
+        if max_iterations < 1:
+            max_iterations = 1
 
         tool_queue: list[Dict[str, Any]] = []
         for idx, tc in enumerate(pending):
@@ -1105,7 +1145,16 @@ def create_react_workflow(
 
         formatted_calls: List[Dict[str, Any]] = []
         for tc in batch:
-            emit("act", {"tool": tc.get("name", ""), "args": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")})
+            emit(
+                "act",
+                {
+                    "iteration": cycle_i,
+                    "max_iterations": max_iterations,
+                    "tool": tc.get("name", ""),
+                    "args": tc.get("arguments", {}),
+                    "call_id": str(tc.get("call_id") or ""),
+                },
+            )
             formatted_calls.append(
                 {"name": tc.get("name", ""), "arguments": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")}
             )
