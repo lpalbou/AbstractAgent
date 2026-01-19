@@ -7,6 +7,7 @@ Agent-specific tools (execute_python, self_improve) are defined locally.
 # Import common tools from AbstractCore (canonical source)
 from abstractcore.tools.common_tools import (
     list_files,
+    skim_folders,
     analyze_code,
     read_file,
     skim_files,
@@ -26,6 +27,7 @@ from .self_improve import self_improve
 ALL_TOOLS = [
     # File operations (from abstractcore)
     list_files,
+    skim_folders,
     analyze_code,
     read_file,
     skim_files,
@@ -45,6 +47,7 @@ ALL_TOOLS = [
 __all__ = [
     # File operations
     "list_files",
+    "skim_folders",
     "analyze_code",
     "read_file",
     "skim_files",
