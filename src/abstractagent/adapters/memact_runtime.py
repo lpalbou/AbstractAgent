@@ -234,7 +234,168 @@ def create_memact_workflow(
         runtime_ns.setdefault("inbox", [])
 
         emit("init", {"task": task})
-        return StepPlan(node_id="init", next_node="reason")
+        return StepPlan(node_id="init", next_node="compose")
+
+    def compose_node(run: RunState, ctx) -> StepPlan:
+        """Optional, runtime-owned memory composition step (v0).
+
+        When enabled via `_runtime.memact_composer.enabled`, this node queries the
+        temporal KG (`MEMORY_KG_QUERY`) using the latest user message as stimulus
+        and maps the selected packets into MemAct CURRENT CONTEXT entries.
+
+        This runs *before* `reason` so it does not consume agent iterations.
+        """
+        context, _, runtime_ns, temp, _ = ensure_memact_vars(run)
+
+        cfg_raw = runtime_ns.get("memact_composer") if isinstance(runtime_ns, dict) else None
+        cfg = cfg_raw if isinstance(cfg_raw, dict) else {}
+        enabled = bool(cfg.get("enabled"))
+        if not enabled:
+            return StepPlan(node_id="compose", next_node="reason")
+
+        # Derive stimulus from the latest user message, falling back to `context.task`.
+        stimulus = ""
+        stimulus_message_id: Optional[str] = None
+        messages = context.get("messages")
+        if isinstance(messages, list):
+            for m in reversed(messages):
+                if not isinstance(m, dict):
+                    continue
+                if str(m.get("role") or "") != "user":
+                    continue
+                raw = m.get("content")
+                if raw is None:
+                    continue
+                text = str(raw).strip()
+                if not text:
+                    continue
+                stimulus = text
+                meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
+                mid = meta.get("message_id") if isinstance(meta, dict) else None
+                if isinstance(mid, str) and mid.strip():
+                    stimulus_message_id = mid.strip()
+                break
+        if not stimulus:
+            stimulus = str(context.get("task", "") or "").strip()
+
+        if not stimulus:
+            return StepPlan(node_id="compose", next_node="reason")
+
+        recall_level = str(cfg.get("recall_level") or "urgent").strip().lower() or "urgent"
+        scope = str(cfg.get("scope") or "session").strip().lower() or "session"
+        marker = str(cfg.get("marker") or "KG:").strip() or "KG:"
+        max_items = cfg.get("max_items")
+        max_items_int: Optional[int] = None
+        if max_items is not None and not isinstance(max_items, bool):
+            try:
+                mi = int(float(max_items))
+            except Exception:
+                mi = None
+            if isinstance(mi, int) and mi > 0:
+                max_items_int = mi
+
+        # Build a stable "composition key" so we don't re-query on tool iterations.
+        compose_key_parts = [
+            stimulus_message_id or stimulus,
+            recall_level,
+            scope,
+            str(cfg.get("limit") or ""),
+            str(cfg.get("min_score") or ""),
+            str(cfg.get("max_input_tokens") or cfg.get("max_in_tokens") or ""),
+        ]
+        compose_key = "|".join([p for p in compose_key_parts if p is not None])
+
+        bucket_raw = temp.get("memact_composer")
+        bucket: Dict[str, Any] = bucket_raw if isinstance(bucket_raw, dict) else {}
+        temp["memact_composer"] = bucket
+
+        # If we already applied the composer for this key and have no pending results, skip.
+        if bucket.get("applied_key") == compose_key and "kg_result" not in bucket:
+            return StepPlan(node_id="compose", next_node="reason")
+
+        kg_result = bucket.get("kg_result")
+        if isinstance(kg_result, dict):
+            try:
+                from abstractruntime.memory.memact_composer import compose_memact_current_context_from_kg_result
+
+                out = compose_memact_current_context_from_kg_result(
+                    run.vars,
+                    kg_result=kg_result,
+                    stimulus=stimulus,
+                    marker=marker,
+                    max_items=max_items_int,
+                )
+            except Exception as e:
+                out = {"ok": False, "error": str(e), "delta": {}, "trace": {}}
+
+            bucket.pop("kg_result", None)
+            bucket["applied_key"] = compose_key
+            bucket["last_stimulus"] = stimulus
+
+            # Persist a small trace for UI/debuggers (bounded list).
+            try:
+                from abstractruntime.memory.active_memory import ensure_memact_memory
+
+                mem = ensure_memact_memory(run.vars)
+                traces = mem.get("composer_traces")
+                if not isinstance(traces, list):
+                    traces = []
+                    mem["composer_traces"] = traces
+
+                timestamp: Optional[str] = None
+                now_iso = getattr(ctx, "now_iso", None)
+                if callable(now_iso):
+                    timestamp = str(now_iso())
+                if not timestamp:
+                    from datetime import datetime, timezone
+
+                    timestamp = datetime.now(timezone.utc).isoformat()
+
+                trace_entry = {
+                    "at": timestamp,
+                    "compose_key": compose_key,
+                    "ok": bool(out.get("ok")),
+                    "trace": out.get("trace"),
+                }
+                traces.insert(0, trace_entry)
+                del traces[25:]
+            except Exception:
+                pass
+
+            emit("compose", {"ok": bool(out.get("ok")), "stimulus": stimulus, "recall_level": recall_level, "scope": scope})
+            return StepPlan(node_id="compose", next_node="reason")
+
+        # No result yet: schedule KG query.
+        payload: Dict[str, Any] = {
+            "query_text": stimulus,
+            "recall_level": recall_level,
+            "scope": scope,
+        }
+        for src_key, dst_key in (
+            ("limit", "limit"),
+            ("min_score", "min_score"),
+            ("max_input_tokens", "max_input_tokens"),
+            ("max_in_tokens", "max_input_tokens"),
+            ("model", "model"),
+        ):
+            if src_key in cfg:
+                payload[dst_key] = cfg.get(src_key)
+
+        # Default packing model: re-use the configured LLM model when available.
+        if "model" not in payload:
+            model_name = runtime_ns.get("model")
+            if isinstance(model_name, str) and model_name.strip():
+                payload["model"] = model_name.strip()
+
+        # Store key so we can attribute the result even if the stimulus changes later.
+        bucket["pending_key"] = compose_key
+
+        emit("compose_query", {"stimulus": stimulus, "recall_level": recall_level, "scope": scope})
+        return StepPlan(
+            node_id="compose",
+            effect=Effect(type=EffectType.MEMORY_KG_QUERY, payload=payload, result_key="_temp.memact_composer.kg_result"),
+            next_node="compose",
+        )
 
     def reason_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_memact_vars(run)
@@ -354,7 +515,7 @@ def create_memact_workflow(
         raw_queue = temp.get("pending_tool_calls", [])
         if not isinstance(raw_queue, list) or not raw_queue:
             temp["pending_tool_calls"] = []
-            return StepPlan(node_id="act", next_node="reason")
+            return StepPlan(node_id="act", next_node="compose")
 
         allow = _effective_allowlist(runtime_ns)
         builtin_effect_tools = {
@@ -379,7 +540,7 @@ def create_memact_workflow(
 
         if not tool_queue:
             temp["pending_tool_calls"] = []
-            return StepPlan(node_id="act", next_node="reason")
+            return StepPlan(node_id="act", next_node="compose")
 
         def _is_builtin(tc: Dict[str, Any]) -> bool:
             name = tc.get("name")
@@ -562,7 +723,7 @@ def create_memact_workflow(
 
             if temp.get("pending_tool_calls"):
                 return StepPlan(node_id="act", next_node="act")
-            return StepPlan(node_id="act", next_node="reason")
+            return StepPlan(node_id="act", next_node="compose")
 
         batch: List[Dict[str, Any]] = []
         for tc in tool_queue:
@@ -638,7 +799,7 @@ def create_memact_workflow(
         if isinstance(pending, list) and pending:
             return StepPlan(node_id="observe", next_node="act")
         temp["pending_tool_calls"] = []
-        return StepPlan(node_id="observe", next_node="reason")
+        return StepPlan(node_id="observe", next_node="compose")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
         context, _, _, temp, _ = ensure_memact_vars(run)
@@ -653,7 +814,7 @@ def create_memact_workflow(
 
         if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
-        return StepPlan(node_id="handle_user_response", next_node="reason")
+        return StepPlan(node_id="handle_user_response", next_node="compose")
 
     def finalize_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_memact_vars(run)
@@ -784,6 +945,7 @@ def create_memact_workflow(
         entry_node="init",
         nodes={
             "init": init_node,
+            "compose": compose_node,
             "reason": reason_node,
             "parse": parse_node,
             "act": act_node,
