@@ -130,6 +130,18 @@ RECALL_MEMORY_TOOL = ToolDefinition(
             "description": "Memory scope to query: run | session | global | all (default run).",
             "default": "run",
         },
+        "recall_level": {
+            "type": "string",
+            "enum": ["urgent", "standard", "deep"],
+            "description": (
+                "Optional recall effort policy.\n"
+                "- urgent: fastest, tight budgets\n"
+                "- standard: bounded but more thorough\n"
+                "- deep: may be slow/expensive\n"
+                "No silent downgrade: budgets/permissions are enforced by the runtime."
+            ),
+            "default": None,
+        },
     },
     when_to_use="Use after compaction or when you need exact details from earlier context.",
 )
