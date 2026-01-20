@@ -442,6 +442,90 @@ def _render_cycles_for_system_prompt(scratchpad: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _render_cycles_for_conclusion_prompt(scratchpad: Dict[str, Any]) -> str:
+    cycles = scratchpad.get("cycles")
+    if not isinstance(cycles, list) or not cycles:
+        return ""
+
+    # The conclusion prompt should have access to the full loop trace, but still needs
+    # to be bounded (tool outputs may be huge).
+    max_cycles = 25
+    max_thought_chars = 900
+    max_obs_chars = 360
+
+    view = [c for c in cycles if isinstance(c, dict)]
+    total = len(view)
+    if total > max_cycles:
+        view = view[-max_cycles:]
+
+    lines: list[str] = []
+    if total > len(view):
+        lines.append(f"(showing last {len(view)} of {total} cycles)")
+        lines.append("")
+
+    for c in view:
+        i = c.get("i")
+        if i is None:
+            continue
+        lines.append(f"[cycle {i}]")
+
+        thought = str(c.get("thought") or "").strip()
+        if len(thought) > max_thought_chars:
+            thought = f"{thought[: max(0, max_thought_chars - 1)]}…"
+        if thought:
+            lines.append(f"thought: {thought}")
+
+        tcs = c.get("tool_calls")
+        if isinstance(tcs, list) and tcs:
+            sigs: list[str] = []
+            for tc in tcs:
+                if isinstance(tc, dict):
+                    sigs.append(_tool_call_signature(tc.get("name", ""), tc.get("arguments")))
+            if sigs:
+                lines.append("actions:")
+                for s in sigs:
+                    lines.append(f"- {s}")
+
+        obs = c.get("observations")
+        if isinstance(obs, list) and obs:
+            lines.append("observations:")
+            for o in obs:
+                if not isinstance(o, dict):
+                    continue
+                name = str(o.get("name") or "tool")
+                ok = bool(o.get("success"))
+                out = o.get("output")
+                err = o.get("error")
+                if not ok:
+                    text = str(err or out or "").strip()
+                else:
+                    if isinstance(out, dict):
+                        url = out.get("url") if isinstance(out.get("url"), str) else None
+                        status = out.get("status_code") if out.get("status_code") is not None else None
+                        content_type = out.get("content_type") if isinstance(out.get("content_type"), str) else None
+                        rendered = out.get("rendered") if isinstance(out.get("rendered"), str) else None
+                        rendered_len = len(rendered) if isinstance(rendered, str) else None
+                        parts: list[str] = []
+                        if url:
+                            parts.append(f"url={url}")
+                        if status is not None:
+                            parts.append(f"status={status}")
+                        if content_type:
+                            parts.append(f"type={content_type}")
+                        if rendered_len is not None:
+                            parts.append(f"rendered_len={rendered_len}")
+                        text = ", ".join(parts) if parts else f"keys={list(out.keys())[:8]}"
+                    else:
+                        text = str(out or "").strip()
+                if len(text) > max_obs_chars:
+                    text = f"{text[: max(0, max_obs_chars - 1)]}…"
+                lines.append(f"- [{name}] {'OK' if ok else 'ERR'}: {text}")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 def _render_final_report(task: str, scratchpad: Dict[str, Any]) -> str:
     cycles = scratchpad.get("cycles")
     if not isinstance(cycles, list):
@@ -915,9 +999,10 @@ def create_react_workflow(
             emit("parse_retry_empty", {"cycle": cycle_i})
             return StepPlan(node_id="parse", next_node="reason")
 
-        # Optional heuristic: if enabled, retry when the model seems to be "still planning"
-        # without emitting tool calls. Default OFF (can be toggled by clients via runtime_ns.check_plan).
-        check_plan = _boolish(runtime_ns.get("check_plan")) if isinstance(runtime_ns, dict) else False
+        # Heuristic: retry when the model seems to be "still planning" without emitting tool calls.
+        # Default ON (can be disabled by clients via `_runtime.check_plan=false`).
+        raw_check_plan = runtime_ns.get("check_plan") if isinstance(runtime_ns, dict) else None
+        check_plan = True if raw_check_plan is None else _boolish(raw_check_plan)
         if check_plan and cycle_i < max_iterations and _looks_like_plan(content):
             _push_inbox(
                 runtime_ns,
@@ -1283,23 +1368,143 @@ def create_react_workflow(
         )
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, temp, limits = ensure_react_vars(run)
+        context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
         max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
         if max_iterations < 1:
             max_iterations = 1
         emit("max_iterations", {"iterations": max_iterations})
 
-        messages = list(context.get("messages") or [])
-        last_content = messages[-1]["content"] if messages else "Max iterations reached"
-        temp["final_answer"] = str(last_content)
+        # Deterministic conclusion: when we hit the iteration cap, run one tool-free LLM call
+        # to synthesize a final report + next steps while the scratchpad is still in context.
+        resp = temp.get("max_iterations_llm_response")
+        if not isinstance(resp, dict):
+            drained_guidance = _drain_inbox(runtime_ns)
+            conclude_directive = (
+                "You have reached the maximum allowed ReAct iterations.\n"
+                "You MUST stop using tools now and provide a best-effort conclusion.\n\n"
+                "In your response, include:\n"
+                "1) A concise progress report (what you did + key observations).\n"
+                "2) The best current answer you can give based on evidence.\n"
+                "3) Remaining uncertainties / missing info.\n"
+                "4) Next steps: exact actions to finish (files to inspect/edit, commands/tools to run, what to look for).\n\n"
+                "Rules:\n"
+                "- Do NOT call tools.\n"
+                "- Do NOT mention internal scratchpads; just present the report.\n"
+                "- Prefer bullet points and concrete next steps."
+            )
+
+            task = str(context.get("task", "") or "")
+            messages_view = list(context.get("messages") or [])
+
+            req = logic.build_request(
+                task=task,
+                messages=messages_view,
+                guidance="",
+                iteration=max_iterations,
+                max_iterations=max_iterations,
+                vars=run.vars,
+            )
+
+            payload: Dict[str, Any] = {"prompt": ""}
+            sanitized_messages = _sanitize_llm_messages(messages_view)
+            if sanitized_messages:
+                payload["messages"] = sanitized_messages
+            else:
+                task_text = str(task or "").strip()
+                if task_text:
+                    payload["prompt"] = task_text
+
+            media = extract_media_from_context(context)
+            if media:
+                payload["media"] = media
+
+            sys_base = str(req.system_prompt or "").strip()
+            sys = _compose_system_prompt(runtime_ns, base=sys_base)
+            block_parts: list[str] = []
+            if drained_guidance:
+                block_parts.append(f"Host guidance:\n{drained_guidance}")
+            block_parts.append(conclude_directive)
+            sys = (f"{sys.rstrip()}\n\n## Max iterations reached\n" + "\n\n".join(block_parts)).strip()
+            scratch_txt = _render_cycles_for_conclusion_prompt(scratchpad)
+            if scratch_txt:
+                sys = f"{sys.rstrip()}\n\n## Scratchpad (ReAct cycles so far)\n{scratch_txt}".strip()
+            if sys:
+                payload["system_prompt"] = sys
+
+            eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+            eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
+            if isinstance(eff_provider, str) and eff_provider.strip():
+                payload["provider"] = eff_provider.strip()
+            if isinstance(eff_model, str) and eff_model.strip():
+                payload["model"] = eff_model.strip()
+
+            params: Dict[str, Any] = {}
+            max_out = _max_output_tokens(runtime_ns, limits)
+            if isinstance(max_out, int) and max_out > 0:
+                params["max_tokens"] = max_out
+            payload["params"] = runtime_llm_params(runtime_ns, extra=params, default_temperature=0.2)
+
+            return StepPlan(
+                node_id="max_iterations",
+                effect=Effect(type=EffectType.LLM_CALL, payload=payload, result_key="_temp.max_iterations_llm_response"),
+                next_node="max_iterations",
+            )
+
+        # We have a conclusion LLM response. Parse it and complete the run.
+        content, tool_calls = logic.parse_response(resp)
+        answer = str(content or "").strip()
+        temp.pop("max_iterations_llm_response", None)
+
+        # If the model still emitted tool calls, retry once with a stricter instruction.
+        if tool_calls and not answer:
+            retries = int(temp.get("max_iterations_conclude_retries", 0) or 0)
+            if retries < 1:
+                temp["max_iterations_conclude_retries"] = retries + 1
+                _push_inbox(
+                    runtime_ns,
+                    "You are out of iterations and tool use is disabled.\n"
+                    "Return ONLY the final report and next steps as plain text, with NO tool calls.",
+                )
+                # Re-run the same conclusion call (tool-free).
+                return StepPlan(node_id="max_iterations", next_node="max_iterations")
+
+        if not answer:
+            # Fallback: avoid returning the last tool observation as the "answer".
+            # Provide a deterministic report so users don't lose scratchpad context.
+            scratch_view = _render_cycles_for_conclusion_prompt(scratchpad)
+            parts = [
+                "Max iterations reached.",
+                "I could not produce a final assistant response in time.",
+            ]
+            if scratch_view:
+                parts.append("## Progress (from scratchpad)\n" + scratch_view)
+            parts.append(
+                "## Next steps\n"
+                "- Increase `max_iterations` and rerun, or use `/conclude` earlier to force a wrap-up.\n"
+                "- If you need me to continue, re-run with a higher iteration budget and I will pick up from the report above."
+            )
+            answer = "\n\n".join(parts).strip()
+
+        # Persist final answer into the conversation history (so it shows up in /history and seeds next runs).
+        messages = context.get("messages")
+        if isinstance(messages, list):
+            last = messages[-1] if messages else None
+            last_role = last.get("role") if isinstance(last, dict) else None
+            last_content = last.get("content") if isinstance(last, dict) else None
+            if last_role != "assistant" or str(last_content or "") != answer:
+                messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer"}))
+
+        temp["final_answer"] = answer
         report = _render_final_report(str(context.get("task") or ""), scratchpad)
+
+        iterations = int(limits.get("current_iteration", 0) or scratchpad.get("iteration", 0) or max_iterations)
         return StepPlan(
             node_id="max_iterations",
             complete_output={
-                "answer": str(last_content),
+                "answer": answer,
                 "report": report,
-                "iterations": max_iterations,
-                "messages": messages,
+                "iterations": iterations,
+                "messages": list(context.get("messages") or []),
                 "scratchpad": dict(scratchpad),
             },
         )
