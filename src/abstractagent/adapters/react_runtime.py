@@ -787,7 +787,7 @@ def create_react_workflow(
         return StepPlan(node_id="init", next_node="reason")
 
     def reason_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, runtime_ns, _, limits = ensure_react_vars(run)
+        context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
 
         max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
         if max_iterations < 1:

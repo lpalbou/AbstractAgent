@@ -37,8 +37,8 @@ OPEN_ATTACHMENT_TOOL = ToolDefinition(
         "max_chars": {"type": "integer", "description": "Maximum characters to return (default 8000).", "default": 8000},
     },
     when_to_use=(
-        "Use to re-open a previously attached file without re-sending its full contents in the chat context. "
-        "Prefer artifact_id when available; otherwise use handle."
+        "Use only to open stored (non-active) session attachments or to fetch a bounded, line-numbered excerpt when the "
+        "attachment is not already provided in this call. Prefer artifact_id when available; otherwise use handle."
     ),
 )
 
