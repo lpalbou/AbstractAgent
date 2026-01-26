@@ -217,6 +217,7 @@ def create_codeact_workflow(
             if keep < 200:
                 keep = max_chars
                 suffix = ""
+            #[WARNING:TRUNCATION] bounded message content for LLM payload
             return text[:keep].rstrip() + suffix
 
         out: List[Dict[str, str]] = []
@@ -867,6 +868,7 @@ def create_codeact_workflow(
             # Keep a bounded preview for huge tool outputs to avoid bloating traces/ledgers.
             preview = rendered
             if len(preview) > 1000:
+                #[WARNING:TRUNCATION] bounded preview for observability payloads
                 preview = preview[:1000] + f"\n… (truncated, {len(rendered):,} chars total)"
             emit("observe", {"tool": name, "success": success, "result": preview})
             context["messages"].append(
@@ -943,6 +945,7 @@ def create_codeact_workflow(
             if keep < 200:
                 keep = max_chars
                 suffix = ""
+            #[WARNING:TRUNCATION] bounded transcript blocks for prompt reconstruction
             return s[:keep].rstrip() + suffix
 
         def _format_allowed_tools() -> str:

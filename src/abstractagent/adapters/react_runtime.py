@@ -265,31 +265,54 @@ def _tool_call_fingerprint(name: str, args: Any) -> str:
         return "fingerprint_err"
 
 
-_PLANISH_RE = re.compile(
-    # “Planning” signals. Keep this conservative: false positives cause wasted ReAct
-    # iterations when no tools are needed.
-    r"(?i)("
-    # Explicit planning headings.
-    r"(^|\n)\s*(plan|approach|steps)\s*[:\\-]\s*"
-    r"|"
-    # Strong planning language (inline).
-    r"\b(let me|let's|i will|i'll|i am going to|i'm going to|i need to|we need to|we should)\b"
-    r")"
+_FINALISH_RE = re.compile(
+    r"(?i)\b(final answer|here is|here['’]s|here are|below is|below are|done|completed|in summary|summary|result)\b"
+)
+
+_WAITING_RE = re.compile(
+    r"(?i)\b("
+    r"let me know|your next step|what would you like|tell me|"
+    r"i can help|i'm ready|i am ready|"
+    r"i'll wait|i will wait|waiting for|"
+    r"no tool calls?"
+    r")\b"
+)
+
+_DEFERRED_ACTION_INTENT_RE = re.compile(
+    # Only treat as "missing tool calls" when the model *commits to acting*
+    # (first-person intent) rather than providing a final answer.
+    r"(?i)\b(i will|i['’]?ll|let me|i am going to|i['’]?m going to|i need to)\b"
+)
+
+_DEFERRED_ACTION_VERB_RE = re.compile(
+    # Verbs that typically imply external actions (tools/files/web/edits).
+    r"(?i)\b(read|open|search|list|skim|inspect|explore|scan|run|execute|edit|fetch|download)\b"
 )
 
 
-def _looks_like_plan(text: str) -> bool:
+def _looks_like_deferred_action(text: str) -> bool:
+    """Return True when the model claims it will take actions but emits no tool calls.
+
+    This is intentionally conservative: false positives waste iterations and can "force"
+    unnecessary tool calls. It should only trigger when the assistant message strongly
+    suggests it is about to act (not answer).
+    """
     s = str(text or "").strip()
     if not s:
         return False
-    # Heuristic: planning language + no obvious "final" framing.
-    if not _PLANISH_RE.search(s):
+    # If the model is explicitly waiting for user direction, that's a valid final response.
+    if _WAITING_RE.search(s):
         return False
     # Common “final answer” framing (incl. typographic apostrophes).
-    if re.search(r"(?i)\b(final answer|here is|here['’]s|here are|below is|below are|done|completed|in summary|summary|result)\b", s):
+    if _FINALISH_RE.search(s):
         return False
     # If the model already produced a structured answer (headings/sections), don't retry.
     if re.search(r"(?m)^(#{1,6}\s+\\S|\\*\\*\\S)", s):
+        return False
+    # Must contain first-person intent *and* an action-ish verb.
+    if not _DEFERRED_ACTION_INTENT_RE.search(s):
+        return False
+    if not _DEFERRED_ACTION_VERB_RE.search(s):
         return False
     return True
 
@@ -999,16 +1022,16 @@ def create_react_workflow(
             emit("parse_retry_empty", {"cycle": cycle_i})
             return StepPlan(node_id="parse", next_node="reason")
 
-        # Heuristic: retry when the model seems to be "still planning" without emitting tool calls.
-        # Default ON (can be disabled by clients via `_runtime.check_plan=false`).
+        # Optional heuristic: retry when the model claims it will take actions but emits no tool calls.
+        # Default OFF (clients may enable via `_runtime.check_plan=true`).
         raw_check_plan = runtime_ns.get("check_plan") if isinstance(runtime_ns, dict) else None
-        check_plan = True if raw_check_plan is None else _boolish(raw_check_plan)
-        if check_plan and cycle_i < max_iterations and _looks_like_plan(content):
+        check_plan = False if raw_check_plan is None else _boolish(raw_check_plan)
+        if check_plan and cycle_i < max_iterations and _looks_like_deferred_action(content):
             _push_inbox(
                 runtime_ns,
-                "You responded without tool calls but appear to still be planning.\n"
-                "If the task requires actions, CALL the next tool(s) now.\n"
-                "Only respond without tool calls when you are truly done and can provide the final answer.",
+                "You said you would take an action, but you did not emit any tool calls.\n"
+                "If you need to take actions (read/search/list/edit/run), emit ONLY the next tool call(s) now.\n"
+                "If you are already done, provide the final answer with NO tool calls.",
             )
             emit("parse_retry_plan_only", {"cycle": cycle_i})
             return StepPlan(node_id="parse", next_node="reason")
