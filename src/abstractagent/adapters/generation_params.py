@@ -64,5 +64,19 @@ def runtime_llm_params(
     else:
         out.pop("seed", None)
 
-    return out
+    # Pass-through media policies (runtime-owned defaults).
+    #
+    # This keeps thin clients simple: they can set `_runtime.audio_policy` (and
+    # optional language hints) once at run start, and all LLM_CALL steps inherit it.
+    if isinstance(runtime_ns, dict):
+        audio_policy = runtime_ns.get("audio_policy")
+        if "audio_policy" not in out and isinstance(audio_policy, str) and audio_policy.strip():
+            out["audio_policy"] = audio_policy.strip()
 
+        stt_language = runtime_ns.get("stt_language")
+        if stt_language is None:
+            stt_language = runtime_ns.get("audio_language")
+        if "stt_language" not in out and isinstance(stt_language, str) and stt_language.strip():
+            out["stt_language"] = stt_language.strip()
+
+    return out
