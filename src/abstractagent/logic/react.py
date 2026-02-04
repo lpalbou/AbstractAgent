@@ -104,7 +104,7 @@ class ReActLogic:
             "  Batch independent read-only tool calls to reduce iterations.\n"
             "  Example: read multiple files/ranges or run multiple searches in one response.\n"
             "  If reading nearby ranges of the same file, prefer ONE call with a wider range.\n"
-            "  Only split tool calls across turns when later calls depend on earlier outputs; do NOT batch side-effectful tools (write_file/edit_file/execute_command).\n"
+            "  Only split tool calls across turns when later calls depend on earlier outputs; do NOT batch side-effectful tools (write_file/edit_file/execute_command/send_email/send_whatsapp_message/send_telegram_message/send_telegram_artifact).\n"
             "- When context is getting large, use delegate_agent(task, context, tools) to offload an independent subtask with minimal context.\n"
             "- Keep tool call arguments small and valid; avoid embedding huge blobs (large file contents / giant JSON) directly in arguments.\n"
             "- Attachments:\n"

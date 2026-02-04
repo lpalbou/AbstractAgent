@@ -812,6 +812,27 @@ def create_react_workflow(
     def reason_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
 
+        # Durable resume safety:
+        # - tool definitions can change across restarts (env/toolset swaps, staged deploy swaps)
+        # - allowlists can be edited at runtime by hosts
+        # `tool_specs` must match the effective allowlist + current tool defs, otherwise the LLM may
+        # see tools it cannot execute ("tool not allowed") or see stale schemas (signature mismatch).
+        try:
+            if isinstance(runtime_ns, dict):
+                allow = _effective_allowlist(runtime_ns)
+                allowed_defs = _allowed_tool_defs(allow)
+                include_examples = _tool_prompt_examples_enabled(runtime_ns)
+                refreshed_specs = _materialize_tool_specs(allowed_defs, include_examples=include_examples)
+                refreshed_id = _compute_toolset_id(refreshed_specs)
+                prev_id = str(runtime_ns.get("toolset_id") or "")
+                prev_specs = runtime_ns.get("tool_specs")
+                if refreshed_id != prev_id or not isinstance(prev_specs, list):
+                    runtime_ns["tool_specs"] = refreshed_specs
+                    runtime_ns["toolset_id"] = refreshed_id
+                    runtime_ns.setdefault("allowed_tools", allow)
+        except Exception:
+            pass
+
         max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
         if max_iterations < 1:
             max_iterations = 1
@@ -935,7 +956,16 @@ def create_react_workflow(
             # even after receiving successful observations. Skip executing duplicates to avoid
             # repeatedly overwriting files or re-running commands.
             try:
-                side_effect_tools = {"write_file", "edit_file", "execute_command"}
+                side_effect_tools = {
+                    "write_file",
+                    "edit_file",
+                    "execute_command",
+                    # Comms tools (side-effectful; avoid duplicate sends).
+                    "send_email",
+                    "send_whatsapp_message",
+                    "send_telegram_message",
+                    "send_telegram_artifact",
+                }
                 has_side_effect = any(
                     isinstance(getattr(tc, "name", None), str) and str(getattr(tc, "name") or "").strip() in side_effect_tools
                     for tc in tool_calls
