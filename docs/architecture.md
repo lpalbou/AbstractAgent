@@ -113,5 +113,6 @@ See [`docs/tools.md`](tools.md).
 Important “schema-only” built-ins are defined in `src/abstractagent/logic/builtins.py` and mapped to runtime effects
 inside the adapters (ask_user/memory/vars/delegate).
 
-Known limitation:
-- `open_attachment` is currently **schema-only** and is not mapped to a runtime effect by adapters yet.
+`open_attachment` is also defined in `src/abstractagent/logic/builtins.py` and is included by default in all agents,
+but it is executed as a runtime-owned tool by AbstractRuntime’s AbstractCore integration (see [`docs/tools.md`](tools.md)
+and [`docs/faq.md`](faq.md)).

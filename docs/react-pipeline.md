@@ -80,6 +80,8 @@ Implemented in `act_node`:
   - `remember_note` → `MEMORY_NOTE`
   - `compact_memory` → `MEMORY_COMPACT`
   - `delegate_agent` → `START_SUBWORKFLOW` (wrapped as a tool-style observation)
+- `open_attachment` is also included as a tool schema (`OPEN_ATTACHMENT_TOOL` in `src/abstractagent/logic/builtins.py`),
+  but it is executed as a runtime-owned tool by AbstractRuntime’s AbstractCore integration (see [`docs/tools.md`](tools.md)).
 - batches regular tools into a single `TOOL_CALLS` effect (payload includes `allowed_tools`)
 
 Loop guard:
@@ -100,5 +102,4 @@ When the iteration cap is reached, `max_iterations_node` performs a tool-free co
 
 ## Known limitations (by design or not yet wired)
 
-- `open_attachment` is a schema-only tool definition today and is not mapped to a runtime effect by the ReAct adapter (see [`docs/tools.md`](tools.md)).
 - ReAct does not parse tool calls out of assistant text. If your provider returns tool requests in `content`, ensure AbstractCore normalization produces structured `tool_calls`.

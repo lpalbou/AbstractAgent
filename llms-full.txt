@@ -7,19 +7,33 @@ This repo is a Python package (`abstractagent`) that implements agent workflows 
 2) runtime adapters (logic → `WorkflowSpec` with durable `EffectType.*` steps),
 3) thin agent API wrappers (`BaseAgent` + concrete agents).
 
-If you are modifying behavior, prefer reading the workflow adapters first (they define the actual runtime graph).
-After changes, run `pytest`.
+Important notes (source-of-truth hints):
+- Runtime behavior lives in workflow adapters: `src/abstractagent/adapters/*_runtime.py`
+- Keep prompting/parsing runtime-agnostic: `src/abstractagent/logic/*` (no `abstractruntime` imports)
+- Docs entrypoint: `README.md` → `docs/getting-started.md` → `docs/README.md`
+- After changes, run tests: `pytest`
 
 ## Docs
 
 - [README](README.md): Installation + quick start
 - [Documentation index](docs/README.md): Map of all docs
 - [Getting started](docs/getting-started.md): Minimal usage + persistence example
+- [FAQ](docs/faq.md): Common questions and troubleshooting
+- [API](docs/api.md): Public API surface
 - [Agents](docs/agents.md): Agent types + API
-- [Tools](docs/tools.md): Default tools, allowlists, schema-only built-ins
+- [Tools](docs/tools.md): Default tools, allowlists, built-ins (adapter-mapped + runtime-owned)
 - [Persistence](docs/persistence.md): Pause/resume across restarts
 - [Architecture](docs/architecture.md): How logic/adapters/agents fit together (diagrams)
 - [ReAct pipeline](docs/react-pipeline.md): ReAct workflow details
+
+## Project
+
+- [Changelog](CHANGELOG.md): Release notes by version
+- [Security policy](SECURITY.md): How to report vulnerabilities responsibly
+- [Contributing](CONTRIBUTING.md): Dev setup + conventions
+- [Acknowledgements](ACKNOWLEDMENTS.md)
+- [pyproject](pyproject.toml): Dependencies, version, scripts
+- [License](LICENSE)
 
 ## Source tree
 
@@ -62,9 +76,12 @@ After changes, run `pytest`.
 - [MemAct workflow](tests/test_memact_workflow.py)
 - [MemAct session memory](tests/test_memact_session_memory.py)
 
+## Verification
+
+- Run unit tests: `pytest -q`
+- Build package (release): `python -m pip install build && python -m build`
+
 ## Optional
 
 - [Manual demo](manual_agent_demo.py): minimal local demo (requires a working provider)
 - [LMStudio tool eval](src/abstractagent/scripts/lmstudio_tool_eval.py): manual evaluation harness
-- [Changelog](CHANGELOG.md)
-- [pyproject](pyproject.toml)

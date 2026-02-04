@@ -18,10 +18,9 @@ pytest
 
 ## Build distributions (optional)
 
-This repo already contains `dist/` artifacts, but to rebuild locally:
+This repo may contain `dist/` artifacts for convenience, but they can be stale. To rebuild locally (recommended before publishing):
 
 ```bash
 python -m pip install build
 python -m build
 ```
-

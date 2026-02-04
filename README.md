@@ -4,6 +4,17 @@ Agent patterns (ReAct / CodeAct / MemAct) built on **AbstractRuntime** (durable 
 
 Start here: [`docs/getting-started.md`](docs/getting-started.md) (then [`docs/README.md`](docs/README.md) for the full index)
 
+## Documentation
+
+- Getting started: [`docs/getting-started.md`](docs/getting-started.md)
+- API reference: [`docs/api.md`](docs/api.md)
+- FAQ / troubleshooting: [`docs/faq.md`](docs/faq.md)
+- Architecture (diagrams): [`docs/architecture.md`](docs/architecture.md)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+- Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Security: [`SECURITY.md`](SECURITY.md)
+- Acknowledgements: [`ACKNOWLEDMENTS.md`](ACKNOWLEDMENTS.md)
+
 ## What you get
 
 - **ReAct**: tool-first Reason → Act → Observe loop
@@ -31,6 +42,12 @@ From PyPI:
 
 ```bash
 pip install abstractagent
+```
+
+Note: the repository may be ahead of the latest published PyPI release. To verify what you installed:
+
+```bash
+python -c "import importlib.metadata as md; print(md.version('abstractagent'))"
 ```
 
 ## Quick start (ReAct)

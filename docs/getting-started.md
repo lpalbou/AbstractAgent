@@ -4,8 +4,10 @@ This guide is the main entrypoint after [`README.md`](../README.md).
 
 Next reading:
 - [`docs/agents.md`](agents.md) (agent types + API)
+- [`docs/api.md`](api.md) (public API surface)
 - [`docs/tools.md`](tools.md) (default tools + allowlists)
 - [`docs/persistence.md`](persistence.md) (pause/resume across restarts)
+- [`docs/faq.md`](faq.md) (common questions)
 - [`docs/architecture.md`](architecture.md) (diagrams + runtime model)
 
 ## Requirements
@@ -31,6 +33,12 @@ With dev dependencies:
 
 ```bash
 pip install -e ".[dev]"
+```
+
+Tip: the repository may be ahead of the latest published PyPI release. To verify what you installed:
+
+```bash
+python -c "import importlib.metadata as md; print(md.version('abstractagent'))"
 ```
 
 ## Quick start (ReAct)
@@ -136,6 +144,7 @@ More details: [`docs/persistence.md`](persistence.md)
 
 ## Known limitations / gotchas
 
-- `open_attachment` is currently schema-only and not mapped to a runtime effect by adapters (see [`docs/tools.md`](tools.md)).
+- `open_attachment` is a runtime-owned tool (executed by the runtime’s AbstractCore integration). If you pass `allowed_tools`,
+  include `"open_attachment"` (see [`docs/tools.md`](tools.md) and [`docs/faq.md`](faq.md)).
 - `execute_python` uses a local subprocess with a timeout; it is not a hardened sandbox (`src/abstractagent/sandbox/local.py`).
 - ReAct’s “plan/review” flags are stored in `_runtime` but not applied by the current ReAct adapter (`src/abstractagent/agents/react.py`, `src/abstractagent/adapters/react_runtime.py`).
