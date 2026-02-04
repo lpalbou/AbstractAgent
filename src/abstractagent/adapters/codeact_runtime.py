@@ -804,13 +804,14 @@ def create_codeact_workflow(
         )
 
     def execute_code_node(run: RunState, ctx) -> StepPlan:
-        _, _, _, temp, _ = ensure_codeact_vars(run)
+        _, _, runtime_ns, temp, _ = ensure_codeact_vars(run)
         code = temp.get("pending_code")
         if not isinstance(code, str) or not code.strip():
             return StepPlan(node_id="execute_code", next_node="reason")
 
         temp.pop("pending_code", None)
         emit("act", {"tool": "execute_python", "args": {"code": "(inline)", "timeout_s": 10.0}})
+        allow = _effective_allowlist(runtime_ns)
 
         return StepPlan(
             node_id="execute_code",
@@ -823,7 +824,8 @@ def create_codeact_workflow(
                             "arguments": {"code": code, "timeout_s": 10.0},
                             "call_id": "code",
                         }
-                    ]
+                    ],
+                    "allowed_tools": list(allow),
                 },
                 result_key="_temp.tool_results",
             ),

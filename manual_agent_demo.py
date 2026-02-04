@@ -8,7 +8,25 @@ from abstractruntime.integrations.abstractcore import create_local_runtime
 
 from abstractagent.agents.react import ReactAgent
 from abstractagent.tools import ALL_TOOLS
-from abstractagent.ui.question import get_user_response
+
+
+def get_user_response(*, prompt: str, choices=None, allow_free_text: bool = True) -> str:
+    """Minimal CLI prompt for handling ASK_USER waits (no external UI dependencies)."""
+    prompt = str(prompt or "Please respond:").strip() or "Please respond:"
+    if isinstance(choices, list) and choices:
+        print(prompt)
+        for i, c in enumerate(choices, start=1):
+            print(f"  {i}) {c}")
+        while True:
+            raw = input("Select a number" + (" or type a response: " if allow_free_text else ": ")).strip()
+            if allow_free_text and raw and not raw.isdigit():
+                return raw
+            if raw.isdigit():
+                idx = int(raw)
+                if 1 <= idx <= len(choices):
+                    return str(choices[idx - 1])
+            print("Invalid selection.")
+    return input(f"{prompt} ").strip()
 
 
 def on_step(step: str, data: dict) -> None:

@@ -286,7 +286,7 @@ _DEFERRED_ACTION_INTENT_RE = re.compile(
 
 _DEFERRED_ACTION_VERB_RE = re.compile(
     # Verbs that typically imply external actions (tools/files/web/edits).
-    r"(?i)\b(read|open|search|list|skim|inspect|explore|scan|run|execute|edit|fetch|download)\b"
+    r"(?i)\b(read|open|search|list|skim|inspect|explore|scan|run|execute|edit|fetch|download|creat(?:e|ing))\b"
 )
 
 
@@ -1022,15 +1022,15 @@ def create_react_workflow(
             emit("parse_retry_empty", {"cycle": cycle_i})
             return StepPlan(node_id="parse", next_node="reason")
 
-        # Optional heuristic: retry when the model claims it will take actions but emits no tool calls.
-        # Default OFF (clients may enable via `_runtime.check_plan=true`).
+        # Followthrough heuristic: retry when the model claims it will take actions but emits no tool calls.
+        # Default ON (disable with `_runtime.check_plan=false`).
         raw_check_plan = runtime_ns.get("check_plan") if isinstance(runtime_ns, dict) else None
-        check_plan = False if raw_check_plan is None else _boolish(raw_check_plan)
+        check_plan = True if raw_check_plan is None else _boolish(raw_check_plan)
         if check_plan and cycle_i < max_iterations and _looks_like_deferred_action(content):
             _push_inbox(
                 runtime_ns,
-                "You said you would take an action, but you did not emit any tool calls.\n"
-                "If you need to take actions (read/search/list/edit/run), emit ONLY the next tool call(s) now.\n"
+                "You said you would take an action, but you did not call any tools.\n"
+                "If you need to act, call the next tool now (emit ONLY the next tool call(s)).\n"
                 "If you are already done, provide the final answer with NO tool calls.",
             )
             emit("parse_retry_plan_only", {"cycle": cycle_i})

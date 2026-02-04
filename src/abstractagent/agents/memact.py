@@ -264,7 +264,7 @@ def create_memact_agent(
         provider=provider,
         model=model,
         llm_kwargs=llm_kwargs,
-        tools=MappingToolExecutor.from_tools(tools),
+        tool_executor=MappingToolExecutor.from_tools(list(tools)),
         run_store=run_store,
         ledger_store=ledger_store,
     )

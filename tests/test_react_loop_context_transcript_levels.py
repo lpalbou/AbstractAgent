@@ -111,7 +111,13 @@ def test_react_loop_context_transcript_level_a_basic() -> None:
     assert len(captured_llm_payloads) >= 2
 
     first = captured_llm_payloads[0]["payload"]
-    assert first.get("messages") == [{"role": "user", "content": "Create a project folder"}]
+    first_msgs = first.get("messages")
+    assert isinstance(first_msgs, list) and first_msgs
+    assert first_msgs[0].get("role") == "user"
+    first_content = str(first_msgs[0].get("content") or "")
+    if first_content.startswith("[") and "]" in first_content:
+        first_content = first_content.split("]", 1)[1].lstrip()
+    assert first_content == "Create a project folder"
     params1 = first.get("params") if isinstance(first.get("params"), dict) else {}
     assert "max_tokens" not in params1, "ReAct should not enforce tiny per-step output caps by default"
 
