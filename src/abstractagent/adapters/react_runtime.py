@@ -289,6 +289,35 @@ _DEFERRED_ACTION_VERB_RE = re.compile(
     r"(?i)\b(read|open|search|list|skim|inspect|explore|scan|run|execute|edit|fetch|download|creat(?:e|ing))\b"
 )
 
+_TOOL_CALL_MARKERS = ("<function_call>", "<tool_call>", "<|tool_call|>", "```tool_code")
+
+
+def _contains_tool_call_markup(text: str) -> bool:
+    s = str(text or "")
+    if not s.strip():
+        return False
+    low = s.lower()
+    return any(m in low for m in _TOOL_CALL_MARKERS)
+
+
+_TOOL_CALL_STRIP_RE = re.compile(
+    r"(?is)"
+    r"<function_call>\s*.*?\s*</function_call>|"
+    r"<tool_call>\s*.*?\s*</tool_call>|"
+    r"<\|tool_call\|>.*?<\|/tool_call\|>|"
+    r"```tool_code\s*.*?```"
+)
+
+
+def _strip_tool_call_markup(text: str) -> str:
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+    try:
+        return _TOOL_CALL_STRIP_RE.sub("", raw)
+    except Exception:
+        return raw
+
 
 def _looks_like_deferred_action(text: str) -> bool:
     """Return True when the model claims it will take actions but emits no tool calls.
@@ -1442,6 +1471,7 @@ def create_react_workflow(
                 "4) Next steps: exact actions to finish (files to inspect/edit, commands/tools to run, what to look for).\n\n"
                 "Rules:\n"
                 "- Do NOT call tools.\n"
+                "- Do NOT output tool-call markup (e.g. <tool_call>...</tool_call>).\n"
                 "- Do NOT mention internal scratchpads; just present the report.\n"
                 "- Prefer bullet points and concrete next steps."
             )
@@ -1508,18 +1538,22 @@ def create_react_workflow(
         answer = str(content or "").strip()
         temp.pop("max_iterations_llm_response", None)
 
-        # If the model still emitted tool calls, retry once with a stricter instruction.
-        if tool_calls and not answer:
+        # If the model still emitted tool calls, or if it leaked tool-call markup as plain text,
+        # retry once with a stricter instruction.
+        tool_tags = _contains_tool_call_markup(answer)
+        if tool_calls or tool_tags:
             retries = int(temp.get("max_iterations_conclude_retries", 0) or 0)
             if retries < 1:
                 temp["max_iterations_conclude_retries"] = retries + 1
                 _push_inbox(
                     runtime_ns,
                     "You are out of iterations and tool use is disabled.\n"
-                    "Return ONLY the final report and next steps as plain text, with NO tool calls.",
+                    "Return ONLY the final report and next steps as plain text.\n"
+                    "Do NOT include any tool calls or tool-call markup (e.g. <tool_call>...</tool_call>).",
                 )
-                # Re-run the same conclusion call (tool-free).
                 return StepPlan(node_id="max_iterations", next_node="max_iterations")
+            # Last resort: strip any leaked tool markup so we don't persist it as the final answer.
+            answer = _strip_tool_call_markup(answer).strip()
 
         if not answer:
             # Fallback: avoid returning the last tool observation as the "answer".

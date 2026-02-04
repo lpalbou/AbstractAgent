@@ -103,3 +103,84 @@ def test_react_max_iterations_triggers_tool_free_conclusion_call() -> None:
     assert len(llm_payloads) >= 3
     assert any("tools" not in p for p in llm_payloads), "expected a tool-free max-iterations conclusion call"
 
+
+@pytest.mark.basic
+def test_react_max_iterations_retries_when_conclusion_leaks_tool_call_markup() -> None:
+    llm_payloads: list[dict[str, Any]] = []
+    conclude_calls = 0
+
+    def llm_handler(run: RunState, effect: Effect, default_next_node: Optional[str]) -> EffectOutcome:
+        del run, default_next_node
+        payload = effect.payload if isinstance(effect.payload, dict) else {}
+        llm_payloads.append(dict(payload))
+
+        # Normal ReAct steps include tool schemas in the payload; keep emitting a tool call
+        # so we hit the iteration cap.
+        if "tools" in payload:
+            return EffectOutcome.completed(
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {"name": "list_files", "arguments": {"directory_path": "."}, "call_id": "call_1"}
+                    ],
+                    "finish_reason": "tool_calls",
+                }
+            )
+
+        nonlocal conclude_calls
+        conclude_calls += 1
+        if conclude_calls == 1:
+            # Tool use is disabled (no tools in payload), but some models still emit <tool_call> blocks.
+            # The adapter should detect this and retry once.
+            return EffectOutcome.completed(
+                {
+                    "content": "<tool_call>\n{\"name\":\"open_attachment\",\"arguments\":{\"artifact_id\":\"deadbeef\"}}\n</tool_call>",
+                    "tool_calls": [],
+                    "finish_reason": "stop",
+                }
+            )
+
+        return EffectOutcome.completed({"content": "FINAL REPORT", "tool_calls": [], "finish_reason": "stop"})
+
+    def tool_handler(run: RunState, effect: Effect, default_next_node: Optional[str]) -> EffectOutcome:
+        del run, default_next_node
+        payload = effect.payload if isinstance(effect.payload, dict) else {}
+        tool_calls = payload.get("tool_calls")
+        assert isinstance(tool_calls, list)
+        results = [
+            {"call_id": tc.get("call_id"), "name": tc.get("name"), "success": True, "output": "ok", "error": None}
+            for tc in tool_calls
+        ]
+        return EffectOutcome.completed({"mode": "executed", "results": results})
+
+    runtime = Runtime(
+        run_store=InMemoryRunStore(),
+        ledger_store=InMemoryLedgerStore(),
+        effect_handlers={EffectType.LLM_CALL: llm_handler, EffectType.TOOL_CALLS: tool_handler},
+    )
+
+    workflow = create_react_workflow(
+        logic=ReActLogic(
+            tools=[
+                ToolDefinition(name="list_files", description="List", parameters={}),
+            ]
+        ),
+        workflow_id="react_agent_max_iterations_tool_markup_retry",
+        provider="stub",
+        model="stub",
+        allowed_tools=["list_files"],
+    )
+
+    run_id = runtime.start(workflow=workflow, vars=_vars(task="t", max_iterations=2), actor_id=None, session_id=None)
+
+    for _ in range(150):
+        state = runtime.tick(workflow=workflow, run_id=run_id, max_steps=1)
+        if state.status in (RunStatus.COMPLETED, RunStatus.FAILED):
+            break
+
+    state = runtime.get_state(run_id)
+    assert state.status == RunStatus.COMPLETED
+    assert state.current_node == "max_iterations"
+    assert isinstance(state.output, dict)
+    assert state.output.get("answer") == "FINAL REPORT"
+    assert conclude_calls == 2
