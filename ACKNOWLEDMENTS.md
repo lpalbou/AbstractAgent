@@ -1,15 +1,30 @@
 # Acknowledgements
 
-This package builds on (and is intended to be used with) the rest of the AbstractFramework ecosystem:
+Thanks to the maintainers and contributors of the libraries this package depends on.
 
-- **AbstractRuntime** (`abstractruntime`): durable execution engine (effects, waits, run stores, ledger)
-- **AbstractCore** (`abstractcore[tools]`): tool definitions + provider/model integration
+## Runtime dependencies
 
-It also relies on the Python ecosystem for development and testing:
+Declared in `pyproject.toml` (`[project].dependencies`) and required to use `abstractagent`:
 
-- **pytest** (dev dependency; see `pyproject.toml`)
+- **AbstractCore** (`abstractcore[tools]`): provider/model integration + canonical tool definitions
+  - used via `abstractcore.tools.common_tools` in `src/abstractagent/tools/__init__.py`
+- **AbstractRuntime** (`abstractruntime`): durable execution engine (effects, waits, storage, ledger)
+  - used throughout agent wrappers and adapters (e.g. `src/abstractagent/agents/base.py`, `src/abstractagent/adapters/react_runtime.py`)
+  - the runtime’s AbstractCore integration implements runtime-owned tooling like `open_attachment`
+    (`abstractruntime.integrations.abstractcore.session_attachments.execute_open_attachment`)
+
+## Development / testing
+
+Declared in `pyproject.toml` (`[project.optional-dependencies].dev`):
+
+- **pytest**: test runner used by the suite in `tests/`
+
+## Packaging
+
+Declared in `pyproject.toml` (`[build-system].requires`):
+
+- **setuptools** and **wheel**: build backend and wheel support
 
 Conceptually, the ReAct agent pattern is inspired by:
 
 - Yao et al., “ReAct: Synergizing Reasoning and Acting in Language Models” (2022)
-

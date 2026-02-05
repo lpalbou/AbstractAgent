@@ -25,4 +25,5 @@ This folder documents the `abstractagent` Python package in this repository.
 - Changelog: [`CHANGELOG.md`](../CHANGELOG.md)
 - Contributing: [`CONTRIBUTING.md`](../CONTRIBUTING.md)
 - Security: [`SECURITY.md`](../SECURITY.md)
+- Acknowledgements: [`ACKNOWLEDMENTS.md`](../ACKNOWLEDMENTS.md)
 - License: [`LICENSE`](../LICENSE)
