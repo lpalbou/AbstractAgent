@@ -2,6 +2,14 @@
 
 This folder documents the `abstractagent` Python package in this repository.
 
+AbstractAgent is part of the **AbstractFramework** ecosystem:
+- AbstractFramework: https://github.com/lpalbou/AbstractFramework
+- AbstractCore (providers + tool schemas): https://github.com/lpalbou/abstractcore
+- AbstractRuntime (durable workflows + storage/ledger): https://github.com/lpalbou/abstractruntime
+
+If you are new to the stack, start with [`docs/getting-started.md`](getting-started.md) and the overview diagram in
+[`docs/architecture.md`](architecture.md).
+
 ## Start here
 
 - **Getting started**: [`docs/getting-started.md`](getting-started.md)

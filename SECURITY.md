@@ -2,6 +2,8 @@
 
 Thanks for helping keep AbstractAgent users safe.
 
+AbstractAgent is part of the **AbstractFramework** ecosystem (overview): https://github.com/lpalbou/AbstractFramework
+
 ## Reporting a vulnerability
 
 Please report suspected security vulnerabilities **privately** and give maintainers time to investigate and issue a fix.
@@ -25,3 +27,10 @@ To help us triage quickly, include:
 
 Please do not open public issues or disclose the vulnerability publicly until a fix is released (or a coordinated disclosure date is agreed).
 
+## Security notes for users (tool execution)
+
+Some default tools can execute code or shell commands, depending on your host/runtime policy:
+- `execute_python`: local subprocess with a timeout (`src/abstractagent/sandbox/local.py`) — not a hardened sandbox.
+- `execute_command`: runs shell commands (policy is controlled by your tool executor / host allowlist).
+
+See also: [`docs/tools.md`](docs/tools.md) and [`docs/getting-started.md`](docs/getting-started.md).

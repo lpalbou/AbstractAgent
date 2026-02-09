@@ -1,14 +1,22 @@
 # AbstractAgent
 
-> Agent patterns (ReAct / CodeAct / MemAct) built on AbstractRuntime (durable effects + storage) and AbstractCore (tools + LLM integration).
+> Agent patterns (ReAct / CodeAct / MemAct) built on AbstractRuntime (durable workflows + storage/ledger) and AbstractCore (providers + tool schemas).
 
-This repository contains the `abstractagent` Python package.
+This repository contains the `abstractagent` Python package (a library; no interactive UI).
+Use this file as a curated “map” for LLM/agent consumption. For a deeper index (more source files + tests), see `llms-full.txt`.
 
 Important notes (source-of-truth hints):
 - Docs entrypoint: `README.md` → `docs/getting-started.md` → `docs/README.md`
 - Runtime behavior lives in workflow adapters: `src/abstractagent/adapters/*_runtime.py`
 - Prompting/parsing logic stays runtime-agnostic: `src/abstractagent/logic/*` (no `abstractruntime` imports)
-- After changes, run tests: `pytest`
+- MemAct is not re-exported at the package top-level; import from `abstractagent.agents.memact` (see `docs/api.md`).
+- After changes, run tests: `pytest -q`
+
+## Ecosystem
+
+- [AbstractFramework](https://github.com/lpalbou/AbstractFramework): ecosystem overview
+- [AbstractCore](https://github.com/lpalbou/abstractcore): providers + tool schemas
+- [AbstractRuntime](https://github.com/lpalbou/abstractruntime): durable workflows + storage/ledger
 
 ## Docs
 
@@ -22,6 +30,7 @@ Important notes (source-of-truth hints):
 - [Persistence](docs/persistence.md): Pause/resume across restarts
 - [Architecture](docs/architecture.md): How logic/adapters/agents fit together (diagrams)
 - [ReAct pipeline](docs/react-pipeline.md): ReAct workflow details
+- [Development](docs/development.md): Local dev, tests, build
 
 ## Project
 
@@ -29,6 +38,7 @@ Important notes (source-of-truth hints):
 - [Security policy](SECURITY.md): How to report vulnerabilities responsibly
 - [Contributing](CONTRIBUTING.md): Dev setup + conventions
 - [Acknowledgements](ACKNOWLEDMENTS.md)
+- [pyproject.toml](pyproject.toml): Dependencies, version, scripts
 - [License](LICENSE)
 
 ## Code entry points
@@ -45,11 +55,6 @@ Important notes (source-of-truth hints):
 ## Tests
 
 - [Test suite](tests/): `pytest` tests for workflows and agent behavior
-
-## Verification
-
-- Run unit tests: `pytest -q`
-- Build package (release): `python -m pip install build && python -m build`
 
 ## Optional
 

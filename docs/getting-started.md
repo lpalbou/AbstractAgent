@@ -10,6 +10,16 @@ Next reading:
 - [`docs/faq.md`](faq.md) (common questions)
 - [`docs/architecture.md`](architecture.md) (diagrams + runtime model)
 
+## Ecosystem context
+
+AbstractAgent is part of the **AbstractFramework** ecosystem:
+- AbstractFramework: https://github.com/lpalbou/AbstractFramework
+- AbstractCore (providers + tool schemas): https://github.com/lpalbou/abstractcore
+- AbstractRuntime (durable workflows + storage/ledger): https://github.com/lpalbou/abstractruntime
+
+This repository documents **what is implemented in `abstractagent`** (agents + adapters + tools). For provider/runtime details,
+refer to AbstractCore/AbstractRuntime documentation.
+
 ## Requirements
 
 - Python `>=3.10` (see `pyproject.toml`)
@@ -60,7 +70,9 @@ Where this goes in code:
 
 - **ReAct** (`create_react_agent`): tool-first loop. Default tools: `abstractagent.tools.ALL_TOOLS`.
 - **CodeAct** (`create_codeact_agent`): executes Python (tool call or fenced code). Default tools: `[execute_python]`.
-- **MemAct** (`create_memact_agent`): adds runtime-owned Active Memory. Default tools: `abstractagent.tools.ALL_TOOLS`.
+- **MemAct**: adds runtime-owned Active Memory. Default tools: `abstractagent.tools.ALL_TOOLS`.
+  Import: `from abstractagent.agents.memact import create_memact_agent` (MemAct is not re-exported at the package top-level; see
+  [`docs/api.md`](api.md)).
 
 If you want file/web/system tools in CodeAct, pass an explicit tool list:
 

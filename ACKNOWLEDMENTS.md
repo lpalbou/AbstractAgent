@@ -2,6 +2,11 @@
 
 Thanks to the maintainers and contributors of the libraries this package depends on.
 
+AbstractAgent is part of the **AbstractFramework** ecosystem:
+- AbstractFramework: https://github.com/lpalbou/AbstractFramework
+- AbstractCore: https://github.com/lpalbou/abstractcore
+- AbstractRuntime: https://github.com/lpalbou/abstractruntime
+
 ## Runtime dependencies
 
 Declared in `pyproject.toml` (`[project].dependencies`) and required to use `abstractagent`:

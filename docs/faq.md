@@ -7,13 +7,16 @@ Related:
 - [`docs/persistence.md`](persistence.md)
 - [`docs/architecture.md`](architecture.md)
 
-## What is AbstractAgent (vs AbstractRuntime / AbstractCore)?
+## What is AbstractAgent (vs AbstractRuntime / AbstractCore / AbstractFramework)?
 
 - **AbstractAgent** (this package) provides agent *patterns* and workflows: ReAct / CodeAct / MemAct.
   See `src/abstractagent/agents/*` and `src/abstractagent/adapters/*_runtime.py`.
 - **AbstractRuntime** executes durable workflows (`WorkflowSpec`) and persists run state + a ledger.
   AbstractAgent adapters emit runtime effects like `EffectType.LLM_CALL` and `EffectType.TOOL_CALLS`.
 - **AbstractCore** defines tool schemas and performs provider/model integration for LLM calls and tool-call normalization.
+- **AbstractFramework** is the ecosystem umbrella that groups these packages (overview): https://github.com/lpalbou/AbstractFramework
+  - AbstractCore: https://github.com/lpalbou/abstractcore
+  - AbstractRuntime: https://github.com/lpalbou/abstractruntime
 
 Architecture overview: [`docs/architecture.md`](architecture.md)
 

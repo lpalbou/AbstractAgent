@@ -7,11 +7,21 @@ This repo is a Python package (`abstractagent`) that implements agent workflows 
 2) runtime adapters (logic → `WorkflowSpec` with durable `EffectType.*` steps),
 3) thin agent API wrappers (`BaseAgent` + concrete agents).
 
+This file is a *larger* index than `llms.txt` (more source files + tests). It is not an official part of the `llms.txt` spec,
+but is commonly used as a “bigger context window” companion.
+
 Important notes (source-of-truth hints):
 - Runtime behavior lives in workflow adapters: `src/abstractagent/adapters/*_runtime.py`
 - Keep prompting/parsing runtime-agnostic: `src/abstractagent/logic/*` (no `abstractruntime` imports)
 - Docs entrypoint: `README.md` → `docs/getting-started.md` → `docs/README.md`
-- After changes, run tests: `pytest`
+- MemAct is not re-exported at the package top-level; import from `abstractagent.agents.memact` (see `docs/api.md`).
+- After changes, run tests: `pytest -q`
+
+## Ecosystem
+
+- [AbstractFramework](https://github.com/lpalbou/AbstractFramework): ecosystem overview
+- [AbstractCore](https://github.com/lpalbou/abstractcore): providers + tool schemas
+- [AbstractRuntime](https://github.com/lpalbou/abstractruntime): durable workflows + storage/ledger
 
 ## Docs
 
@@ -25,6 +35,7 @@ Important notes (source-of-truth hints):
 - [Persistence](docs/persistence.md): Pause/resume across restarts
 - [Architecture](docs/architecture.md): How logic/adapters/agents fit together (diagrams)
 - [ReAct pipeline](docs/react-pipeline.md): ReAct workflow details
+- [Development](docs/development.md): Local dev, tests, build
 
 ## Project
 
@@ -75,11 +86,6 @@ Important notes (source-of-truth hints):
 - [CodeAct verifier policy](tests/test_codeact_runtime_verifier_policy.py)
 - [MemAct workflow](tests/test_memact_workflow.py)
 - [MemAct session memory](tests/test_memact_session_memory.py)
-
-## Verification
-
-- Run unit tests: `pytest -q`
-- Build package (release): `python -m pip install build && python -m build`
 
 ## Optional
 

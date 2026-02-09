@@ -2,6 +2,15 @@
 
 Thanks for taking the time to contribute. This project aims to keep the agent layer small, reliable, and durable-runtime friendly.
 
+## Project context
+
+AbstractAgent is part of the **AbstractFramework** ecosystem:
+- AbstractFramework: https://github.com/lpalbou/AbstractFramework
+- AbstractCore: https://github.com/lpalbou/abstractcore
+- AbstractRuntime: https://github.com/lpalbou/abstractruntime
+
+If you’re new to the codebase, start with [`docs/architecture.md`](docs/architecture.md) for a faithful “what is implemented” overview.
+
 ## How to contribute
 
 - **Bug reports**: include reproduction steps, expected vs actual behavior, and logs/tool outputs when relevant.
@@ -37,4 +46,3 @@ use file paths and symbol names (e.g., `src/abstractagent/adapters/react_runtime
 - **Logic vs runtime separation**: keep prompting/parsing logic in `src/abstractagent/logic/*` free of runtime imports.
 - **Durability**: do not store tool callables in `RunState.vars`. Prefer host-held tool executors (e.g. `MappingToolExecutor`).
 - **Truthfulness**: do not claim actions without tool outputs; tests should enforce important contracts.
-

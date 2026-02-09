@@ -2,6 +2,11 @@
 
 This document describes the public API surface intended for external users.
 
+Ecosystem context:
+- AbstractFramework: https://github.com/lpalbou/AbstractFramework
+- AbstractCore (providers + tool schemas): https://github.com/lpalbou/abstractcore
+- AbstractRuntime (durable workflows + storage/ledger): https://github.com/lpalbou/abstractruntime
+
 Related:
 - [`docs/getting-started.md`](getting-started.md)
 - [`docs/agents.md`](agents.md)
@@ -131,4 +136,3 @@ Source of truth:
 - ReAct: `src/abstractagent/adapters/react_runtime.py` (`done_node`, `max_iterations_node`)
 - CodeAct: `src/abstractagent/adapters/codeact_runtime.py` (`done_node`, `max_iterations_node`)
 - MemAct: `src/abstractagent/adapters/memact_runtime.py` (`done_node`, `max_iterations_node`)
-

@@ -2,7 +2,23 @@
 
 Agent patterns (ReAct / CodeAct / MemAct) built on **AbstractRuntime** (durable execution) and **AbstractCore** (tools + LLM integration).
 
+AbstractAgent is part of the **AbstractFramework** ecosystem:
+- AbstractFramework (ecosystem overview): https://github.com/lpalbou/AbstractFramework
+- AbstractCore (providers + tool schemas): https://github.com/lpalbou/abstractcore
+- AbstractRuntime (durable workflows + storage/ledger): https://github.com/lpalbou/abstractruntime
+
 Start here: [`docs/getting-started.md`](docs/getting-started.md) (then [`docs/README.md`](docs/README.md) for the full index)
+
+## How it fits (high level)
+
+```mermaid
+flowchart LR
+  Host[Your app / service] --> Agent[AbstractAgent<br/>ReAct / CodeAct / MemAct]
+  Agent --> RT[AbstractRuntime<br/>WorkflowSpec + Effects]
+  RT --> Core[AbstractCore<br/>LLM + tool-call normalization]
+  RT --> Stores[RunStore + LedgerStore]
+  Agent --> Tools[Tool callables<br/>(abstractcore common_tools + agent tools)]
+```
 
 ## Documentation
 
@@ -23,6 +39,16 @@ Start here: [`docs/getting-started.md`](docs/getting-started.md) (then [`docs/RE
 - **Durable runs**: pause/resume via `run_id` + runtime stores
 - **Tool control**: explicit tool bundles + per-run allowlists
 - **Observability**: durable ledger of LLM calls, tool calls, and waits
+
+Where this lives in code (source of truth):
+- Agents: `src/abstractagent/agents/*`
+- Workflows/adapters: `src/abstractagent/adapters/*_runtime.py`
+- Prompting/parsing logic (runtime-agnostic): `src/abstractagent/logic/*`
+- Default tool bundle: `src/abstractagent/tools/__init__.py`
+
+## Requirements
+
+- Python `>=3.10` (see `pyproject.toml`)
 
 ## Installation
 

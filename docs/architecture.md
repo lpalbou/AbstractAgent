@@ -3,6 +3,11 @@
 > Updated: 2026-02-04  
 > Scope: describes **what is implemented in this repository** (no roadmap claims).
 
+Ecosystem context:
+- AbstractFramework: https://github.com/lpalbou/AbstractFramework
+- AbstractCore: https://github.com/lpalbou/abstractcore
+- AbstractRuntime: https://github.com/lpalbou/abstractruntime
+
 Related docs:
 - [`docs/README.md`](README.md)
 - [`docs/getting-started.md`](getting-started.md)

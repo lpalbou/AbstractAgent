@@ -14,6 +14,9 @@ AbstractAgent ships three agent patterns implemented as **(logic → runtime wor
 | **CodeAct** | Python-centric tasks | Treats fenced ` ```python ... ``` ` as `execute_python` | `abstractagent.agents.codeact.CodeActAgent`, `create_codeact_agent()` |
 | **MemAct** | Memory-enhanced sessions | Uses runtime-owned `active_memory` blocks | `abstractagent.agents.memact.MemActAgent`, `create_memact_agent()` |
 
+Note: `MemActAgent` / `create_memact_agent` are **not** re-exported at the package top-level. Import them from
+`abstractagent.agents.memact` (see [`docs/api.md`](api.md)).
+
 ## ReAct (`ReactAgent`)
 
 Files:
