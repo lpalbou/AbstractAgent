@@ -112,7 +112,7 @@ class ReActLogic:
             "    Do NOT call tools just to re-open/read them.\n"
             "  - If you see 'Stored session attachments', those may not be included in the current call.\n"
             "    Only if you truly need it, use the attachment-open tool with artifact_id and a bounded line range.\n"
-            "  - Never use filesystem tools on attachment filenames/paths or absolute paths outside the workspace.\n"
+            "  - Never use filesystem tools on attachment filenames/paths; use the attachment-open tool instead.\n"
             "- For fetch_url: use include_full_content=False for shorter previews; set keep_links=False to strip links when not needed.\n"
             "- For large files, create a small skeleton first, then refine via multiple smaller edits/tool calls.\n"
             "- Use tool outputs as evidence; do not claim actions without tool outputs.\n"
