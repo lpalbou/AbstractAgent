@@ -70,6 +70,11 @@ From PyPI:
 pip install abstractagent
 ```
 
+Native Python hardware profile cascades are available for deployment manifests:
+`abstractagent[apple]`, `abstractagent[gpu]`, `abstractagent[all-apple]`, and
+`abstractagent[all-gpu]`. These delegate to the matching AbstractCore and
+AbstractRuntime profiles; AbstractAgent itself remains provider/runtime agnostic.
+
 Note: the repository may be ahead of the latest published PyPI release. To verify what you installed:
 
 ```bash

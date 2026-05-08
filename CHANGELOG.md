@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-08
+
+### Changed
+
+- Added native install-profile cascade extras:
+  `abstractagent[apple]`, `abstractagent[gpu]`,
+  `abstractagent[all-apple]`, and `abstractagent[all-gpu]`.
+- Raised optional Core/Runtime profile floors to `abstractcore>=2.13.12` and
+  `AbstractRuntime>=0.4.8` so Agent aggregates align with Gateway deployment
+  profiles.
+
 ## [0.3.1] - 2026-02-04
 
 ### Added
