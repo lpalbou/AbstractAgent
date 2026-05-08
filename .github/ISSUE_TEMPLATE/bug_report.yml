@@ -12,7 +12,7 @@ body:
     attributes:
       label: AbstractAgent version
       description: Output of `python -c "from importlib.metadata import version; print(version('abstractagent'))"`
-      placeholder: "0.3.3"
+      placeholder: "0.3.4"
     validations:
       required: true
   - type: dropdown
