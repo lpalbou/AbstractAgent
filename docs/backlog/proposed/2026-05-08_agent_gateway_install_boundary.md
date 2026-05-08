@@ -12,42 +12,44 @@ Gateway deployments, Agent is pulled in for Visual Agent nodes and durable auton
 
 ## Current Code Reality
 
-- Agent package metadata depends on `abstractcore[tools]` and `abstractruntime`.
+- Agent package metadata depends on `abstractcore[tools]>=2.13.12` and
+  `abstractruntime>=0.4.8`.
 - Agent imports/re-exports Core tool helpers from package root.
-- There are no pending changes in the Agent repo.
+- Agent exposes `apple`, `gpu`, `all-apple`, and `all-gpu` extras as Core/Runtime profile cascades.
 
 ## Problem
 
-Agent is behind Gateway, but it is not a hardware or modality package. It should not grow Apple/GPU
-extras or capability-package dependencies just to match a unified naming scheme.
+Agent is behind Gateway, but it is not a hardware or modality package. Its Apple/GPU extras should
+stay pass-through Core/Runtime profile cascades rather than adding modality or local-engine
+dependencies directly.
 
-Current dependency metadata is also too loose for the newer Gateway/Core stack:
-
-- no minimum Core version;
-- no minimum Runtime version;
-- no explicit relation to Gateway server profiles.
+The risk is future drift: if Agent keeps older Core/Runtime floors, Gateway native profiles can
+resolve a runnable server while Agent nodes use older Core/Runtime contracts.
 
 ## Proposed Direction
 
 Keep Agent focused:
 
 - `abstractagent`: Runtime plus Core tools.
-- optional `dev` remains test/dev only.
-- Do not add `apple`, `gpu`, `all-apple`, or `all-gpu` unless Agent later owns local model-engine
-  dependencies, which it should avoid.
+- `abstractagent[apple]` / `abstractagent[gpu]`: pass-through Core and Runtime local-engine
+  profile cascades.
+- `abstractagent[all-apple]` / `abstractagent[all-gpu]`: pass-through Core and Runtime aggregate
+  profile cascades.
+- optional `dev` and `test` remain test/dev only.
+- Do not add direct Vision, Voice, Music, Memory, or provider SDK dependencies to Agent profile
+  extras unless Agent itself starts owning that behavior, which it should avoid.
 
 Gateway server profiles should depend on Agent when workflows can contain agent nodes.
 
 Future cleanup:
 
-- tighten dependency floors to the Gateway-supported baseline, for example
-  `abstractcore[tools]>=2.13.10` and `abstractruntime>=0.4.6`;
 - consider lazy package-root exports if importing `abstractagent` pulls tool stacks too eagerly;
 - document Agent as a behavior package, not a deployment/profile owner.
 
 ## Pending Changes Guidance
 
-No Agent pending changes are needed for this strategic pass.
+Keep the 0.3.5 release focused on dependency-floor/profile alignment. Do not add capability package
+dependencies here; Gateway/Core compose capabilities.
 
 Related pending changes:
 
@@ -61,7 +63,6 @@ Promote when version-alignment work begins across Gateway, Runtime, Core, and ro
 
 ## Validation Ideas
 
-- Packaging test for Agent dependency floors.
+- Packaging test for Agent dependency floors and pass-through profile cascades.
 - Import test for `abstractagent` in a clean venv.
 - Gateway flow test with an agent node under the chosen `abstractgateway[server]` profile.
-

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-05-09
+
+### Changed
+
+- Raised base and hardware-profile dependency floors to `abstractcore>=2.13.12`
+  and `AbstractRuntime>=0.4.8` after the Core/Runtime install-profile alignment.
+- Added packaging regression coverage for the base dependencies and
+  `apple`/`gpu`/`all-apple`/`all-gpu` profile cascades.
+
 ## [0.3.4] - 2026-05-08
 
 ### Fixed
