@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abstractagent"
-version = "0.3.2"
+version = "0.3.3"
 description = "Agent implementations using AbstractRuntime and AbstractCore"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,9 @@ all-gpu = [
     "abstractruntime[all-gpu]>=0.4.8",
 ]
 dev = [
+    "pytest>=7.0",
+]
+test = [
     "pytest>=7.0",
 ]
 

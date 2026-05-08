@@ -1,0 +1,74 @@
+name: Bug report
+description: Report a reproducible AbstractAgent bug
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Include enough detail to reproduce the agent, tool, runtime, and model/provider behavior.
+  - type: input
+    id: version
+    attributes:
+      label: AbstractAgent version
+      description: Output of `python -c "from importlib.metadata import version; print(version('abstractagent'))"`
+      placeholder: "0.3.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Agent or area
+      options:
+        - react
+        - codeact
+        - memact
+        - tools
+        - runtime adapter
+        - sandbox
+        - packaging/install
+        - documentation
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened?
+      description: Describe the incorrect behavior, including exact errors, tool calls, or final output.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include commands, Python snippets, provider/model settings, and any relevant tool/runtime configuration.
+      placeholder: |
+        1. Create a ReAct agent with ...
+        2. Run task ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, installed extras, provider/model, and relevant package versions.
+      placeholder: |
+        macOS 15, Python 3.12
+        pip install "abstractagent[apple]"
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Logs or artifacts
+      description: Attach logs, run traces, tool payloads, or relevant files.
+    validations:
+      required: false
