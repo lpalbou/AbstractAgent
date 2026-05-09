@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-05-09
+
+### Changed
+
+- Raised Runtime dependency floors to `AbstractRuntime>=0.4.9` so Agent
+  installs inherit Runtime's base AbstractMemory contract for KG-aware
+  workflows.
+
 ## [0.3.5] - 2026-05-09
 
 ### Changed
