@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-05-09
+
+### Changed
+
+- Re-release to pick up abstractruntime>=0.4.9 on PyPI (previous release CI ran before CDN propagation).
+
 ## [0.3.6] - 2026-05-09
 
 ### Changed
