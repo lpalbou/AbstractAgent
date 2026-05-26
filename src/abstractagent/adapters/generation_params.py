@@ -79,4 +79,11 @@ def runtime_llm_params(
         if "stt_language" not in out and isinstance(stt_language, str) and stt_language.strip():
             out["stt_language"] = stt_language.strip()
 
+        binding = runtime_ns.get("prompt_cache_binding")
+        if "prompt_cache_binding" not in out:
+            if isinstance(binding, dict) and binding:
+                out["prompt_cache_binding"] = dict(binding)
+            elif isinstance(binding, str) and binding.strip():
+                out["prompt_cache_binding"] = binding.strip()
+
     return out

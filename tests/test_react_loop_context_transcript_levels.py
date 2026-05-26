@@ -24,6 +24,15 @@ def _base_vars(*, task: str) -> Dict[str, Any]:
     return {"context": {"task": task, "messages": []}, "_runtime": {"inbox": []}}
 
 
+def _strip_runtime_prefixes(content: str) -> str:
+    text = str(content or "")
+    if text.startswith("<runtime_metadata>") and "</runtime_metadata>" in text:
+        text = text.split("</runtime_metadata>", 1)[1].lstrip()
+    if text.startswith("[") and "]" in text:
+        text = text.split("]", 1)[1].lstrip()
+    return text
+
+
 @pytest.mark.basic
 def test_react_loop_context_transcript_level_a_basic() -> None:
     captured_llm_payloads: list[dict[str, Any]] = []
@@ -114,9 +123,7 @@ def test_react_loop_context_transcript_level_a_basic() -> None:
     first_msgs = first.get("messages")
     assert isinstance(first_msgs, list) and first_msgs
     assert first_msgs[0].get("role") == "user"
-    first_content = str(first_msgs[0].get("content") or "")
-    if first_content.startswith("[") and "]" in first_content:
-        first_content = first_content.split("]", 1)[1].lstrip()
+    first_content = _strip_runtime_prefixes(str(first_msgs[0].get("content") or ""))
     assert first_content == "Create a project folder"
     params1 = first.get("params") if isinstance(first.get("params"), dict) else {}
     assert "max_tokens" not in params1, "ReAct should not enforce tiny per-step output caps by default"

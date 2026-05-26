@@ -4,31 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abstractagent"
-version = "0.3.7"
+version = "0.3.8"
 description = "Agent implementations using AbstractRuntime and AbstractCore"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "abstractcore[tools]>=2.13.12",
-    "abstractruntime>=0.4.9",
+    "abstractcore[tools]>=2.13.28",
+    "abstractruntime>=0.4.23",
 ]
 
 [project.optional-dependencies]
 apple = [
-    "abstractcore[apple]>=2.13.12",
-    "abstractruntime[apple]>=0.4.9",
+    "abstractcore[apple]>=2.13.28",
+    "abstractruntime[apple]>=0.4.23",
 ]
 gpu = [
-    "abstractcore[gpu]>=2.13.12",
-    "abstractruntime[gpu]>=0.4.9",
+    "abstractcore[gpu]>=2.13.28",
+    "abstractruntime[gpu]>=0.4.23",
 ]
 all-apple = [
-    "abstractcore[all-apple]>=2.13.12",
-    "abstractruntime[all-apple]>=0.4.9",
+    "abstractcore[all-apple]>=2.13.28",
+    "abstractruntime[all-apple]>=0.4.23",
 ]
 all-gpu = [
-    "abstractcore[all-gpu]>=2.13.12",
-    "abstractruntime[all-gpu]>=0.4.9",
+    "abstractcore[all-gpu]>=2.13.28",
+    "abstractruntime[all-gpu]>=0.4.23",
 ]
 dev = [
     "pytest>=7.0",
@@ -44,6 +44,7 @@ where = ["src"]
 react-agent = "abstractagent.repl:main"
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 markers = [
     "basic: Level A (contract/unit) tests",
     "integration: Level B (integration/local) tests",
