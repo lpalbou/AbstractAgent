@@ -13,6 +13,7 @@ but is commonly used as a “bigger context window” companion.
 Important notes (source-of-truth hints):
 - Runtime behavior lives in workflow adapters: `src/abstractagent/adapters/*_runtime.py`
 - Keep prompting/parsing runtime-agnostic: `src/abstractagent/logic/*` (no `abstractruntime` imports)
+- `src/abstractagent/adapters/generation_params.py` is the shared LLM param normalizer for temperature, seed, media policy, prompt-cache binding, and Core `thinking`.
 - Docs entrypoint: `README.md` → `docs/getting-started.md` → `docs/README.md`
 - MemAct is not re-exported at the package top-level; import from `abstractagent.agents.memact` (see `docs/api.md`).
 - After changes, run tests: `pytest -q`
@@ -59,7 +60,7 @@ Important notes (source-of-truth hints):
 - [CodeAct workflow adapter](src/abstractagent/adapters/codeact_runtime.py): `create_codeact_workflow`
 - [MemAct workflow adapter](src/abstractagent/adapters/memact_runtime.py): `create_memact_workflow`
 
-- [LLM param normalization](src/abstractagent/adapters/generation_params.py): temperature/seed/audio policies
+- [LLM param normalization](src/abstractagent/adapters/generation_params.py): temperature/seed/audio policies, prompt-cache bindings, and Core `thinking`
 - [Attachment/media plumbing](src/abstractagent/adapters/media.py): `extract_media_from_context`
 
 - [ReAct logic](src/abstractagent/logic/react.py): `ReActLogic` (system prompt + response parsing)

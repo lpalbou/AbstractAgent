@@ -38,6 +38,8 @@ flowchart LR
 - **MemAct**: memory-enhanced agent using runtime-owned Active Memory
 - **Durable runs**: pause/resume via `run_id` + runtime stores
 - **Tool control**: explicit tool bundles + per-run allowlists
+- **Generation controls**: temperature, seed, media policy, prompt-cache binding,
+  and Core `thinking` are normalized before LLM calls
 - **Observability**: durable ledger of LLM calls, tool calls, and waits
 
 Where this lives in code (source of truth):

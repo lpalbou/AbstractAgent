@@ -1,7 +1,7 @@
 """Helpers for consistent generation params in AbstractAgent adapters.
 
 These adapters build `EffectType.LLM_CALL` payloads for AbstractRuntime. We want
-to expose a uniform `(temperature, seed)` interface across agents while keeping
+to expose a uniform `(temperature, seed, thinking)` interface across agents while keeping
 backward compatibility with older runs that may not have these keys in
 `vars["_runtime"]`.
 """
@@ -28,6 +28,20 @@ def normalize_seed(seed: Any) -> Optional[int]:
         return None
 
 
+def normalize_thinking(value: Any) -> Any:
+    """Return a provider-ready thinking value or None when unset.
+
+    Core owns provider-specific validation. Agent adapters only preserve explicit
+    booleans or non-empty strings and avoid sending empty UI values.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        clean = value.strip()
+        return clean or None
+    return None
+
+
 def runtime_llm_params(
     runtime_ns: Dict[str, Any],
     *,
@@ -40,6 +54,9 @@ def runtime_llm_params(
     1) `runtime_ns.temperature` / `runtime_ns.seed` when present
     2) `extra.temperature` / `extra.seed` (step-specific defaults)
     3) `default_temperature` (only for temperature)
+
+    `thinking` is copied from `extra.thinking` when explicitly set, otherwise
+    from `runtime_ns.thinking`. Empty strings are treated as unset.
     """
     out: Dict[str, Any] = dict(extra or {})
 
@@ -63,6 +80,15 @@ def runtime_llm_params(
         out["seed"] = seed_norm
     else:
         out.pop("seed", None)
+
+    thinking_val = out.get("thinking")
+    thinking_norm = normalize_thinking(thinking_val)
+    if thinking_norm is None and isinstance(runtime_ns, dict):
+        thinking_norm = normalize_thinking(runtime_ns.get("thinking"))
+    if thinking_norm is not None:
+        out["thinking"] = thinking_norm
+    else:
+        out.pop("thinking", None)
 
     # Pass-through media policies (runtime-owned defaults).
     #

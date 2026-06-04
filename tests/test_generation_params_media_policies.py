@@ -49,3 +49,30 @@ def test_runtime_llm_params_keeps_explicit_prompt_cache_binding_override() -> No
     )
 
     assert out["prompt_cache_binding"] == "explicit-binding-id"
+
+
+@pytest.mark.basic
+def test_runtime_llm_params_forwards_thinking_from_runtime_ns() -> None:
+    from abstractagent.adapters.generation_params import runtime_llm_params
+
+    out = runtime_llm_params({"thinking": " high "}, extra={"temperature": 0.2})
+
+    assert out["thinking"] == "high"
+
+
+@pytest.mark.basic
+def test_runtime_llm_params_keeps_explicit_thinking_override() -> None:
+    from abstractagent.adapters.generation_params import runtime_llm_params
+
+    out = runtime_llm_params({"thinking": "high"}, extra={"thinking": "low", "temperature": 0.2})
+
+    assert out["thinking"] == "low"
+
+
+@pytest.mark.basic
+def test_runtime_llm_params_forwards_boolean_thinking() -> None:
+    from abstractagent.adapters.generation_params import runtime_llm_params
+
+    out = runtime_llm_params({"thinking": False}, extra={"temperature": 0.2})
+
+    assert out["thinking"] is False

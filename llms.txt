@@ -9,6 +9,7 @@ Important notes (source-of-truth hints):
 - Docs entrypoint: `README.md` → `docs/getting-started.md` → `docs/README.md`
 - Runtime behavior lives in workflow adapters: `src/abstractagent/adapters/*_runtime.py`
 - Prompting/parsing logic stays runtime-agnostic: `src/abstractagent/logic/*` (no `abstractruntime` imports)
+- `src/abstractagent/adapters/generation_params.py` is the shared LLM param normalizer for temperature, seed, media policy, prompt-cache binding, and Core `thinking`.
 - MemAct is not re-exported at the package top-level; import from `abstractagent.agents.memact` (see `docs/api.md`).
 - After changes, run tests: `pytest -q`
 
