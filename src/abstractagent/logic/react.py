@@ -88,8 +88,13 @@ class ReActLogic:
         if not isinstance(max_output_tokens, int) or max_output_tokens <= 0:
             max_output_tokens = None
 
+        # IMPORTANT (prompt-prefix cache stability, backlog 0212): the system prompt must be
+        # byte-stable across iterations so provider prompt caching can hit. Do NOT embed the
+        # per-iteration counter (or any per-cycle state) here — volatile loop position is carried
+        # at the message tail by the runtime adapter instead. `iteration`/`max_iterations` remain in
+        # the signature for callers but must not leak into this cached prefix.
+        _ = (iteration, max_iterations)
         system_prompt = (
-            f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
             "## MY PERSONA\n"
             "You are an autonomous ReAct agent (Reason → Act → Observe).\n\n"
             "Loop contract:\n"
@@ -139,7 +144,15 @@ class ReActLogic:
                 break
 
         # Some providers return a separate `reasoning` field. If content is empty, fall back
-        # to reasoning so iterative loops don't lose context.
+        # to reasoning so iterative loops don't lose context. UNBOUNDED by ADR-0026 (a
+        # 2026-07-09 attempt to cap this at 1200 chars was reverted the same night as a
+        # maintainer-caught ADR violation): this text is the model's own thought for the
+        # cycle and is model-facing context — never ours to slice. The genuinely pathological
+        # shape (generation cut mid-reasoning by an output cap) never reaches this transcript
+        # path anyway: the parse node retries `finish_reason in {"length","max_tokens"}`
+        # turns without appending, and ReAct sets no output caps by default. Token growth
+        # from faithful reasoning retention is addressed by prompt-prefix caching (0212) and
+        # explicit user-opted compaction — never by silent truncation.
         if not content.strip():
             reasoning = response.get("reasoning")
             if isinstance(reasoning, str) and reasoning.strip():

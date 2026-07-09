@@ -207,7 +207,19 @@ def create_memact_workflow(
                 if call_id is not None and str(call_id).strip():
                     entry["tool_call_id"] = str(call_id).strip()
             out.append(entry)
-        return out
+
+        # Adjacent USER turns (operator guidance drained before the first assistant reply) are
+        # legal in durable history but 400 on alternation-strict chat templates (Mistral/Gemma-
+        # class). Payload-boundary repair only: join them; the durable records stay distinct.
+        merged: List[Dict[str, str]] = []
+        for entry in out:
+            if merged and entry.get("role") == "user" and merged[-1].get("role") == "user":
+                prev = dict(merged[-1])
+                prev["content"] = f"{str(prev.get('content') or '').rstrip()}\n\n{str(entry.get('content') or '')}"
+                merged[-1] = prev
+                continue
+            merged.append(entry)
+        return merged
 
     def init_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_memact_vars(run)
@@ -412,6 +424,27 @@ def create_memact_workflow(
         limits["current_iteration"] = iteration + 1
 
         task = str(context.get("task", "") or "")
+
+        # Inbox is a small, host/agent-controlled injection channel. Drained guidance joins the
+        # durable transcript as a user interjection (maintainer ruling 2026-07-09, same as the
+        # ReAct adapter): the previous rendering folded it into the system prompt for ONE call,
+        # which both mutated the cached prefix and was forgotten on the next cycle — a final
+        # answer written later re-anchored on the original task and dropped the correction.
+        guidance = ""
+        inbox = runtime_ns.get("inbox", [])
+        if isinstance(inbox, list) and inbox:
+            inbox_messages = [str(m.get("content", "") or "") for m in inbox if isinstance(m, dict)]
+            guidance = "\n".join([m for m in inbox_messages if m])
+            runtime_ns["inbox"] = []
+        if guidance:
+            context["messages"].append(
+                _new_message(
+                    ctx,
+                    role="user",
+                    content=f"[Operator guidance — this amends the task; the final answer must satisfy it]\n{guidance}",
+                    metadata={"kind": "operator_guidance"},
+                )
+            )
         messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
         allow = _effective_allowlist(runtime_ns)
@@ -421,18 +454,12 @@ def create_memact_workflow(
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
 
-        # Inbox is a small, host/agent-controlled injection channel.
-        guidance = ""
-        inbox = runtime_ns.get("inbox", [])
-        if isinstance(inbox, list) and inbox:
-            inbox_messages = [str(m.get("content", "") or "") for m in inbox if isinstance(m, dict)]
-            guidance = " | ".join([m for m in inbox_messages if m])
-            runtime_ns["inbox"] = []
-
         req = logic.build_request(
             task=task,
             messages=messages_view,
-            guidance=guidance,
+            # Guidance no longer rides the system prompt (cache stability + durability): it is
+            # already in `messages_view` as a durable transcript message (see the drain above).
+            guidance="",
             iteration=iteration + 1,
             max_iterations=max_iterations,
             vars=run.vars,

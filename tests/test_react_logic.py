@@ -23,7 +23,9 @@ def test_build_request_includes_history_and_memory_instruction() -> None:
     assert req.prompt == "Do something"
     assert "History:" not in req.prompt
     assert isinstance(req.system_prompt, str) and req.system_prompt.strip()
-    assert "Iteration: 2/10" in req.system_prompt
+    # Prompt-prefix cache stability (0212): the per-iteration counter must NOT be in the (cached)
+    # system prompt; loop position is carried at the message tail by the runtime adapter.
+    assert "Iteration:" not in req.system_prompt
     assert "autonomous ReAct agent" in req.system_prompt
     assert "keep tool call arguments small" in req.system_prompt.lower()
     assert "multiple tool calls" in req.system_prompt.lower()

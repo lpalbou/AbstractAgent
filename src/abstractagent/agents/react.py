@@ -28,6 +28,7 @@ from ..logic.builtins import (
     RECALL_MEMORY_TOOL,
     REMEMBER_TOOL,
     REMEMBER_NOTE_TOOL,
+    UPDATE_PLAN_TOOL,
 )
 from ..logic.react import ReActLogic
 
@@ -65,7 +66,13 @@ class ReactAgent(BaseAgent):
         max_history_messages: int = -1,
         max_tokens: Optional[int] = None,
         plan_mode: bool = False,
-        review_mode: bool = True,
+        # OPT-IN (flipped from default-on 2026-07-09, Critic-3 audit): the verifier works —
+        # live-proven catching real violations — but its failure mode is uncontained: a
+        # verifier-side deterministic 400 (e.g. response_format unsupported) FAILS a run that
+        # already holds a valid final answer, and verifier-forced tool calls bypass the
+        # duplicate-side-effect guard. Re-default to on once review failures degrade to
+        # accept-with-#FALLBACK instead of killing the run.
+        review_mode: bool = False,
         review_max_rounds: int = 3,
         actor_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -105,6 +112,7 @@ class ReactAgent(BaseAgent):
             REMEMBER_NOTE_TOOL,
             COMPACT_MEMORY_TOOL,
             DELEGATE_AGENT_TOOL,
+            UPDATE_PLAN_TOOL,
             *tool_defs,
         ]
 
@@ -273,7 +281,7 @@ def create_react_agent(
     max_history_messages: int = -1,
     max_tokens: Optional[int] = None,
     plan_mode: bool = False,
-    review_mode: bool = True,
+    review_mode: bool = False,  # opt-in; see ReactAgent.__init__ (uncontained failure mode)
     review_max_rounds: int = 3,
     llm_kwargs: Optional[Dict[str, Any]] = None,
     run_store: Optional[Any] = None,

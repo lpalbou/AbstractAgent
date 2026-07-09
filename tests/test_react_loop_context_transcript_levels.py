@@ -124,7 +124,13 @@ def test_react_loop_context_transcript_level_a_basic() -> None:
     assert isinstance(first_msgs, list) and first_msgs
     assert first_msgs[0].get("role") == "user"
     first_content = _strip_runtime_prefixes(str(first_msgs[0].get("content") or ""))
-    assert first_content == "Create a project folder"
+    # Adjacency guard (2026-07-09): on a first turn the volatile [loop] tail MERGES into the
+    # trailing user message (alternation-strict templates reject user,user), so the task
+    # message carries task + tail rather than a second consecutive user message.
+    assert first_content.startswith("Create a project folder")
+    assert "[loop] iteration 1" in first_content
+    roles_first = [m.get("role") for m in first_msgs]
+    assert all(not (a == b == "user") for a, b in zip(roles_first, roles_first[1:]))
     params1 = first.get("params") if isinstance(first.get("params"), dict) else {}
     assert "max_tokens" not in params1, "ReAct should not enforce tiny per-step output caps by default"
 
@@ -132,13 +138,27 @@ def test_react_loop_context_transcript_level_a_basic() -> None:
     second_msgs = second_payload.get("messages")
     assert isinstance(second_msgs, list)
     assert any(m.get("role") == "tool" and "a.txt" in str(m.get("content") or "") for m in second_msgs)
-    # Ensure the assistant tool-call turn is preserved in the transcript.
-    assert any(m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list) for m in second_msgs)
-    # Ensure scratchpad cycles are fed back into the LLM call (system prompt).
+    # Context fidelity (0213): the assistant tool-call turn is preserved AND carries the model's own
+    # reasoning content in the transcript (not dropped to content="").
+    assistant_tool_msgs = [
+        m for m in second_msgs if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list)
+    ]
+    assert assistant_tool_msgs
+    assert any("Checking the workspace." in str(m.get("content") or "") for m in assistant_tool_msgs)
+    # Prompt-prefix cache stability (0212): the scratchpad is NO LONGER rendered into the system
+    # prompt (that mutated the cached prefix and double-carried observations). The system prompt must
+    # stay stable across iterations, so it must not contain per-cycle scratchpad state.
+    sys1 = captured_llm_payloads[0]["payload"].get("system_prompt")
     sys2 = second_payload.get("system_prompt")
     assert isinstance(sys2, str)
-    assert "Scratchpad" in sys2
-    assert "[cycle 1]" in sys2
+    assert "Scratchpad" not in sys2
+    assert "[cycle 1]" not in sys2
+    # The system prompt prefix is byte-identical between iterations (cache-friendly).
+    assert sys1 == sys2
+    # Volatile loop position rides the TRAILING message, never the cached prefix.
+    assert second_msgs[-1].get("role") == "user"
+    assert "iteration 2" in str(second_msgs[-1].get("content") or "")
+    assert "Iteration:" not in str(sys2)
 
 
 @pytest.mark.integration
@@ -286,3 +306,118 @@ def test_react_loop_context_transcript_level_c_lmstudio(tmp_path: Any) -> None:
     msgs = second.get("messages")
     assert isinstance(msgs, list)
     assert any(m.get("role") == "tool" for m in msgs), "Expected a tool message in the second LLM call context"
+
+
+@pytest.mark.basic
+def test_ask_user_orphaned_tool_calls_repaired_in_llm_payload() -> None:
+    """Multi-turn correctness on strict providers (found live 2026-07-09, pre-existing at HEAD):
+    ask_user resolves via an ASK_USER wait + a user message — never a tool message — so the
+    assistant `tool_calls` turn stays unanswered in durable history and native OpenAI 400s the
+    NEXT request. The sanitizer must synthesize an adjacent tool result in the payload (durable
+    history untouched)."""
+    captured: list[dict[str, Any]] = []
+
+    def llm_handler(run: RunState, effect: Effect, default_next_node: Optional[str]) -> EffectOutcome:
+        del default_next_node
+        payload = effect.payload if isinstance(effect.payload, dict) else {}
+        captured.append(dict(payload))
+        iteration = int(run.vars.get("_limits", {}).get("current_iteration", 0) or 0)
+        if iteration == 1:
+            return EffectOutcome.completed(
+                {"content": "", "tool_calls": [{"name": "ask_user", "arguments": {"question": "Favorite color?"}, "call_id": "call_ask"}]}
+            )
+        return EffectOutcome.completed({"content": "Your color is ultramarine.", "tool_calls": []})
+
+    def ask_user_handler(run: RunState, effect: Effect, default_next_node: Optional[str]) -> EffectOutcome:
+        del run, effect, default_next_node
+        from abstractruntime.core.models import WaitReason, WaitState
+
+        return EffectOutcome.waiting(WaitState(reason=WaitReason.USER, wait_key="ask-1", result_key="_temp.user_response"))
+
+    from abstractagent.logic.builtins import ASK_USER_TOOL
+
+    logic = ReActLogic(tools=[ASK_USER_TOOL])
+    workflow = create_react_workflow(logic=logic)
+    runtime = Runtime(
+        run_store=InMemoryRunStore(),
+        ledger_store=InMemoryLedgerStore(),
+        effect_handlers={EffectType.LLM_CALL: llm_handler, EffectType.ASK_USER: ask_user_handler},
+    )
+    run_id = runtime.start(workflow=workflow, vars=_base_vars(task="ask me my color, then conclude"))
+    state = runtime.tick(workflow=workflow, run_id=run_id, max_steps=20)
+    assert state.status == RunStatus.WAITING
+
+    state = runtime.resume(workflow=workflow, run_id=run_id, wait_key="ask-1", payload={"response": "ultramarine"}, max_steps=20)
+    assert state.status == RunStatus.COMPLETED
+
+    # The post-resume LLM request must contain NO orphaned assistant tool_calls: every id is
+    # answered by an adjacent tool message (the synthetic interactive-handled result).
+    final_msgs = captured[-1].get("messages") or []
+    for idx, m in enumerate(final_msgs):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = {str(tc.get("id")) for tc in m["tool_calls"]}
+            j = idx + 1
+            while j < len(final_msgs) and final_msgs[j].get("role") == "tool":
+                ids.discard(str(final_msgs[j].get("tool_call_id") or ""))
+                j += 1
+            assert not ids, f"orphaned tool_call ids in payload: {ids}"
+
+    # Durable history is untouched: no synthetic tool message persisted.
+    run = runtime._run_store.load(run_id)
+    durable = (run.vars.get("context") or {}).get("messages") or []
+    assert not any(m.get("role") == "tool" and "handled interactively" in str(m.get("content") or "") for m in durable)
+
+
+@pytest.mark.basic
+def test_loop_tail_merges_into_trailing_user_message() -> None:
+    """Adjacency guard (Critic-3, 2026-07-09): when the payload already ends with a user
+    message (first turn), the volatile [loop] tail merges INTO it — alternation-strict
+    templates reject user,user, and a separate banner steals the grounding envelope's
+    last-user-message slot from the real task."""
+    captured: list[dict[str, Any]] = []
+
+    def llm_handler(run: RunState, effect: Effect, default_next_node: Optional[str]) -> EffectOutcome:
+        del default_next_node
+        captured.append(dict(effect.payload if isinstance(effect.payload, dict) else {}))
+        iteration = int(run.vars.get("_limits", {}).get("current_iteration", 0) or 0)
+        if iteration == 1:
+            return EffectOutcome.completed(
+                {"content": "Looking.", "tool_calls": [{"name": "list_files", "arguments": {}, "call_id": "c1"}]}
+            )
+        return EffectOutcome.completed({"content": "Done.", "tool_calls": []})
+
+    def tool_handler(run: RunState, effect: Effect, default_next_node: Optional[str]) -> EffectOutcome:
+        del run, default_next_node
+        calls = (effect.payload or {}).get("tool_calls") or []
+        return EffectOutcome.completed(
+            {"mode": "executed",
+             "results": [{"call_id": c.get("call_id"), "name": c.get("name"), "success": True,
+                          "output": "a.txt", "error": None} for c in calls]}
+        )
+
+    list_files = ToolDefinition(name="list_files", description="List files", parameters={})
+    logic = ReActLogic(tools=[list_files])
+    workflow = create_react_workflow(logic=logic)
+    runtime = Runtime(
+        run_store=InMemoryRunStore(),
+        ledger_store=InMemoryLedgerStore(),
+        effect_handlers={EffectType.LLM_CALL: llm_handler, EffectType.TOOL_CALLS: tool_handler},
+    )
+    run_id = runtime.start(workflow=workflow, vars=_base_vars(task="list the files"))
+    state = runtime.tick(workflow=workflow, run_id=run_id, max_steps=30)
+    assert state.status == RunStatus.COMPLETED
+
+    # FIRST call: ends with a user message -> tail MERGED (no user,user anywhere).
+    first_msgs = captured[0].get("messages") or []
+    roles = [m.get("role") for m in first_msgs]
+    assert all(not (a == b == "user") for a, b in zip(roles, roles[1:])), roles
+    assert "[loop] iteration 1" in str(first_msgs[-1].get("content") or "")
+    assert "list the files" in str(first_msgs[-1].get("content") or "")  # task + tail together
+
+    # SECOND call: ends with tool results -> tail is a separate trailing user message
+    # (the grounding envelope may be prefixed into it — both are volatile per-call state).
+    second_msgs = captured[1].get("messages") or []
+    assert second_msgs[-1].get("role") == "user"
+    assert "[loop] iteration 2" in str(second_msgs[-1].get("content") or "")
+    roles2 = [m.get("role") for m in second_msgs]
+    assert all(not (a == b == "user") for a, b in zip(roles2, roles2[1:])), roles2

@@ -264,6 +264,30 @@ COMPACT_MEMORY_TOOL = ToolDefinition(
     when_to_use="Use when the active context is too large and you need to reduce it while keeping provenance.",
 )
 
+UPDATE_PLAN_TOOL = ToolDefinition(
+    name="update_plan",
+    description="Record or update a short task plan/checklist that persists across loop iterations.",
+    parameters={
+        "plan": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "The plan as a list of short step strings (e.g. [\"read config\", \"add flag\", "
+                "\"run tests\"]). A plain string is also accepted. Pass an empty list to clear the plan."
+            ),
+        },
+        "explanation": {
+            "type": "string",
+            "description": "Optional one-line note on why the plan changed.",
+            "default": None,
+        },
+    },
+    when_to_use=(
+        "Use at the start of a multi-step task, and update it as steps complete or the approach "
+        "changes, so you keep a stable anchor over a long loop. It has no external side effect."
+    ),
+)
+
 DELEGATE_AGENT_TOOL = ToolDefinition(
     name="delegate_agent",
     description="Delegate a subtask to a fresh agent run with smaller context and restricted tools.",

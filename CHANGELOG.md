@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (2026-07-09 adversarial-audit wave — 5 critics over the agency-parity changes)
+- **Loop-tail adjacency guard**: when the LLM payload already ends with a user message (first
+  turn; post-ask_user turns), the volatile `[loop]`/plan/guidance tail now MERGES into that
+  message instead of appending a second consecutive user message. Alternation-strict chat
+  templates (Mistral/Gemma-class) reject `user,user` with a 400, and a separate trailing banner
+  also displaced the runtime grounding envelope from the real task message. In tool-loop shape
+  (payload ends with tool results) the tail stays a separate trailing message exactly as before.
+  Trade-off (documented in the prefix-stability test): the iteration-1 task message carries the
+  merged tail, so it is not prefix-reusable into iteration 2 — one small message, once per run;
+  from iteration 2 onward the task message is pure and byte-stable.
+- **Recovered-reasoning fallback stays UNBOUNDED (ADR-0026)**: a same-night attempt to cap the
+  empty-content → `reasoning` transcript fallback at 1200 chars was REVERTED as a
+  maintainer-caught ADR-0026 violation — the recovered reasoning is the model's own thought for
+  the cycle and is model-facing context, never ours to slice (a marker does not make a lossy
+  slice compliant; truncation is reserved for UI surfaces or explicit user opt-in). The
+  pathological shape the cap pretended to solve (generation cut mid-reasoning by an output
+  token limit) never reaches this path: `parse_node` retries `finish_reason in
+  {"length","max_tokens"}` turns WITHOUT appending partial content, and ReAct's `init_node`
+  disables output caps by default. Token growth from faithful reasoning retention is the
+  designed fidelity trade, mitigated by prompt-prefix caching (0212) and explicit user-opted
+  compaction — never by silent truncation.
+- **`review_mode` default flipped to opt-in (False)**: the verifier works (live-proven catching
+  real instruction violations) but its failure mode is uncontained — a verifier-side
+  deterministic 400 fails a run that already holds a valid final answer, and verifier-forced tool
+  calls bypass the parse-node duplicate-side-effect guard. Re-default to on once review failures
+  degrade to accept-with-`#FALLBACK`. (Note: `review_mode=True` was dead config at HEAD; the
+  0217 wiring made it live, which is what made the default matter.)
+- **Orphan-repair honesty guard**: the `ask_user` payload repair no longer claims "handled
+  interactively" for arbitrary unanswered tool calls — only interactive builtins get that label;
+  any other unanswered id gets `[tool result missing (host error): <name>]` so genuine tool-result
+  loss (the known truncation class) stays observable instead of being papered over. Orphan TOOL
+  messages (no preceding assistant tool-calls run, e.g. after a history cut) are folded into an
+  inert `[unpaired tool result]` user note, mirroring the native-OpenAI fold, instead of 400ing
+  strict servers.
+
+### Fixed
+- **Multi-turn ask_user runs failed on native OpenAI (pre-existing at HEAD, found in live
+  multi-turn verification 2026-07-09)**: `ask_user` resolves through an ASK_USER wait + a user
+  message — never a tool message — so the assistant `tool_calls` turn stays unanswered in durable
+  history and OpenAI 400s the NEXT request ("must be followed by tool messages responding to each
+  tool_call_id"), failing the run after retries. `_sanitize_llm_messages` now repairs orphans at
+  the payload boundary: any unanswered tool_call id gets a deterministic adjacent synthetic tool
+  result ("[handled interactively; …]"); durable history is untouched and the synthetic text is
+  stable so the 0212 cached prefix stays byte-identical. Live-verified (native OpenAI,
+  gpt-5-mini): the ask_user probe that 400s on git HEAD completes on current code — artifact
+  `docs/backlog/planned/agency-parity/evidence/ab_askuser_native_openai.json` (the earlier
+  citation pointed at the OVH multi-turn artifact, which is a different provider's run —
+  corrected per audit). OVH multi-turn evidence (session recall + wait/resume + hygiene) is in
+  `evidence/ab_multiturn_result.json`; single-run existence demonstrations, not success-rate
+  claims.
+
+### Added
+- ReAct verifier + planning (agency-parity 0217): the CodeAct-style verifier is now wired into the
+  ReAct loop behind `_runtime.review_mode` (previously dead config on ReAct) — a final answer is
+  re-checked and, if incomplete, the loop re-enters `act` with the verifier's `next_tool_calls`
+  (synthesizing the preceding assistant tool-calls message so the tool results are never orphaned).
+  New `update_plan` builtin tool persists a checklist to the scratchpad and renders it on the
+  cache-stable message tail. Verification budget resets per-answer after tools run (mirrors CodeAct).
+
+### Changed
+- Prompt-prefix cache stability (agency-parity 0212): the per-iteration counter, scratchpad, and
+  drained guidance are no longer baked into the (cached) system prompt — they ride a trailing
+  ephemeral message so the request prefix stays byte-stable across iterations. Measured common
+  prefix across a 3-iteration loop went from ~1% to ~93%.
+- Context fidelity (agency-parity 0213): assistant tool-call transcript messages now retain the
+  model's reasoning `content` instead of `content=""`, and the redundant scratchpad copy is no
+  longer injected into the system prompt (observations already live in the transcript). Remaining
+  bounded previews carry the ADR-0026 `#[WARNING:TRUNCATION]` tag + marker.
+
 ## [0.3.12] - 2026-06-14
 
 ### Changed

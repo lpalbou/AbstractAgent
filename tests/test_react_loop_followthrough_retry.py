@@ -48,8 +48,11 @@ def test_react_followthrough_retries_plan_only_no_tool_call_steps() -> None:
                 }
             )
         if idx == 3:
-            sys = str(payload.get("system_prompt") or "")
-            assert "did not call any tools" in sys.lower() or "call the next tool" in sys.lower()
+            # Followthrough retry guidance now rides the TRAILING message (0212 cache stability),
+            # not the cache-stable system prompt.
+            msgs = payload.get("messages")
+            tail = str((msgs[-1].get("content") if isinstance(msgs, list) and msgs else "") or "").lower()
+            assert "did not call any tools" in tail or "call the next tool" in tail
             return EffectOutcome.completed(
                 {
                     "content": "Creating folder.",

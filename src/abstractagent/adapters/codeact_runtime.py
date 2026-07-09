@@ -239,7 +239,19 @@ def create_codeact_workflow(
                 if call_id is not None and str(call_id).strip():
                     entry["tool_call_id"] = str(call_id).strip()
             out.append(entry)
-        return out
+
+        # Adjacent USER turns (operator guidance drained before the first assistant reply) are
+        # legal in durable history but 400 on alternation-strict chat templates (Mistral/Gemma-
+        # class). Payload-boundary repair only: join them; the durable records stay distinct.
+        merged: List[Dict[str, str]] = []
+        for entry in out:
+            if merged and entry.get("role") == "user" and merged[-1].get("role") == "user":
+                prev = dict(merged[-1])
+                prev["content"] = f"{str(prev.get('content') or '').rstrip()}\n\n{str(entry.get('content') or '')}"
+                merged[-1] = prev
+                continue
+            merged.append(entry)
+        return merged
 
     def _flag(runtime_ns: Dict[str, Any], key: str, *, default: bool = False) -> bool:
         if not isinstance(runtime_ns, dict) or key not in runtime_ns:
@@ -396,12 +408,26 @@ def create_codeact_workflow(
         scratchpad["iteration"] = iteration + 1
         limits["current_iteration"] = iteration + 1
 
+        # Inbox is a small, host/agent-controlled injection channel. Drained guidance joins the
+        # durable transcript as a user interjection (maintainer ruling 2026-07-09, same as the
+        # ReAct adapter): the previous rendering folded it into the system prompt for ONE call,
+        # which both mutated the cached prefix and was forgotten on the next cycle — a final
+        # answer written later re-anchored on the original task and dropped the correction.
         inbox = runtime_ns.get("inbox", [])
         guidance = ""
         if isinstance(inbox, list) and inbox:
             inbox_messages = [str(m.get("content", "") or "") for m in inbox if isinstance(m, dict)]
-            guidance = " | ".join([m for m in inbox_messages if m])
+            guidance = "\n".join([m for m in inbox_messages if m])
             runtime_ns["inbox"] = []
+        if guidance:
+            context["messages"].append(
+                _new_message(
+                    ctx,
+                    role="user",
+                    content=f"[Operator guidance — this amends the task; the final answer must satisfy it]\n{guidance}",
+                    metadata={"kind": "operator_guidance"},
+                )
+            )
 
         messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
@@ -420,7 +446,9 @@ def create_codeact_workflow(
         req = logic.build_request(
             task=str(context.get("task", "") or ""),
             messages=messages_view,
-            guidance=guidance,
+            # Guidance no longer rides the system prompt (cache stability + durability): it is
+            # already in `messages_view` as a durable transcript message (see the drain above).
+            guidance="",
             iteration=iteration + 1,
             max_iterations=max_iterations,
             vars=run.vars,  # Pass vars for _limits access

@@ -52,10 +52,13 @@ def test_react_truncated_output_retries_and_continues() -> None:
             )
         if idx == 3:
             sys = str(payload.get("system_prompt") or "")
-            assert "output token limit" in sys.lower()
+            # Persona rules stay in the (cache-stable) system prompt.
             assert "keep tool call arguments small" in sys.lower()
             msgs = payload.get("messages")
             assert isinstance(msgs, list) and msgs
+            # Retry guidance now rides the TRAILING message (0212 cache stability), not the system prompt.
+            assert "output token limit" in str(msgs[-1].get("content") or "").lower()
+            assert "output token limit" not in sys.lower()
             assert str(payload.get("prompt") or "") == ""
             return EffectOutcome.completed(
                 {
@@ -139,8 +142,10 @@ def test_react_truncated_output_retry_survives_restart(tmp_path: Any) -> None:
                 }
             )
         if idx == 3:
-            sys = str(payload.get("system_prompt") or "")
-            assert "truncated" in sys.lower() or "output token limit" in sys.lower()
+            # Retry guidance rides the TRAILING message (0212 cache stability), not the system prompt.
+            msgs = payload.get("messages")
+            tail = str((msgs[-1].get("content") if isinstance(msgs, list) and msgs else "") or "").lower()
+            assert "truncated" in tail or "output token limit" in tail
             return EffectOutcome.completed(
                 {
                     "content": "Creating folder.",

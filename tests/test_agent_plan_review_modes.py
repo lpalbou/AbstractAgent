@@ -46,20 +46,35 @@ def _base_vars(*, runtime_ns: dict | None = None) -> dict:
     }
 
 
-def test_react_workflow_ignores_plan_and_review_modes() -> None:
-    """Canonical ReAct workflow no longer has separate plan/review nodes.
+def test_react_workflow_has_verifier_gated_on_review_mode() -> None:
+    """ReAct now wires the CodeAct-style verifier behind `_runtime.review_mode` (backlog 0217).
 
-    Plan/review are higher-level UX patterns; the ReAct core is a simple loop:
-    reason → act → observe until no tool calls.
+    Default (review_mode off): a final answer goes straight to `done`.
+    review_mode on: a final answer is routed through the verifier (`maybe_review` → `review`).
+    There is still no upfront `plan` node (planning is the model-invoked `update_plan` tool).
     """
     tool = ToolDefinition(name="tool_a", description="A", parameters={})
     wf = create_react_workflow(logic=ReActLogic(tools=[tool]), workflow_id="wf", allowed_tools=["tool_a"])
 
-    run = _run(vars=_base_vars(runtime_ns={"plan_mode": True, "review_mode": True, "review_max_rounds": 1}))
-    init_plan = wf.get_node("init")(run, _Ctx())
-    assert init_plan.next_node == "reason"
+    # The verifier nodes exist; there is no separate upfront plan node.
+    assert "maybe_review" in wf.nodes
+    assert "review" in wf.nodes
+    assert "review_parse" in wf.nodes
     assert "plan" not in wf.nodes
-    assert "maybe_review" not in wf.nodes
+
+    # init always routes to reason.
+    run = _run(vars=_base_vars(runtime_ns={"review_mode": True, "review_max_rounds": 1}))
+    assert wf.get_node("init")(run, _Ctx()).next_node == "reason"
+
+    # review_mode ON: maybe_review routes to the verifier.
+    run_on = _run(vars=_base_vars(runtime_ns={"review_mode": True, "review_max_rounds": 1}))
+    run_on.vars["_temp"]["final_answer"] = "answer"
+    assert wf.get_node("maybe_review")(run_on, _Ctx()).next_node == "review"
+
+    # review_mode OFF (default): maybe_review routes straight to done.
+    run_off = _run(vars=_base_vars(runtime_ns={}))
+    run_off.vars["_temp"]["final_answer"] = "answer"
+    assert wf.get_node("maybe_review")(run_off, _Ctx()).next_node == "done"
 
 
 def test_codeact_plan_mode_routes_to_plan_node() -> None:

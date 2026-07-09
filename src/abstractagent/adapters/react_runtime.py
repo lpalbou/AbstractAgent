@@ -168,7 +168,8 @@ def _tool_call_signature(name: str, args: Any) -> str:
         s = str(v)
         if len(s) <= max_chars:
             return s
-        return f"{s[: max(0, max_chars - 1)]}…"
+        #[WARNING:TRUNCATION] bounded argument preview in tool-call signatures (ADR-0026: marked, full args stay in scratchpad/ledger)
+        return f"{s[: max(0, max_chars - 1)]}… (truncated, {len(s):,} chars total)"
 
     def _hash_str(s: str) -> str:
         try:
@@ -180,7 +181,9 @@ def _tool_call_signature(name: str, args: Any) -> str:
     if not isinstance(args, dict) or not args:
         return f"{n}()"
 
-    # Special-case common large-argument tools so the system prompt doesn't explode.
+    # Special-case common large-argument tools so rendered signatures (conclusion prompt,
+    # final report) don't explode. Content is replaced by len+sha256 provenance (ADR-0026
+    # compression-with-provenance, not silent truncation).
     if n == "write_file":
         fp = args.get("file_path") if isinstance(args.get("file_path"), str) else args.get("path")
         mode = args.get("mode") if isinstance(args.get("mode"), str) else "w"
@@ -420,78 +423,27 @@ def _max_output_tokens(runtime_ns: Dict[str, Any], limits: Dict[str, Any]) -> Op
     return val if val > 0 else None
 
 
-def _render_cycles_for_system_prompt(scratchpad: Dict[str, Any]) -> str:
-    cycles = scratchpad.get("cycles")
-    if not isinstance(cycles, list) or not cycles:
-        return ""
+# NOTE (0212/0213): `_render_cycles_for_system_prompt` was removed. The per-cycle scratchpad is no
+# longer rendered into the system prompt: it mutated the cached prefix every iteration (defeating
+# provider prompt caching) and duplicated observations that already live in `context.messages`.
+# The model's reasoning now stays in the transcript (assistant tool-call messages keep `content`),
+# and `scratchpad.cycles` remains a durable host-side record (final report / conclusion prompt).
 
-    # Keep the system prompt bounded: tool outputs can be very large (fetch_url/web_search).
-    max_cycles = 6
-    max_thought_chars = 600
-    max_obs_chars = 220
 
-    view = [c for c in cycles if isinstance(c, dict)]
-    if len(view) > max_cycles:
-        view = view[-max_cycles:]
+def _truncate_preview(text: str, *, max_chars: int) -> str:
+    """Bounded preview for prompt/report rendering — never for durable state.
 
-    lines: list[str] = []
-    for c in view:
-        i = c.get("i")
-        thought = str(c.get("thought") or "").strip()
-        if len(thought) > max_thought_chars:
-            thought = f"{thought[: max(0, max_thought_chars - 1)]}…"
-        tcs = c.get("tool_calls")
-        obs = c.get("observations")
-        if i is None:
-            continue
-        lines.append(f"[cycle {i}]")
-        if thought:
-            lines.append(f"thought: {thought}")
-        if isinstance(tcs, list) and tcs:
-            sigs: list[str] = []
-            for tc in tcs:
-                if isinstance(tc, dict):
-                    sigs.append(_tool_call_signature(tc.get("name", ""), tc.get("arguments")))
-            if sigs:
-                lines.append("actions:")
-                for s in sigs:
-                    lines.append(f"- {s}")
-        if isinstance(obs, list) and obs:
-            lines.append("observations:")
-            for o in obs:
-                if not isinstance(o, dict):
-                    continue
-                name = str(o.get("name") or "tool")
-                ok = bool(o.get("success"))
-                out = o.get("output")
-                err = o.get("error")
-                if not ok:
-                    text = str(err or out or "").strip()
-                else:
-                    if isinstance(out, dict):
-                        # Prefer metadata-ish fields; do not dump full `rendered` bodies into the prompt.
-                        url = out.get("url") if isinstance(out.get("url"), str) else None
-                        status = out.get("status_code") if out.get("status_code") is not None else None
-                        content_type = out.get("content_type") if isinstance(out.get("content_type"), str) else None
-                        rendered = out.get("rendered") if isinstance(out.get("rendered"), str) else None
-                        rendered_len = len(rendered) if isinstance(rendered, str) else None
-                        parts: list[str] = []
-                        if url:
-                            parts.append(f"url={url}")
-                        if status is not None:
-                            parts.append(f"status={status}")
-                        if content_type:
-                            parts.append(f"type={content_type}")
-                        if rendered_len is not None:
-                            parts.append(f"rendered_len={rendered_len}")
-                        text = ", ".join(parts) if parts else f"keys={list(out.keys())[:8]}"
-                    else:
-                        text = str(out or "").strip()
-                if len(text) > max_obs_chars:
-                    text = f"{text[: max(0, max_obs_chars - 1)]}…"
-                lines.append(f"- [{name}] {'OK' if ok else 'ERR'}: {text}")
-        lines.append("")
-    return "\n".join(lines).strip()
+    ADR-0026: lossy truncation must never be silent. The returned text always carries an
+    explicit `… (truncated, N chars total)` marker, and the full content remains durably
+    available (scratchpad cycles in run vars + runtime ledger records).
+    """
+    s = str(text or "")
+    if max_chars <= 0 or len(s) <= max_chars:
+        return s
+    suffix = f"… (truncated, {len(s):,} chars total)"
+    keep = max(0, max_chars - len(suffix))
+    #[WARNING:TRUNCATION] bounded scratchpad/conclusion preview; full text stays in scratchpad.cycles + ledger
+    return s[:keep].rstrip() + suffix
 
 
 def _render_cycles_for_conclusion_prompt(scratchpad: Dict[str, Any]) -> str:
@@ -521,9 +473,7 @@ def _render_cycles_for_conclusion_prompt(scratchpad: Dict[str, Any]) -> str:
             continue
         lines.append(f"[cycle {i}]")
 
-        thought = str(c.get("thought") or "").strip()
-        if len(thought) > max_thought_chars:
-            thought = f"{thought[: max(0, max_thought_chars - 1)]}…"
+        thought = _truncate_preview(str(c.get("thought") or "").strip(), max_chars=max_thought_chars)
         if thought:
             lines.append(f"thought: {thought}")
 
@@ -566,11 +516,17 @@ def _render_cycles_for_conclusion_prompt(scratchpad: Dict[str, Any]) -> str:
                             parts.append(f"type={content_type}")
                         if rendered_len is not None:
                             parts.append(f"rendered_len={rendered_len}")
-                        text = ", ".join(parts) if parts else f"keys={list(out.keys())[:8]}"
+                        if parts:
+                            text = ", ".join(parts)
+                        else:
+                            # Structural key listing (not content); disclose when clipped.
+                            keys_view = [str(k) for k in out.keys()]
+                            text = f"keys={keys_view[:8]}" + (
+                                f" (+{len(keys_view) - 8} more keys)" if len(keys_view) > 8 else ""
+                            )
                     else:
                         text = str(out or "").strip()
-                if len(text) > max_obs_chars:
-                    text = f"{text[: max(0, max_obs_chars - 1)]}…"
+                text = _truncate_preview(text, max_chars=max_obs_chars)
                 lines.append(f"- [{name}] {'OK' if ok else 'ERR'}: {text}")
 
         lines.append("")
@@ -787,7 +743,75 @@ def create_react_workflow(
             elif role == "assistant" and tool_calls:
                 entry["tool_calls"] = tool_calls
             out.append(entry)
-        return out
+
+        # Orphan repair (multi-turn correctness on strict providers): an assistant `tool_calls`
+        # message whose ids are not answered by immediately-following tool messages makes native
+        # OpenAI reject the WHOLE request ("must be followed by tool messages responding to each
+        # tool_call_id" -> 400, run fails). The durable history legitimately produces this shape
+        # for interactive builtins (ask_user resolves via an ASK_USER wait + a user message, never
+        # a tool message). Pre-existing at git HEAD; repaired here at the payload boundary:
+        # synthesize a deterministic tool result right after the assistant turn (adjacency is part
+        # of the provider contract). Durable history is untouched; the synthetic text is stable so
+        # the cached prefix stays byte-identical across iterations (0212).
+        # Interactive builtins resolve through waits + user messages BY DESIGN; only their
+        # unanswered ids may honestly be labeled "handled interactively". Anything else
+        # unanswered is a genuinely lost result and must SAY so (Critic-3: a repair that
+        # papers over real loss with a false claim actively misleads the model).
+        _interactive_builtin_names = {"ask_user"}
+
+        repaired: List[Dict[str, Any]] = []
+        i = 0
+        while i < len(out):
+            entry = out[i]
+            if entry.get("role") == "tool":
+                # Orphan TOOL message (no immediately-preceding assistant tool_calls run —
+                # e.g. a compaction/trim cut): strict providers 400 on it. Fold it into an
+                # inert user-visible note instead (mirrors native-OpenAI's missing-id fold).
+                repaired.append({
+                    "role": "user",
+                    "content": f"[unpaired tool result]: {str(entry.get('content') or '')}",
+                })
+                i += 1
+                continue
+            repaired.append(entry)
+            i += 1
+            if entry.get("role") != "assistant" or not entry.get("tool_calls"):
+                continue
+            want: Dict[str, str] = {}
+            for tc in entry.get("tool_calls") or []:
+                tid = str(tc.get("id") or "")
+                if tid:
+                    want[tid] = str(((tc.get("function") or {}).get("name")) or "")
+            answered: set[str] = set()
+            while i < len(out) and out[i].get("role") == "tool":
+                tid = str(out[i].get("tool_call_id") or "")
+                if tid:
+                    answered.add(tid)
+                repaired.append(out[i])
+                i += 1
+            for tid, name in want.items():
+                if tid in answered:
+                    continue
+                if name in _interactive_builtin_names:
+                    content = "[handled interactively; see the following conversation messages]"
+                else:
+                    content = f"[tool result missing (host error): {name or 'unknown tool'}]"
+                repaired.append({"role": "tool", "tool_call_id": tid, "content": content})
+
+        # Adjacent USER turns (operator guidance drained before the first assistant reply, or
+        # across parse-retry cycles) are legal in durable history but 400 on alternation-strict
+        # chat templates (Mistral/Gemma-class). Payload-boundary repair only: join them with a
+        # blank line; the durable records stay distinct. User entries never carry tool_calls,
+        # so a plain content merge is lossless.
+        merged: List[Dict[str, Any]] = []
+        for entry in repaired:
+            if merged and entry.get("role") == "user" and merged[-1].get("role") == "user":
+                prev = dict(merged[-1])
+                prev["content"] = f"{str(prev.get('content') or '').rstrip()}\n\n{str(entry.get('content') or '')}"
+                merged[-1] = prev
+                continue
+            merged.append(entry)
+        return merged
 
     builtin_effect_tools = {
         "ask_user",
@@ -797,6 +821,7 @@ def create_react_workflow(
         "remember_note",
         "compact_memory",
         "delegate_agent",
+        "update_plan",
     }
 
     def init_node(run: RunState, ctx) -> StepPlan:
@@ -874,13 +899,28 @@ def create_react_workflow(
         limits["current_iteration"] = iteration
 
         task = str(context.get("task", "") or "")
-        messages_view = list(context.get("messages") or [])
 
         guidance = _drain_inbox(runtime_ns)
+        if guidance:
+            # Drained guidance joins the durable transcript as a user interjection (maintainer
+            # ruling 2026-07-09): the previous one-shot ephemeral tail was visible to exactly one
+            # LLM call, so a final answer written any cycle later re-anchored on the original task
+            # and dropped the correction. Append-only, so the cached prefix stays intact (0212);
+            # user,user adjacency (guidance before the first assistant turn, or across
+            # parse-retry cycles) is repaired at the payload boundary by _sanitize_llm_messages.
+            context["messages"].append(
+                _new_message(
+                    ctx,
+                    role="user",
+                    content=f"[Operator guidance — this amends the task; the final answer must satisfy it]\n{guidance}",
+                    metadata={"kind": "operator_guidance"},
+                )
+            )
+        messages_view = list(context.get("messages") or [])
         req = logic.build_request(
             task=task,
             messages=messages_view,
-            guidance=guidance,
+            guidance="",
             iteration=iteration,
             max_iterations=max_iterations,
             vars=run.vars,
@@ -908,13 +948,49 @@ def create_react_workflow(
 
         sys_base = str(req.system_prompt or "").strip()
         sys = _compose_system_prompt(runtime_ns, base=sys_base)
-        # Append scratchpad only when not using a full override prompt.
-        if _system_prompt_override(runtime_ns) is None:
-            scratch_txt = _render_cycles_for_system_prompt(scratchpad)
-            if scratch_txt:
-                sys = f"{sys.rstrip()}\n\n## Scratchpad (ReAct cycles so far)\n{scratch_txt}".strip()
+        # Prompt-prefix cache stability (0212) + context fidelity (0213):
+        # Do NOT append the per-cycle scratchpad to the system prompt. It mutated the cached prefix
+        # every iteration (defeating prompt caching) and double-carried observations already present
+        # in `context.messages`. The model's reasoning now lives in the transcript (assistant
+        # tool-call messages carry their `content`), so the system prompt stays byte-stable across
+        # iterations. The durable `scratchpad.cycles` record remains for host-side observability.
         if sys:
             payload["system_prompt"] = sys
+
+        # Volatile per-call state (loop position) rides a TRAILING ephemeral message so it never
+        # enters the cached prefix (0212). This is analogous to how the runtime grounding envelope
+        # is kept out of the stable prefix. Guidance no longer rides here: it is a durable
+        # transcript message (see the drain above).
+        tail_parts: list[str] = []
+        tail_parts.append(f"[loop] iteration {int(iteration)} of {int(max_iterations)}.")
+        plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
+        if isinstance(plan_text, str) and plan_text.strip():
+            # Bound the rendered plan so a pathological (or runaway) plan cannot balloon every
+            # subsequent request. The full plan stays durable in scratchpad; this is a display cap.
+            plan_render = plan_text.strip()
+            _plan_cap = 4000
+            if len(plan_render) > _plan_cap:
+                #[WARNING:TRUNCATION] bounded plan render in the trailing loop message
+                plan_render = plan_render[:_plan_cap].rstrip() + f"\n… (plan truncated, {len(plan_text.strip()):,} chars total)"
+            tail_parts.append(f"[plan]\n{plan_render}")
+        tail_text = "\n\n".join(tail_parts).strip()
+        if tail_text and isinstance(payload.get("messages"), list):
+            msgs_out = list(payload["messages"])
+            # Adjacency guard (Critic-3, 2026-07-09): when the payload already ends with a USER
+            # message (first turn: the task; post-ask_user turns: the user's reply), MERGE the
+            # volatile tail into it instead of appending a second consecutive user message —
+            # alternation-strict chat templates (Mistral/Gemma-class) reject user,user with a
+            # 400, and a separate trailing banner also steals the grounding envelope's
+            # "last user message" slot from the real task. When the payload ends with
+            # assistant/tool turns (the common tool-loop shape), the tail stays a separate
+            # trailing message exactly as before (no adjacency, cache prefix untouched).
+            if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
+                last = dict(msgs_out[-1])
+                last["content"] = f"{str(last.get('content') or '').rstrip()}\n\n{tail_text}"
+                msgs_out[-1] = last
+            else:
+                msgs_out.append({"role": "user", "content": tail_text})
+            payload["messages"] = msgs_out
 
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
         eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
@@ -1051,10 +1127,15 @@ def create_react_workflow(
                 pass
 
             # Keep tool transcript in context for OpenAI-compatible tool calling.
+            # Context fidelity (0213): keep the model's OWN reasoning in the durable transcript
+            # instead of dropping it (content="") and re-surfacing only a truncated, last-6-cycle
+            # copy via the system prompt. Providers accept assistant messages carrying BOTH content
+            # and tool_calls; this preserves multi-step coherence across long runs. The durable
+            # scratchpad.cycles record is kept for host-side observability only.
             context["messages"].append(
                 _new_assistant_message_with_tool_calls(
                     ctx,
-                    content="",  # thought is stored in scratchpad (not user-visible history)
+                    content=str(content or ""),
                     tool_calls=tool_calls,
                     metadata={"kind": "tool_calls", "cycle": cycle_i},
                 )
@@ -1095,11 +1176,14 @@ def create_react_workflow(
             emit("parse_retry_plan_only", {"cycle": cycle_i})
             return StepPlan(node_id="parse", next_node="reason")
 
-        # Final answer: stop the loop.
+        # Final answer candidate. Before stopping, optionally run a verification pass (0217):
+        # a strict self-critique that can send the loop back to `act` with concrete next steps if
+        # the task is not actually complete. Gated on `_runtime.review_mode` (default off at the
+        # workflow level; ReactAgent enables it by default via _runtime).
         answer = str(content).strip()
         temp["final_answer"] = answer
         emit("parse_final", {"cycle": cycle_i})
-        return StepPlan(node_id="parse", next_node="done")
+        return StepPlan(node_id="parse", next_node="maybe_review")
 
     def act_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
@@ -1144,7 +1228,9 @@ def create_react_workflow(
 
             temp["pending_tool_calls"] = list(tool_queue[1:])
 
-            if name and name not in allow:
+            # `update_plan` is an always-available control-flow primitive (no external effect); it is
+            # not an allowlisted external tool, so it bypasses the allowlist gate.
+            if name and name not in allow and name != "update_plan":
                 temp["tool_results"] = {
                     "results": [
                         {
@@ -1180,6 +1266,33 @@ def create_react_workflow(
                     ),
                     next_node="handle_user_response",
                 )
+
+            if name == "update_plan":
+                # Schema-only planning tool (0217): persist a structured checklist/plan to the
+                # scratchpad. No effect is issued; the plan is rendered at the message TAIL on the
+                # next reason step (cache-safe per 0212). This gives long tasks a stable anchor.
+                plan_value = args.get("plan")
+                if isinstance(plan_value, list):
+                    plan_text = "\n".join(f"- {str(item)}" for item in plan_value if str(item).strip())
+                else:
+                    plan_text = str(plan_value or "").strip()
+                scratchpad["plan"] = plan_text
+                explanation = str(args.get("explanation") or "").strip()
+                if explanation:
+                    scratchpad["plan_explanation"] = explanation
+                emit("update_plan", {"has_plan": bool(plan_text)})
+                temp["tool_results"] = {
+                    "results": [
+                        {
+                            "call_id": str(tc.get("call_id") or ""),
+                            "name": "update_plan",
+                            "success": True,
+                            "output": "Plan updated." if plan_text else "Plan cleared.",
+                            "error": None,
+                        }
+                    ]
+                }
+                return StepPlan(node_id="act", next_node="observe")
 
             if name == "recall_memory":
                 payload = dict(args)
@@ -1344,6 +1457,11 @@ def create_react_workflow(
 
         if results:
             scratchpad["used_tools"] = True
+            # Verification budget is PER-ANSWER, not run-lifetime (mirror CodeAct, which resets
+            # after tools execute). Any tool activity — model-issued or verifier-forced — means the
+            # next final answer is a new claim that deserves its own review rounds. Without this,
+            # a long run stops being verified after the first `review_max_rounds` checks.
+            scratchpad["review_count"] = 0
 
         # Attach observations to the most recent cycle.
         cycles = scratchpad.get("cycles")
@@ -1419,6 +1537,195 @@ def create_react_workflow(
         if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
         return StepPlan(node_id="handle_user_response", next_node="reason")
+
+    def _review_truncate(text: str, *, max_chars: int) -> str:
+        s = str(text or "")
+        if max_chars <= 0 or len(s) <= max_chars:
+            return s
+        suffix = f"\n… (truncated, {len(s):,} chars total)"
+        keep = max_chars - len(suffix)
+        if keep < 200:
+            # Even at a tiny bound, never emit an UNMARKED slice (ADR-0026). Keep a short marker.
+            keep = max(0, max_chars - 1)
+            suffix = "…"
+        #[WARNING:TRUNCATION] bounded verifier transcript blocks for prompt reconstruction
+        return s[:keep].rstrip() + suffix
+
+    def maybe_review_node(run: RunState, ctx) -> StepPlan:
+        _, scratchpad, runtime_ns, _, _ = ensure_react_vars(run)
+
+        raw_review = runtime_ns.get("review_mode") if isinstance(runtime_ns, dict) else None
+        review_mode = _boolish(raw_review) if raw_review is not None else False
+        if not review_mode:
+            return StepPlan(node_id="maybe_review", next_node="done")
+
+        try:
+            max_rounds = int(runtime_ns.get("review_max_rounds", 1) or 0)
+        except (TypeError, ValueError):
+            max_rounds = 1
+        if max_rounds < 0:
+            max_rounds = 0
+
+        try:
+            count = int(scratchpad.get("review_count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count >= max_rounds:
+            return StepPlan(node_id="maybe_review", next_node="done")
+
+        scratchpad["review_count"] = count + 1
+        return StepPlan(node_id="maybe_review", next_node="review")
+
+    def review_node(run: RunState, ctx) -> StepPlan:
+        context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
+        task = str(context.get("task", "") or "")
+        plan = scratchpad.get("plan")
+        plan_text = str(plan).strip() if isinstance(plan, str) and plan.strip() else "(no plan)"
+        answer = str(temp.get("final_answer") or "").strip()
+
+        messages = list(context.get("messages") or [])
+        tool_msgs: list[str] = []
+        for m in reversed(messages):
+            if not isinstance(m, dict) or m.get("role") != "tool":
+                continue
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                tool_msgs.append(_review_truncate(content.strip(), max_chars=2000))
+            if len(tool_msgs) >= 8:
+                break
+        tool_msgs.reverse()
+        observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
+
+        allow = _effective_allowlist(runtime_ns)
+        prompt = (
+            "You are a verifier. Review whether the user's request has been fully satisfied.\n"
+            "Be strict: only count actions that are supported by the tool outputs.\n"
+            "If anything is missing, propose the NEXT ACTIONS.\n"
+            "Prefer returning `next_tool_calls` over `next_prompt`.\n"
+            "Return JSON ONLY.\n\n"
+            f"User request:\n{task}\n\n"
+            f"Plan:\n{plan_text}\n\n"
+            f"Proposed final answer:\n{_review_truncate(answer, max_chars=4000)}\n\n"
+            f"Tool outputs:\n{observations}\n\n"
+            f"Allowed tools:\n{', '.join(allow) if allow else '(none)'}\n\n"
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "complete": {"type": "boolean"},
+                "missing": {"type": "array", "items": {"type": "string"}},
+                "next_prompt": {"type": "string"},
+                "next_tool_calls": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}},
+                        "required": ["name", "arguments"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["complete", "missing", "next_prompt", "next_tool_calls"],
+            "additionalProperties": False,
+        }
+
+        emit("review_request", {"tool_messages": len(tool_msgs)})
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "response_schema": schema,
+            "response_schema_name": "ReActVerifier",
+            "params": runtime_llm_params(runtime_ns, extra={}, default_temperature=0.2),
+        }
+        media = extract_media_from_context(context)
+        if media:
+            payload["media"] = media
+        sys = _compose_system_prompt(runtime_ns, base="")
+        if sys:
+            payload["system_prompt"] = sys
+        eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
+        eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
+        if isinstance(eff_provider, str) and eff_provider.strip():
+            payload["provider"] = eff_provider.strip()
+        if isinstance(eff_model, str) and eff_model.strip():
+            payload["model"] = eff_model.strip()
+
+        return StepPlan(
+            node_id="review",
+            effect=Effect(type=EffectType.LLM_CALL, payload=payload, result_key="_temp.review_llm_response"),
+            next_node="review_parse",
+        )
+
+    def review_parse_node(run: RunState, ctx) -> StepPlan:
+        context, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
+        resp = temp.get("review_llm_response", {})
+        if not isinstance(resp, dict):
+            resp = {}
+
+        data = resp.get("data")
+        if data is None and isinstance(resp.get("content"), str):
+            try:
+                data = json.loads(resp["content"])
+            except Exception:
+                data = None
+        if not isinstance(data, dict):
+            data = {}
+
+        complete = bool(data.get("complete"))
+        missing = data.get("missing") if isinstance(data.get("missing"), list) else []
+        next_prompt_text = str(data.get("next_prompt") or "").strip()
+        next_tool_calls_raw = data.get("next_tool_calls")
+        next_tool_calls: list[dict[str, Any]] = []
+        if isinstance(next_tool_calls_raw, list):
+            for item in next_tool_calls_raw:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                args = item.get("arguments")
+                if not isinstance(args, dict):
+                    args = {}
+                if name:
+                    next_tool_calls.append({"name": name, "arguments": args})
+
+        emit("review", {"complete": complete, "missing": missing})
+        temp.pop("review_llm_response", None)
+
+        if complete:
+            return StepPlan(node_id="review_parse", next_node="done")
+
+        if next_tool_calls:
+            # BUG FIX (adversarial review): forced tool calls MUST be preceded by an assistant
+            # tool-calls message in the transcript, or the tool observations become orphans and
+            # strict OpenAI-compatible providers 400 the next call ("tool message must be a response
+            # to a preceding tool_calls"). Synthesize that assistant message here, mirroring
+            # parse_node, with explicit call_ids shared by the assistant message AND the pending
+            # calls so the ids line up when observe_node writes the tool results.
+            synthesized: list[ToolCall] = []
+            base = f"review_{int(scratchpad.get('iteration', 0) or 0)}_{hashlib.sha256(json.dumps(next_tool_calls, sort_keys=True, default=str).encode()).hexdigest()[:8]}"
+            for i, item in enumerate(next_tool_calls):
+                synthesized.append(
+                    ToolCall(name=str(item.get("name") or ""), arguments=dict(item.get("arguments") or {}), call_id=f"{base}_{i}")
+                )
+            context["messages"].append(
+                _new_assistant_message_with_tool_calls(
+                    ctx,
+                    content="",
+                    tool_calls=synthesized,
+                    metadata={"kind": "tool_calls", "source": "review"},
+                )
+            )
+            temp["pending_tool_calls"] = [tc.__dict__ for tc in synthesized]
+            emit("review_tool_calls", {"count": len(synthesized)})
+            return StepPlan(node_id="review_parse", next_node="act")
+
+        # Incomplete but no actionable tool calls. The old "nudge then re-review" was a no-op (the
+        # re-review payload was byte-identical, so the runtime idempotency layer replayed the first
+        # verdict) AND leaked the nudge into the MAIN model's guidance tail. Instead: if the verifier
+        # gave a next_prompt, steer the main agent with it (bounded by the run-lifetime review
+        # budget, which does not reset on this path); otherwise accept the answer.
+        if next_prompt_text:
+            _push_inbox(runtime_ns, f"[Review] {next_prompt_text}")
+            return StepPlan(node_id="review_parse", next_node="reason")
+        return StepPlan(node_id="review_parse", next_node="done")
 
     def done_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, _, temp, limits = ensure_react_vars(run)
@@ -1606,6 +1913,9 @@ def create_react_workflow(
             "act": act_node,
             "observe": observe_node,
             "handle_user_response": handle_user_response_node,
+            "maybe_review": maybe_review_node,
+            "review": review_node,
+            "review_parse": review_parse_node,
             "done": done_node,
             "max_iterations": max_iterations_node,
         },
