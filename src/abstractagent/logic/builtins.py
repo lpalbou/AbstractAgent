@@ -310,6 +310,14 @@ DELEGATE_AGENT_TOOL = ToolDefinition(
             ),
             "default": None,
         },
+        "max_iterations": {
+            "type": "integer",
+            "description": (
+                "Iteration budget for the delegated agent (optional). "
+                "When omitted, the delegated agent inherits the parent's budget (min 20)."
+            ),
+            "default": None,
+        },
     },
     when_to_use=(
         "Use when you can split off a subtask that can be completed with a small context (e.g., "

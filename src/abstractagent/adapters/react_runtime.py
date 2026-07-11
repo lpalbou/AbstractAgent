@@ -294,6 +294,13 @@ _DEFERRED_ACTION_VERB_RE = re.compile(
 
 _TOOL_CALL_MARKERS = ("<function_call>", "<tool_call>", "<|tool_call|>", "```tool_code")
 
+# Paired fenced blocks (```lang ... ```). Used to make prose heuristics fence-blind:
+# fenced content is quoted material (code samples, entity election fences like
+# ```diary/```feel — frozen visit seam spec a2a 0013 §4 line 6), never the assistant's
+# own action commitment. An unterminated trailing fence stays in the prose view
+# (conservative: no pair, no exclusion).
+_FENCED_BLOCK_RE = re.compile(r"(?s)```[^\n`]*\n.*?```")
+
 
 def _contains_tool_call_markup(text: str) -> bool:
     s = str(text or "")
@@ -322,29 +329,108 @@ def _strip_tool_call_markup(text: str) -> str:
         return raw
 
 
+# --- Act-only tool results (frozen visit seam spec, a2a thread 0013 v2 §2) ---
+#
+# Act-only tools (e.g. entity diary reads) must never land their CONTENT in any
+# at-rest surface outside its one home (G1: "the book's words never rest outside
+# the book"). The durable transcript carries an ACT-FRAME REFERENCE instead; the
+# runtime LLM_CALL handler dereferences it at the provider boundary (send time)
+# into a wire COPY. The adapter is NOT the privacy mechanism (the effect handler
+# is — words must never reach the tool-result channel); this rendering is the
+# canonical-shape half plus fail-safe defense in depth.
+
+_ACT_ONLY_KEY = "$act_only"
+
+
+def _act_only_ref_content(frame: Dict[str, Any]) -> str:
+    """Serialize an act-frame as canonical `$act_only` reference message content.
+
+    Contract (spec v2 §2 + agent pins): the reference rides the tool message's
+    CONTENT as one exact JSON object with a lone `$act_only` top-level key, so the
+    runtime handler detects it by parse (json.loads), never by regex. Deterministic
+    serialization (sorted keys) keeps the durable bytes stable for prefix caching.
+    """
+    return json.dumps({_ACT_ONLY_KEY: frame}, ensure_ascii=False, sort_keys=True)
+
+
+def _act_only_frame_from_output(output: Any) -> Optional[Dict[str, Any]]:
+    """Return the act-frame dict when a tool result output is `$act_only`-shaped.
+
+    A handler-authored reference (`{"$act_only": {...}}`, lone top-level key) is
+    honored regardless of local tool declarations — the effect handler is the
+    enforcement authority and may mark results act-only on its own.
+    """
+    if (
+        isinstance(output, dict)
+        and set(output.keys()) == {_ACT_ONLY_KEY}
+        and isinstance(output[_ACT_ONLY_KEY], dict)
+    ):
+        return dict(output[_ACT_ONLY_KEY])
+    return None
+
+
+def _act_only_frame_is_dereferenceable(frame: Dict[str, Any]) -> bool:
+    """True when a frame may take the lone-key REF shape in the durable transcript.
+
+    Cross-package wedge guard (found reading runtime's shipped dereference,
+    identity/act_only.py): the LLM_CALL wrapper resolves every `$act_only` ref in
+    the transcript at SEND time and FAILS the call loudly when one cannot resolve.
+    Refs are durable, so a non-dereferenceable ref (no entry_id — e.g. a failure
+    record) would fail EVERY subsequent LLM call in the run: the run wedges on a
+    historical record. Rule: the ref shape is reserved for frames that actually
+    reference book content (entry_id present); records-of-acts without content
+    (failures, suppressions) render as labeled non-ref text instead — still no
+    words, but inert to the dereference pass.
+    """
+    return bool(str(frame.get("entry_id") or "").strip())
+
+
+def _act_only_record_content(frame: Dict[str, Any]) -> str:
+    """Non-ref rendering for act-only frames that reference nothing.
+
+    Deliberately NOT the lone-key `$act_only` shape (would be parsed as a ref and
+    wedge the run — see `_act_only_frame_is_dereferenceable`). Carries act-frame
+    fields only; never tool-surfaced words.
+    """
+    tool = str(frame.get("tool") or "tool")
+    detail = json.dumps({k: v for k, v in frame.items() if k != "tool"}, ensure_ascii=False, sort_keys=True)
+    return f"[{tool}]: act-only record (no content at rest): {detail}"
+
+
 def _looks_like_deferred_action(text: str) -> bool:
     """Return True when the model claims it will take actions but emits no tool calls.
 
     This is intentionally conservative: false positives waste iterations and can "force"
     unnecessary tool calls. It should only trigger when the assistant message strongly
     suggests it is about to act (not answer).
+
+    Fence-blind (frozen visit seam spec, a2a 0013 §4 line 6): all heuristics run on the
+    PROSE view with paired ```fenced blocks removed — fenced content is quoted material
+    (code samples, entity election fences like ```diary whose first-person text, e.g.
+    "I will keep reading…", is diary content, not an action commitment). A retry
+    triggered by fence content would discard a reply carrying elections — the exact
+    consume-the-fences failure the spec's never-strip obligation forbids. A reply that
+    is ONLY fences is a valid final answer (elections are reply content).
     """
     s = str(text or "").strip()
     if not s:
         return False
+    prose = _FENCED_BLOCK_RE.sub("", s).strip()
+    if not prose:
+        return False
     # If the model is explicitly waiting for user direction, that's a valid final response.
-    if _WAITING_RE.search(s):
+    if _WAITING_RE.search(prose):
         return False
     # Common “final answer” framing (incl. typographic apostrophes).
-    if _FINALISH_RE.search(s):
+    if _FINALISH_RE.search(prose):
         return False
     # If the model already produced a structured answer (headings/sections), don't retry.
-    if re.search(r"(?m)^(#{1,6}\s+\\S|\\*\\*\\S)", s):
+    if re.search(r"(?m)^(#{1,6}\s+\\S|\\*\\*\\S)", prose):
         return False
     # Must contain first-person intent *and* an action-ish verb.
-    if not _DEFERRED_ACTION_INTENT_RE.search(s):
+    if not _DEFERRED_ACTION_INTENT_RE.search(prose):
         return False
-    if not _DEFERRED_ACTION_VERB_RE.search(s):
+    if not _DEFERRED_ACTION_VERB_RE.search(prose):
         return False
     return True
 
@@ -383,6 +469,28 @@ def _boolish(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
     return False
+
+def _apply_llm_payload_extras(runtime_ns: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    """Copy embedding-workflow payload keys from `_runtime` onto an LLM_CALL payload.
+
+    G1 write direction (runtime b8b8c78/56e55c3): the entity runtime's result-boundary
+    election capture keys book writes on the payload's `turn_id` (elections with no
+    turn_id fail loud) and threads word-free `anchor_record_ids`/`anchor_graph_ids`
+    into the DIARY_WRITE it performs. The embedding visit workflow sets
+    `_runtime.turn_id` / `_runtime.llm_payload_extras` per turn (RENDER/ROUTE seam);
+    outside visits the keys are absent and payloads are byte-unchanged.
+    """
+    if not isinstance(runtime_ns, dict):
+        return
+    turn_id_val = runtime_ns.get("turn_id")
+    if isinstance(turn_id_val, str) and turn_id_val.strip():
+        payload["turn_id"] = turn_id_val.strip()
+    extras = runtime_ns.get("llm_payload_extras")
+    if isinstance(extras, dict):
+        for key, value in extras.items():
+            if isinstance(key, str) and key.strip() and key not in payload:
+                payload[key] = value
+
 
 def _system_prompt_override(runtime_ns: Dict[str, Any]) -> Optional[str]:
     raw = runtime_ns.get("system_prompt") if isinstance(runtime_ns, dict) else None
@@ -573,6 +681,41 @@ def _render_final_report(task: str, scratchpad: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def reset_react_turn(run_vars: Dict[str, Any]) -> None:
+    """Reset per-TURN loop state so an embedding workflow can re-enter `reason`.
+
+    Visit-workflow composition (frozen seam spec a2a 0013 §A/§4: "per-turn iteration
+    budget rides `_limits`"): a resident/visit workflow cycles PARK → seam nodes →
+    reason → … → final_next_node → PARK. Each turn gets a fresh iteration budget and
+    clean per-turn scratch; the DURABLE LIFE — transcript (`context.messages`),
+    `scratchpad.cycles`, `scratchpad.plan` — is deliberately untouched (append-only
+    history, prefix-cache stable). The caller owns `_limits.max_iterations` (set once
+    at OPEN); this resets only the counters/carriers a finished turn leaves behind.
+    """
+    scratchpad = run_vars.get("scratchpad")
+    if isinstance(scratchpad, dict):
+        scratchpad["iteration"] = 0
+        scratchpad["review_count"] = 0
+    limits = run_vars.get("_limits")
+    if isinstance(limits, dict):
+        limits["current_iteration"] = 0
+    temp = run_vars.get("_temp")
+    if isinstance(temp, dict):
+        for key in (
+            "final_answer",
+            "react_output",
+            "llm_response",
+            "pending_tool_calls",
+            "tool_results",
+            "user_response",
+            "review_llm_response",
+            "max_iterations_llm_response",
+            "max_iterations_conclude_retries",
+            "turn_captures",
+        ):
+            temp.pop(key, None)
+
+
 def create_react_workflow(
     *,
     logic: ReActLogic,
@@ -581,8 +724,22 @@ def create_react_workflow(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     allowed_tools: Optional[List[str]] = None,
+    final_next_node: Optional[str] = None,
 ) -> WorkflowSpec:
-    """Adapt ReActLogic to an AbstractRuntime workflow."""
+    """Adapt ReActLogic to an AbstractRuntime workflow.
+
+    `final_next_node` (composition knob, frozen seam spec a2a 0013 §A): when set, the
+    terminal nodes (`done`, `max_iterations`) do everything they do today — persist the
+    final answer to the durable transcript, honor the never-strip election obligation,
+    render the report — but HAND OFF to the named node instead of completing the run,
+    stashing the would-be output dict at `_temp.react_output` (answer/report/iterations/
+    messages/scratchpad). An embedding workflow (the entity visit TURN chain) merges
+    these nodes with its own seam nodes (RECALL before `reason`, ELECTIONS after) and
+    reads `_temp.final_answer` / `_temp.react_output` at the handoff. Default None:
+    behavior unchanged (the run completes). Re-entry for the next turn goes through
+    `reset_react_turn(run.vars)` then `reason` — never `init` (init seeds the task
+    message; a visit's messages arrive from the PARK resume).
+    """
 
     def emit(step: str, data: Dict[str, Any]) -> None:
         if on_step:
@@ -603,6 +760,16 @@ def create_react_workflow(
             name = getattr(t, "name", None)
             if isinstance(name, str) and name.strip():
                 out[name] = t
+        return out
+
+    def _act_only_tool_names() -> set[str]:
+        # Keyed on core's first-class `act_only` field (ToolDefinition); fail-closed by
+        # absence (getattr default False) so the check works before core ships the field
+        # and becomes constructor-native after — one spelling, no tags fallback.
+        out: set[str] = set()
+        for name, t in _tool_by_name().items():
+            if bool(getattr(t, "act_only", False)):
+                out.add(name)
         return out
 
     def _default_allowlist() -> list[str]:
@@ -999,6 +1166,8 @@ def create_react_workflow(
         if isinstance(eff_model, str) and eff_model.strip():
             payload["model"] = eff_model.strip()
 
+        _apply_llm_payload_extras(runtime_ns, payload)
+
         params: Dict[str, Any] = {}
         max_out = _max_output_tokens(runtime_ns, limits)
         if isinstance(max_out, int) and max_out > 0:
@@ -1017,6 +1186,23 @@ def create_react_workflow(
     def parse_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
         response = temp.get("llm_response", {})
+
+        # Accumulate entity-runtime result-boundary captures across the turn's
+        # iterations (G1 write direction, runtime b8b8c78): `diary_entries` (word-free
+        # metadata) and `act_only_warnings` ride EACH LLM result and would be lost when
+        # `_temp.llm_response` is overwritten next iteration — but the embedding visit
+        # workflow's ELECT/FORM nodes need ALL of them (mid-loop elections included:
+        # the model may elect, then call a tool, then answer). Keys are the entity
+        # runtime's declared result contract, never guessed. Absent = untouched.
+        if isinstance(response, dict) and (response.get("diary_entries") or response.get("act_only_warnings")):
+            captures = temp.get("turn_captures")
+            if not isinstance(captures, dict):
+                captures = {"diary_entries": [], "act_only_warnings": []}
+                temp["turn_captures"] = captures
+            for capture_key in ("diary_entries", "act_only_warnings"):
+                vals = response.get(capture_key)
+                if isinstance(vals, list) and vals:
+                    captures[capture_key] = list(captures.get(capture_key) or []) + list(vals)
 
         content, tool_calls = logic.parse_response(response)
         finish_reason = ""
@@ -1379,6 +1565,22 @@ def create_react_workflow(
                 if delegated_context:
                     combined_task = f"{delegated_task}\n\nContext:\n{delegated_context}"
 
+                # Child iteration budget (agency-caps ruling 2026-07-11: default caps are
+                # 20; below-20 is an operator's explicit choice, never a code default).
+                # The old hardcoded 10 was a fear-shaped number — a delegated research
+                # subtask is exactly where iterate-until-satisfied matters. The child
+                # inherits the PARENT's budget (a sub-agent is not a lesser agent), with
+                # the ruled 20 as the floor guard against a parent that was itself
+                # narrowed below the ruling. An explicit `max_iterations` tool arg wins.
+                child_iterations: int
+                raw_child_iters = args.get("max_iterations")
+                try:
+                    child_iterations = int(raw_child_iters) if raw_child_iters is not None else 0
+                except Exception:
+                    child_iterations = 0
+                if child_iterations < 1:
+                    child_iterations = max(int(max_iterations or 0), 20)
+
                 sub_vars: Dict[str, Any] = {
                     "context": {"task": combined_task, "messages": []},
                     "_runtime": {
@@ -1391,7 +1593,7 @@ def create_react_workflow(
                             "- Return a concise result suitable for the parent agent to act on.\n"
                         ),
                     },
-                    "_limits": {"max_iterations": 10},
+                    "_limits": {"max_iterations": child_iterations},
                 }
 
                 payload = {
@@ -1479,6 +1681,8 @@ def create_react_workflow(
                     return rendered.strip()
             return "" if v is None else str(v)
 
+        act_only_names = _act_only_tool_names()
+
         obs_list: list[dict[str, Any]] = []
         for r in results:
             if not isinstance(r, dict):
@@ -1487,6 +1691,58 @@ def create_react_workflow(
             success = bool(r.get("success"))
             output = r.get("output", "")
             error = r.get("error", "")
+
+            # Act-only results (frozen seam spec, a2a 0013 v2 §2): the durable transcript,
+            # scratchpad cycles, and emit lane carry the ACT-FRAME REFERENCE only — never
+            # tool-surfaced content. Handler-authored refs are honored unconditionally;
+            # declared act-only tools additionally get fail-safe rendering when a handler
+            # misbehaves (raw output is suppressed, loudly, before it becomes permanent).
+            frame = _act_only_frame_from_output(output)
+            if frame is None and name in act_only_names:
+                if success and isinstance(output, dict):
+                    frame = dict(output)
+                elif not success:
+                    # Failure diagnostics ride the handler's ERROR channel by contract
+                    # (a refused/failed act-only read returns no content); raw output is
+                    # never rendered for a declared act-only tool.
+                    frame = {"tool": name, "error": str(error or "").strip() or "act-only tool call failed"}
+                else:
+                    frame = {
+                        "tool": name,
+                        "error": "non-reference output from an act-only tool suppressed at render",
+                        "warning": "#FALLBACK",
+                    }
+            if frame is not None:
+                frame.setdefault("tool", name)
+                # Ref shape only for frames that reference book content; records-of-acts
+                # without an entry_id render as labeled non-ref text — inert to runtime's
+                # send-time dereference pass, which loudly fails the LLM call on any
+                # unresolvable ref (durable message -> a wedged run otherwise).
+                if _act_only_frame_is_dereferenceable(frame):
+                    rendered = _act_only_ref_content(frame)
+                else:
+                    rendered = _act_only_record_content(frame)
+                emit("observe", {"tool": name, "success": success, "result": rendered})
+                context["messages"].append(
+                    _new_message(
+                        ctx,
+                        role="tool",
+                        content=rendered,
+                        metadata={"name": name, "call_id": r.get("call_id"), "success": success, "act_only": True},
+                    )
+                )
+                obs_list.append(
+                    {
+                        "call_id": r.get("call_id"),
+                        "name": name,
+                        "success": success,
+                        "output": {_ACT_ONLY_KEY: dict(frame)},
+                        "error": error,
+                        "rendered": rendered,
+                    }
+                )
+                continue
+
             display = _display(output)
             if not success:
                 display = _display(output) if isinstance(output, dict) else str(error or output)
@@ -1745,16 +2001,19 @@ def create_react_workflow(
         iterations = int(limits.get("current_iteration", 0) or scratchpad.get("iteration", 0) or 0)
         report = _render_final_report(task, scratchpad)
 
-        return StepPlan(
-            node_id="done",
-            complete_output={
-                "answer": answer,
-                "report": report,
-                "iterations": iterations,
-                "messages": list(context.get("messages") or []),
-                "scratchpad": dict(scratchpad),
-            },
-        )
+        output = {
+            "answer": answer,
+            "report": report,
+            "iterations": iterations,
+            "messages": list(context.get("messages") or []),
+            "scratchpad": dict(scratchpad),
+        }
+        if final_next_node:
+            # Composition handoff (visit TURN chain): the turn is finished but the RUN
+            # continues — the seam node reads _temp.react_output / _temp.final_answer.
+            temp["react_output"] = output
+            return StepPlan(node_id="done", next_node=final_next_node)
+        return StepPlan(node_id="done", complete_output=output)
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
@@ -1892,16 +2151,19 @@ def create_react_workflow(
         report = _render_final_report(str(context.get("task") or ""), scratchpad)
 
         iterations = int(limits.get("current_iteration", 0) or scratchpad.get("iteration", 0) or max_iterations)
-        return StepPlan(
-            node_id="max_iterations",
-            complete_output={
-                "answer": answer,
-                "report": report,
-                "iterations": iterations,
-                "messages": list(context.get("messages") or []),
-                "scratchpad": dict(scratchpad),
-            },
-        )
+        output = {
+            "answer": answer,
+            "report": report,
+            "iterations": iterations,
+            "messages": list(context.get("messages") or []),
+            "scratchpad": dict(scratchpad),
+        }
+        if final_next_node:
+            # Composition handoff: budget exhaustion also ends the TURN, not the run —
+            # the seam node decides what an out-of-budget visit turn does next.
+            temp["react_output"] = output
+            return StepPlan(node_id="max_iterations", next_node=final_next_node)
+        return StepPlan(node_id="max_iterations", complete_output=output)
 
     return WorkflowSpec(
         workflow_id=str(workflow_id or "react_agent"),

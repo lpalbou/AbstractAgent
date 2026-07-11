@@ -1,11 +1,150 @@
 # Changelog
 
+## Unreleased (2026-07-11)
+
+### Changed
+- **delegate_agent child iteration budget (agency-caps ruling 2026-07-11)**: the
+  delegated child's `_limits.max_iterations` was hardcoded to 10 — a fear-shaped
+  default under the ruling ("default caps are 20; below-20 is operator choice").
+  The child now inherits the PARENT's budget with 20 as the floor guard; an
+  explicit `max_iterations` tool argument wins (added to the delegate_agent
+  schema). The no-recursion allowlist strip (delegate_agent/ask_user removed
+  from child allowlists) is unchanged — that is wait-safety, not a cap.
+  Tests: `test_react_delegate_agent_tool.py` (4 new parametrized pins).
+
+### Fixed
+- **Prompt-cache vocabulary collision (live-proven, agency c509)**: `runtime_llm_params`
+  now emits bare-string `_runtime.prompt_cache_binding` values as `prompt_cache_key`
+  (core's best-effort per-session cache identity) and reserves `prompt_cache_binding`
+  for dict shapes (core's strict durable-bloc artifact binding, whose validation
+  unconditionally raises for bare strings). The string-under-strict-name shape failed
+  100% of live entity-visit turns at the provider boundary the moment the door began
+  forwarding params (turn-1 terminal failure). The guard applies at the output
+  boundary, so explicit string overrides convert too. `_runtime.prompt_cache_key`
+  is now also forwarded directly. Tests: `test_generation_params_media_policies.py`
+  (4 new pins, incl. the exact door-stamped string shape).
+
 All notable changes to `abstractagent` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Added (2026-07-10 — THE MERGE PROOF: this cycle inside runtime's real visit workflow)
+- **`tests/test_react_visit_merge.py`**: consumes runtime's SHIPPED merge parameter
+  (`build_visit_workflow(react_middle=...)`, a78185c — one owner for the visit graph
+  in runtime's package; the middle arrives as DATA to keep the dependency arrow
+  one-way). This suite is the CALLER the `ReactMiddle` contract names: it builds the
+  middle from this package's public API (`create_react_workflow(final_next_node=
+  HARVEST_NODE)` + `reset_react_turn`) and pins the composed graph over a REAL home +
+  per-entity runtime. Proven live: mid-loop diary election (iteration 1, beside a tool
+  call) captured at the result boundary — elected words rest ONLY in the book (run
+  vars + ledger grepped clean); episode formed with `visit_id` + stamped participants
+  through runtime's nodes byte-unchanged; identity access counts stay 0 (D2); prelude
+  head byte-identical across iterations; restart-mid-visit (criterion 5) holds under
+  the merge. The seam is tested from BOTH directions: runtime pins it with a
+  contract-faithful stub middle (no adapter import); this suite pins it with the real
+  cycle. (Initial version carried local BRIDGE/HARVEST seam nodes as the proposal
+  proof; deleted same-day when runtime shipped the parameter.)
+
+### Added (2026-07-10 — visit-workflow composition knob, frozen spec a2a 0013 §A / 0014 draft)
+- **`create_react_workflow(final_next_node=...)`**: when set, `done`/`max_iterations`
+  finish the TURN instead of the run — they persist the final answer to the durable
+  transcript exactly as today (never-strip obligation intact), stash the output dict at
+  `_temp.react_output`, and hand off to the named seam node. This is how the entity
+  visit TURN chain (RECALL → this adapter's reason/act/observe → ELECTIONS → COMMIT →
+  FORM → ANSWER → PARK) embeds the loop: the embedding workflow merges the adapter's
+  nodes with its seam nodes. Default None: behavior unchanged.
+- **`reset_react_turn(run_vars)`**: per-turn budget semantics for re-entry — resets the
+  iteration counter, review count, and per-turn `_temp` carriers while leaving the
+  durable life (transcript, `scratchpad.cycles`, plan) untouched. Re-entry goes through
+  this helper then `reason`, never `init` (init seeds the task message; visit messages
+  arrive from the PARK resume). Pinned through the real runtime with a miniature visit
+  workflow (`tests/test_react_visit_composition.py`): handoff instead of completion,
+  two-turn visit with fresh budget + durable transcript continuity + append-only prefix
+  across the turn boundary, budget exhaustion handing off to the seam.
+- **`_runtime.turn_id` + `_runtime.llm_payload_extras` → LLM_CALL payload pass-through**
+  (G1 write direction, runtime b8b8c78/56e55c3): the entity runtime's result-boundary
+  diary-election capture keys book writes on the payload's `turn_id` (elections without
+  it fail loud) and threads word-free `anchor_record_ids`/`anchor_graph_ids` into the
+  DIARY_WRITE it performs. The embedding workflow sets both per turn; `reason_node`
+  passes them through (extras never overwrite existing payload keys). Absent = absent —
+  non-visit runs byte-unchanged (pinned both ways).
+- **`_temp.turn_captures` accumulation**: the entity runtime's wrapper returns
+  `diary_entries` (word-free metadata) + `act_only_warnings` on EACH LLM result; with a
+  multi-iteration loop a mid-loop election's capture would be lost when
+  `_temp.llm_response` is overwritten next iteration. `parse_node` accumulates both
+  lists across the turn at `_temp.turn_captures` for the embedding ELECT/FORM nodes;
+  `reset_react_turn` clears it at turn boundaries. Keys are the entity runtime's
+  declared result contract; absent = untouched (pinned incl. the mid-loop election case).
+
+### Added (2026-07-10 — prefix-reuse measurement, A/B criterion 3 evidence tooling)
+- **`abstractagent.metrics.prefix_reuse`** (`measure_prefix_reuse` / `prefix_reuse_report`):
+  byte-level reuse measurement over captured LLM_CALL payloads, mirroring how provider
+  prompt caches key requests (head = system_prompt + tools, reusable only when
+  byte-identical; message lane = longest common prefix of byte-identical messages;
+  a changed head invalidates everything after it). Deterministic JSON canonicalization;
+  pure measurement, no policy. Feeds the fixture-home A/B's criterion 3 ("prefix reuse
+  measured and reported — target is evidence, not a pass bar"). Pinned at unit level
+  (known reuse shapes, head-mutation invalidation) AND over the real adapter loop,
+  where it MEASURES the documented adjacency-guard trade precisely: iteration 2 reuses
+  the head but zero messages (iteration 1's task message merged the volatile tail);
+  from iteration 3 the transcript prefix reuses and grows
+  (`tests/test_prefix_reuse_metric.py`).
+
+### Added (2026-07-10 — entity-dress conformance pins, frozen spec a2a 0013 §4)
+- **Entity-dress knobs pinned by test** (`tests/test_react_entity_dress_conformance.py`):
+  `_runtime.system_prompt` (the prelude) fully replaces the ReAct persona and stays
+  byte-identical across iterations (the visit's cached prefix holds);
+  `_runtime.allowed_tools = []` is deny-by-default (zero tool specs reach the provider)
+  and is distinct from the key being absent (full registry default) — the load-bearing
+  distinction for tier-1 grants; `_limits.max_iterations` is the per-turn budget and
+  the tool-free conclusion path runs on exhaustion. No adapter changes needed — the
+  dress is configuration on the existing loop, now proven rather than asserted.
+
+### Added (2026-07-10 — never-strip election conformance, frozen spec a2a 0013 §4 line 6)
+- **Election fences survive the loop, pinned by test** (`tests/test_react_election_fence_conformance.py`):
+  final answers carry ```fenced blocks byte-identical and in order; a fences-only reply
+  is a VALID final answer (entity elections are reply content); the max-iterations
+  conclusion strip removes tool-call markup spans only (election fences pass through).
+- **Deferred-action followthrough heuristic is now fence-blind** (`react_runtime.py`):
+  `_looks_like_deferred_action` evaluates the PROSE view with paired ```fenced blocks
+  removed. First-person text inside a fence (e.g. a diary election "I will keep
+  reading…") is quoted content, not an action commitment — previously it could trigger
+  a followthrough retry that DISCARDED the reply and consumed its elections (the exact
+  failure the seam spec's never-strip obligation forbids). The heuristic is unchanged
+  for genuine prose action claims (pinned both ways). Conservative fence matching:
+  only PAIRED fences are excluded; an unterminated trailing fence stays in the prose view.
+
+### Added (2026-07-10 — entity visit seam, frozen spec a2a 0013 v2 §2)
+- **Act-only tool observations render as `$act_only` references** (`react_runtime.py`):
+  for tools carrying the `act_only` attribute (core's first-class ToolDefinition field;
+  getattr-based and fail-closed by absence until core ships it), `observe_node` appends
+  the ACT-FRAME REFERENCE — one exact JSON object with a lone `$act_only` top-level key —
+  as the durable tool message content instead of rendered output. The runtime LLM_CALL
+  handler dereferences the ref at the provider boundary (send time) into a wire copy;
+  the words never rest in the durable transcript, scratchpad cycles, LLM payloads, or
+  the emit/on_step lane (G1: "the book's words never rest outside the book").
+  Handler-authored refs (`{"$act_only": {...}}`-shaped outputs) are honored regardless
+  of local declarations (the effect handler is the enforcement authority); a declared
+  act-only tool whose handler misbehaves gets loud suppression (`#FALLBACK` frame),
+  never silent rendering, and failure diagnostics ride the error channel only.
+  Serialization is deterministic (sorted keys) so durable bytes stay prefix-cache
+  stable. Honest boundary found while building: the runtime kernel copies raw effect
+  results into `_runtime.node_traces` before observe runs — keeping words out of the
+  result channel entirely is the handler's contract (runtime seat's surface); the
+  adapter pins every surface it owns (`tests/test_react_act_only_observation.py`).
+- **Wedge guard: the lone-key ref shape is reserved for dereferenceable frames**
+  (cross-package finding against runtime's shipped send-time dereference,
+  `abstractruntime/identity/act_only.py`): runtime's LLM wrapper loudly FAILS a call
+  on any unresolvable `$act_only` ref, and refs are durable — so an act-only frame
+  that references nothing (suppression/failure records, list-style results without an
+  `entry_id`) must NOT take the ref shape or it would fail every subsequent LLM call
+  in the run. Such frames render as labeled non-ref record text
+  (`[tool]: act-only record (no content at rest): {…}`) — still no words at rest,
+  inert to the dereference pass. Interop pinned by running runtime's own
+  `parse_act_only_ref`/`dereference_act_only_messages` over both shapes (7 tests total).
 
 ### Changed (2026-07-09 adversarial-audit wave — 5 critics over the agency-parity changes)
 - **Loop-tail adjacency guard**: when the LLM payload already ends with a user message (first

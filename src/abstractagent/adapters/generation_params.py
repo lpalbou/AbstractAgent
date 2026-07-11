@@ -112,4 +112,23 @@ def runtime_llm_params(
             elif isinstance(binding, str) and binding.strip():
                 out["prompt_cache_binding"] = binding.strip()
 
+        cache_key = runtime_ns.get("prompt_cache_key")
+        if "prompt_cache_key" not in out and isinstance(cache_key, str) and cache_key.strip():
+            out["prompt_cache_key"] = cache_key.strip()
+
+    # Vocabulary collision guard (live-proven 2026-07-11, agency c509): core's
+    # `prompt_cache_binding` is the STRICT durable-bloc artifact binding — a dict
+    # with binding meta whose validation unconditionally raises without a loaded
+    # bloc — while a bare STRING here has always meant per-session cache identity,
+    # which in core's vocabulary is `prompt_cache_key` (best-effort). Emitting the
+    # string under the strict name failed 100% of live calls at the provider
+    # boundary (the entity visit lane's turn-1 failure). Strings therefore ride
+    # `prompt_cache_key`; only dict bindings keep the strict name.
+    bound = out.get("prompt_cache_binding")
+    if isinstance(bound, str):
+        out.pop("prompt_cache_binding", None)
+        key = bound.strip()
+        if key and "prompt_cache_key" not in out:
+            out["prompt_cache_key"] = key
+
     return out

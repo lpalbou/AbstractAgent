@@ -40,15 +40,63 @@ def test_runtime_llm_params_forwards_prompt_cache_binding_from_runtime_ns() -> N
 
 
 @pytest.mark.basic
-def test_runtime_llm_params_keeps_explicit_prompt_cache_binding_override() -> None:
+def test_runtime_llm_params_string_binding_rides_prompt_cache_key() -> None:
+    """Vocabulary-collision guard (agency c509, live turn-1 failure): core's
+    `prompt_cache_binding` is the STRICT durable-bloc dict; a bare string means
+    per-session cache identity, which is core's `prompt_cache_key`. Strings must
+    NEVER reach the wire under the strict name — they failed 100% of live calls."""
+    from abstractagent.adapters.generation_params import runtime_llm_params
+
+    out = runtime_llm_params(
+        {"prompt_cache_binding": "entity:voyager|visit-abc"},
+        extra={"temperature": 0.2},
+    )
+
+    assert "prompt_cache_binding" not in out
+    assert out["prompt_cache_key"] == "entity:voyager|visit-abc"
+
+
+@pytest.mark.basic
+def test_runtime_llm_params_explicit_string_binding_override_also_converts() -> None:
+    """The guard applies at the OUTPUT boundary: even an explicit extra override
+    that is a bare string converts to prompt_cache_key (the string shape is the
+    trap regardless of which caller supplied it)."""
     from abstractagent.adapters.generation_params import runtime_llm_params
 
     out = runtime_llm_params(
         {"prompt_cache_binding": {"binding_id": "runtime"}},
-        extra={"prompt_cache_binding": "explicit-binding-id"},
+        extra={"prompt_cache_binding": "explicit-session-key"},
     )
 
-    assert out["prompt_cache_binding"] == "explicit-binding-id"
+    assert "prompt_cache_binding" not in out
+    assert out["prompt_cache_key"] == "explicit-session-key"
+
+
+@pytest.mark.basic
+def test_runtime_llm_params_forwards_prompt_cache_key_from_runtime_ns() -> None:
+    from abstractagent.adapters.generation_params import runtime_llm_params
+
+    out = runtime_llm_params(
+        {"prompt_cache_key": " session-42 "},
+        extra={"temperature": 0.2},
+    )
+
+    assert out["prompt_cache_key"] == "session-42"
+
+
+@pytest.mark.basic
+def test_runtime_llm_params_key_does_not_clobber_explicit_extra_key() -> None:
+    from abstractagent.adapters.generation_params import runtime_llm_params
+
+    out = runtime_llm_params(
+        {"prompt_cache_key": "runtime-key", "prompt_cache_binding": "runtime-binding"},
+        extra={"prompt_cache_key": "explicit-key"},
+    )
+
+    # The explicit key wins; the string binding never overwrites it and never
+    # survives under the strict name.
+    assert out["prompt_cache_key"] == "explicit-key"
+    assert "prompt_cache_binding" not in out
 
 
 @pytest.mark.basic
