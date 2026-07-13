@@ -288,8 +288,9 @@ def test_handler_authored_frame_without_entry_id_renders_as_record_text() -> Non
         },
         {"content": "Listed.", "tool_calls": []},
     ]
-    # Act-only honored (no raw output at rest) but NOT dereferenceable (no entry_id):
-    # labeled non-ref record text — inert to runtime's send-time dereference pass.
+    # Act-only honored (no raw output at rest) but NOT dereferenceable (neither
+    # entry_id nor an args dict — references nothing): labeled non-ref record
+    # text — inert to runtime's send-time dereference pass.
     frame = {"tool": "diary_list", "count": 3, "reason": "survey"}
     tool_outputs = {"call_1": {"success": True, "output": {_ACT_ONLY_KEY: dict(frame)}, "error": None}}
     _, _, state = _run_scripted_loop(llm_script, tool_outputs)
@@ -299,6 +300,42 @@ def test_handler_authored_frame_without_entry_id_renders_as_record_text() -> Non
     assert content.startswith("[diary_list]: act-only record")
     assert '"count": 3' in content
     assert tool_msgs[0].get("metadata", {}).get("act_only") is True
+
+
+def test_rerun_shaped_frame_renders_as_ref_and_resolves_via_runtime() -> None:
+    """The tool+args generalization (runtime 64398ff, e-s 233 R3): a re-run
+    shaped frame ({tool, args} — diary_list's word-free request body, empty
+    dict = list-everything) IS addressable and must take the REF shape, so
+    runtime's send-time resolver re-runs the listing fresh against the book.
+    Shape-based on my side: no tool-name list is copied into this adapter."""
+    llm_script = [
+        {
+            "content": "Listing.",
+            "tool_calls": [{"name": "diary_list", "arguments": {}, "call_id": "call_1"}],
+        },
+        {"content": "Listed.", "tool_calls": []},
+    ]
+    frame = {"tool": "diary_list", "args": {}}
+    tool_outputs = {"call_1": {"success": True, "output": {_ACT_ONLY_KEY: dict(frame)}, "error": None}}
+    payloads, _, state = _run_scripted_loop(llm_script, tool_outputs)
+
+    tool_msgs = _durable_tool_messages(state)
+    content = str(tool_msgs[0].get("content"))
+    # The lone-key ref shape, byte-canonical.
+    assert json.loads(content) == {_ACT_ONLY_KEY: frame}
+    assert tool_msgs[0].get("metadata", {}).get("act_only") is True
+
+    # Interop: runtime's shipped dereference resolves it via the args shape.
+    act_only_rt = pytest.importorskip("abstractruntime.identity.act_only")
+    def read_entry(ref: dict) -> str:
+        assert ref.get("args") == {} and ref.get("tool") == "diary_list"
+        return "FRESH LISTING (3 entries)"
+    wire, resolved = act_only_rt.dereference_act_only_messages(
+        [{"role": "tool", "content": content, "tool_call_id": "call_1"}],
+        read_entry=read_entry,
+    )
+    assert resolved == 1
+    assert wire[0]["content"] == "FRESH LISTING (3 entries)"
 
 
 def test_interop_with_runtime_shipped_dereference_parser() -> None:

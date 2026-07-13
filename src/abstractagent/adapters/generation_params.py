@@ -28,18 +28,76 @@ def normalize_seed(seed: Any) -> Optional[int]:
         return None
 
 
-def normalize_thinking(value: Any) -> Any:
-    """Return a provider-ready thinking value or None when unset.
+# The thinking values core's provider boundary ACCEPTS (BaseProvider.
+# _normalize_thinking_request). Core RAISES ValueError for any other string —
+# forwarding a freeform value ("verbose", "deep") would hard-fail 100% of calls
+# at the provider boundary, the same collision class as the prompt_cache_binding
+# incident (2026-07-11, adversary finding P2-1). Values here are canonical; a
+# drift-pin test runs every member through core's real normalizer.
+_THINKING_ENABLE = {"on", "true", "yes"}
+_THINKING_DISABLE = {"off", "false", "no", "none"}
+_THINKING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
+_THINKING_XHIGH_ALIASES = {"extra_high", "x_high"}
 
-    Core owns provider-specific validation. Agent adapters only preserve explicit
-    booleans or non-empty strings and avoid sending empty UI values.
+
+def normalize_thinking(value: Any) -> Any:
+    """Return a provider-SAFE thinking value or None when unset/unsupported.
+
+    Policy matches `normalize_seed`: values core would reject are DROPPED
+    (None = do not send; provider defaults apply) rather than forwarded into a
+    guaranteed ValueError at the provider boundary. Known strings are emitted
+    in canonical form.
     """
     if isinstance(value, bool):
         return value
-    if isinstance(value, str):
-        clean = value.strip()
-        return clean or None
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lower()
+    if not s or s == "auto":
+        # "auto" is core's explicit auto mode; empty means unset.
+        return "auto" if s == "auto" else None
+    if s in _THINKING_ENABLE:
+        return True
+    if s in _THINKING_DISABLE:
+        return False
+    s_norm = "_".join(part for part in s.replace("-", " ").split() if part)
+    if s_norm in _THINKING_XHIGH_ALIASES:
+        return "xhigh"
+    if s_norm in _THINKING_LEVELS:
+        return s_norm
     return None
+
+
+def resolve_max_iterations(
+    limits: Any,
+    scratchpad: Any,
+    *,
+    default: int = 20,
+) -> int:
+    """Resolve the iteration budget with PRESENCE-based precedence.
+
+    `_limits.max_iterations` wins when present, then the scratchpad seed, then
+    `default`. Explicit values are honored even when falsy: 0 clamps to the
+    loop's floor of 1 instead of silently falling open to the default
+    (agency-caps adversary finding P2-2 — the `explicit-0 or DEFAULT` class:
+    an explicit narrow budget must never silently widen).
+
+    The default is 20 — the ONE ruled framework default (maintainer c726
+    "i never said 50" + c786; runtime's agent-node pin and the published
+    basic-agent bundle both carry 20). This package's old 25 was a third
+    value in the ecosystem, the copied-default drift class. Explicit
+    workflow/host values stay authoritative (the "workflow decides"
+    amendment); the 100 calls/turn failsafe ceiling is enforced upstream
+    (runtime compiler / gateway config), never silently here.
+    """
+    for source in (limits, scratchpad):
+        if isinstance(source, dict) and source.get("max_iterations") is not None:
+            try:
+                value = int(source["max_iterations"])
+            except (TypeError, ValueError):
+                continue
+            return value if value >= 1 else 1
+    return int(default)
 
 
 def runtime_llm_params(
@@ -115,6 +173,15 @@ def runtime_llm_params(
         cache_key = runtime_ns.get("prompt_cache_key")
         if "prompt_cache_key" not in out and isinstance(cache_key, str) and cache_key.strip():
             out["prompt_cache_key"] = cache_key.strip()
+
+        # Streaming passthrough (code seat c1007): `_runtime.stream = True`
+        # reaches the LLM call as params.stream so same-process hosts get
+        # runtime's on_token deltas (d3f6f87). STRICT bool True only — the
+        # tool-args lesson (2026-02-20): strings like "false"/"0" are truthy
+        # in Python, so anything but `True` is treated as unset (absent =
+        # provider default, no key emitted; never a truthy-string fall-open).
+        if "stream" not in out and runtime_ns.get("stream") is True:
+            out["stream"] = True
 
     # Vocabulary collision guard (live-proven 2026-07-11, agency c509): core's
     # `prompt_cache_binding` is the STRICT durable-bloc artifact binding — a dict

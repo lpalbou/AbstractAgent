@@ -17,6 +17,7 @@ If you are new to the stack, start with [`docs/getting-started.md`](getting-star
 - **API reference**: [`docs/api.md`](api.md)
 - **Agents (ReAct / CodeAct / MemAct)**: [`docs/agents.md`](agents.md)
 - **Tools and allowlists**: [`docs/tools.md`](tools.md)
+- **Loop hooks (listen / steer / capture)**: [`docs/hooks.md`](hooks.md)
 - **State + persistence (pause/resume)**: [`docs/persistence.md`](persistence.md)
 
 ## Deep dives

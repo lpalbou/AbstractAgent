@@ -24,6 +24,7 @@ flowchart LR
 
 - Getting started: [`docs/getting-started.md`](docs/getting-started.md)
 - API reference: [`docs/api.md`](docs/api.md)
+- Loop hooks (listen/steer/capture): [`docs/hooks.md`](docs/hooks.md)
 - FAQ / troubleshooting: [`docs/faq.md`](docs/faq.md)
 - Architecture (diagrams): [`docs/architecture.md`](docs/architecture.md)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
@@ -37,9 +38,12 @@ flowchart LR
 - **CodeAct**: executes Python (tool call or fenced ` ```python``` ` blocks)
 - **MemAct**: memory-enhanced agent using runtime-owned Active Memory
 - **Durable runs**: pause/resume via `run_id` + runtime stores
-- **Tool control**: explicit tool bundles + per-run allowlists
-- **Generation controls**: temperature, seed, media policy, prompt-cache binding,
-  and Core `thinking` are normalized before LLM calls
+- **Tool control**: explicit tool bundles + per-run allowlists (unresolvable
+  grant names are recorded loudly, never dropped silently)
+- **Loop hooks**: listen/steer/capture on the running loop via `LoopHooks`
+  (see [`docs/hooks.md`](docs/hooks.md)); the flat `on_step` callback remains
+- **Generation controls**: temperature, seed, media policy, prompt-cache
+  identity, streaming, and Core `thinking` are normalized before LLM calls
 - **Observability**: durable ledger of LLM calls, tool calls, and waits
 
 Where this lives in code (source of truth):

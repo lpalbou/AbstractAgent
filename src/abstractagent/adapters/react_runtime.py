@@ -24,8 +24,10 @@ from abstractcore.tools import ToolCall
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 
-from .generation_params import runtime_llm_params
+from .generation_params import resolve_max_iterations, runtime_llm_params
+from .loop_hooks import LoopHooks
 from .media import extract_media_from_context
+from .tool_allowlist import note_pruned_grants
 from ..logic.react import ReActLogic
 
 
@@ -138,12 +140,12 @@ def ensure_react_vars(
 
     max_iterations = scratchpad.get("max_iterations")
     if max_iterations is None:
-        scratchpad["max_iterations"] = 25
+        scratchpad["max_iterations"] = 20
     elif not isinstance(max_iterations, int):
         try:
             scratchpad["max_iterations"] = int(max_iterations)
         except (TypeError, ValueError):
-            scratchpad["max_iterations"] = 25
+            scratchpad["max_iterations"] = 20
     if scratchpad["max_iterations"] < 1:
         scratchpad["max_iterations"] = 1
 
@@ -374,15 +376,22 @@ def _act_only_frame_is_dereferenceable(frame: Dict[str, Any]) -> bool:
 
     Cross-package wedge guard (found reading runtime's shipped dereference,
     identity/act_only.py): the LLM_CALL wrapper resolves every `$act_only` ref in
-    the transcript at SEND time and FAILS the call loudly when one cannot resolve.
-    Refs are durable, so a non-dereferenceable ref (no entry_id — e.g. a failure
-    record) would fail EVERY subsequent LLM call in the run: the run wedges on a
-    historical record. Rule: the ref shape is reserved for frames that actually
-    reference book content (entry_id present); records-of-acts without content
-    (failures, suppressions) render as labeled non-ref text instead — still no
-    words, but inert to the dereference pass.
+    the transcript at SEND time. Refs are durable, so a shape that references
+    NOTHING (e.g. a failure/suppression record) must never take the ref form —
+    it renders as labeled non-ref text instead (inert to the dereference pass).
+
+    TWO addressable shapes (runtime's tool+args generalization, e-s 233 R3 /
+    64398ff): entry-addressed refs carry a non-empty `entry_id` (diary_read);
+    re-run refs carry an `args` dict (diary_list — the listing is re-executed
+    fresh at send time; empty dict = list-everything, still a valid address).
+    Deliberately SHAPE-based, no tool-name list copied here: which tools resolve
+    is runtime's dispatch (ACT_ONLY_TOOLS), and since the wedge amendment an
+    unknown ref tombstones loudly instead of failing the call — the shape rule
+    only keeps reference-free records out of the resolver's path.
     """
-    return bool(str(frame.get("entry_id") or "").strip())
+    if str(frame.get("entry_id") or "").strip():
+        return True
+    return isinstance(frame.get("args"), dict)
 
 
 def _act_only_record_content(frame: Dict[str, Any]) -> str:
@@ -649,6 +658,13 @@ def _render_final_report(task: str, scratchpad: Dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append(f"task: {task}")
     lines.append(f"cycles: {len([c for c in cycles if isinstance(c, dict)])}")
+    # Review-failure containment marker (backlog 0027): a skipped verifier round
+    # must be visible in the report, not just in the emit lane.
+    skipped_reviews = scratchpad.get("review_skipped")
+    if isinstance(skipped_reviews, list):
+        for s in skipped_reviews:
+            if isinstance(s, dict) and s.get("reason"):
+                lines.append(f"review: #FALLBACK skipped ({str(s.get('reason'))})")
     lines.append("")
     for c in cycles:
         if not isinstance(c, dict):
@@ -720,6 +736,7 @@ def create_react_workflow(
     *,
     logic: ReActLogic,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    hooks: Optional[LoopHooks] = None,
     workflow_id: str = "react_agent",
     provider: Optional[str] = None,
     model: Optional[str] = None,
@@ -727,6 +744,13 @@ def create_react_workflow(
     final_next_node: Optional[str] = None,
 ) -> WorkflowSpec:
     """Adapt ReActLogic to an AbstractRuntime workflow.
+
+    `hooks` (first-class loop hooks, 2026-07-12 directive): a `LoopHooks`
+    registry whose handlers observe every emit point as structured
+    `HookEvent`s (listen/capture) and may return guidance injections that
+    fold into the DURABLE `_runtime.inbox` at the next reason boundary
+    (steer — resume-safe, same channel as inject_guidance). `on_step` stays
+    the flat compat surface; both may be wired at once.
 
     `final_next_node` (composition knob, frozen seam spec a2a 0013 §A): when set, the
     terminal nodes (`done`, `max_iterations`) do everything they do today — persist the
@@ -741,9 +765,56 @@ def create_react_workflow(
     message; a visit's messages arrive from the PARK resume).
     """
 
+    if hooks is not None and not hooks.agent:
+        hooks.agent = str(workflow_id or "react_agent")
+
     def emit(step: str, data: Dict[str, Any]) -> None:
         if on_step:
             on_step(step, data)
+        if hooks is not None:
+            # Hook dispatch NEVER raises. Handler failures/steers come back
+            # as follow-up (step, data) pairs for the flat on_step stream;
+            # dispatch also notifies the handlers themselves (pure listen,
+            # returns ignored — loop-bounded), so a hooks-only host still
+            # observes hook_error / hook_steer.
+            for fu_step, fu_data in hooks.dispatch(step, data):
+                if on_step:
+                    on_step(fu_step, fu_data)
+
+    def _with_run_context(node_fn: Callable[..., Any]) -> Callable[..., Any]:
+        """Bind the hooks' run context around node execution so every
+        dispatch and drain is keyed to the EXECUTING run — one workflow
+        product serves many runs (delegate children, re-registration), and
+        a queue keyed to nothing would leak steering across them."""
+        if hooks is None:
+            return node_fn
+
+        def wrapper(run: RunState, ctx: Any) -> Any:
+            hooks.push_run(str(getattr(run, "run_id", "") or ""))
+            try:
+                return node_fn(run, ctx)
+            finally:
+                hooks.pop_run()
+
+        wrapper.__name__ = getattr(node_fn, "__name__", "node")
+        return wrapper
+
+    def _fold_hook_steering(runtime_ns: Dict[str, Any]) -> None:
+        """Fold the CURRENT run's hook-queued injections into its durable
+        inbox (reason boundary only — a hook never mutates state mid-node)."""
+        if hooks is None or not isinstance(runtime_ns, dict):
+            return
+        for text in hooks.drain_pending_injections(hooks.current_run_id()):
+            _push_inbox(runtime_ns, text)
+
+    def _discard_hook_steering_at_terminal() -> None:
+        """A completing run's undelivered steering must neither leak into a
+        later run nor rot in host memory; the discard is LOUD when non-empty."""
+        if hooks is None:
+            return
+        dropped = hooks.discard_run(hooks.current_run_id())
+        if dropped:
+            emit("hook_steer_discarded", {"count": dropped})
 
     def _current_tool_defs() -> list[Any]:
         defs = getattr(logic, "tools", None)
@@ -809,12 +880,26 @@ def create_react_workflow(
             out.append(name)
         return out
 
+    def _note_pruned(runtime_ns: Dict[str, Any], raw: Any, normalized: list[str]) -> None:
+        payload = note_pruned_grants(runtime_ns, raw, normalized)
+        if payload is not None:
+            emit("allowlist_pruned", payload)
+
     def _effective_allowlist(runtime_ns: Dict[str, Any]) -> list[str]:
         if isinstance(runtime_ns, dict) and "allowed_tools" in runtime_ns:
-            normalized = _normalize_allowlist(runtime_ns.get("allowed_tools"))
+            raw = runtime_ns.get("allowed_tools")
+            normalized = _normalize_allowlist(raw)
+            _note_pruned(runtime_ns, raw, normalized)
             runtime_ns["allowed_tools"] = normalized
             return normalized
-        return _normalize_allowlist(list(_default_allowlist()))
+        # Factory channel (`create_react_workflow(allowed_tools=...)`): the
+        # entity door passes its grant here, not via run vars — same
+        # works-or-loud obligation, same note (when run vars can carry it).
+        default = _default_allowlist()
+        normalized = _normalize_allowlist(list(default))
+        if isinstance(runtime_ns, dict):
+            _note_pruned(runtime_ns, default, normalized)
+        return normalized
 
     def _allowed_tool_defs(allow: list[str]) -> list[Any]:
         out: list[Any] = []
@@ -1054,7 +1139,7 @@ def create_react_workflow(
         except Exception:
             pass
 
-        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
+        max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
 
@@ -1067,6 +1152,10 @@ def create_react_workflow(
 
         task = str(context.get("task", "") or "")
 
+        # Hook-queued steering folds into the durable inbox HERE (the one
+        # drain point), so hook steer and gateway inject_guidance are one
+        # mechanism observed by the same events.
+        _fold_hook_steering(runtime_ns)
         guidance = _drain_inbox(runtime_ns)
         if guidance:
             # Drained guidance joins the durable transcript as a user interjection (maintainer
@@ -1083,6 +1172,9 @@ def create_react_workflow(
                     metadata={"kind": "operator_guidance"},
                 )
             )
+            # The in-loop "message received" listen point (fleet seam): fires
+            # whenever the reason boundary consumes delivered guidance.
+            emit("inbox_drained", {"chars": len(guidance), "iteration": iteration})
         messages_view = list(context.get("messages") or [])
         req = logic.build_request(
             task=task,
@@ -1156,7 +1248,14 @@ def create_react_workflow(
                 last["content"] = f"{str(last.get('content') or '').rstrip()}\n\n{tail_text}"
                 msgs_out[-1] = last
             else:
-                msgs_out.append({"role": "user", "content": tail_text})
+                # Structural volatile marker (B1 pair, code c971 → agent c978 →
+                # runtime c986): runtime's llm_client EXCLUDES flagged messages
+                # from the prompt-cache fingerprint sequence and STRIPS the key
+                # before any provider/SDK sees it — so the per-cycle tail no
+                # longer forces a full local-cache re-prefill. The merged branch
+                # above cannot carry the flag (it holds the real task); that leg
+                # dies with runtime's B3 boundary-merge.
+                msgs_out.append({"role": "user", "content": tail_text, "volatile": True})
             payload["messages"] = msgs_out
 
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
@@ -1211,7 +1310,7 @@ def create_react_workflow(
             finish_reason = str(fr or "").strip().lower() if fr is not None else ""
 
         cycle_i = int(scratchpad.get("iteration", 0) or 0)
-        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
+        max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
         reasoning_text = ""
@@ -1379,7 +1478,7 @@ def create_react_workflow(
             pending = []
 
         cycle_i = int(scratchpad.get("iteration", 0) or 0)
-        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
+        max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
 
@@ -1891,6 +1990,16 @@ def create_react_workflow(
             "response_schema": schema,
             "response_schema_name": "ReActVerifier",
             "params": runtime_llm_params(runtime_ns, extra={}, default_temperature=0.2),
+            # Review-failure containment (backlog 0027, c1128 incident class): the
+            # verifier is a verification AID — a failed verifier call (structured
+            # validation, provider error, anything) must never kill a run whose
+            # `_temp.final_answer` already holds a valid answer. The runtime's
+            # opt-in absorption converts the FINAL failed outcome (after its own
+            # retries) into {"ok": False, "absorbed_failure": <error>} at
+            # result_key and continues to review_parse, which degrades to
+            # accept-with-#FALLBACK. Runtimes without the absorption mechanism
+            # ignore this key — behavior there stays exactly as before.
+            "_absorb_failure": True,
         }
         media = extract_media_from_context(context)
         if media:
@@ -1916,6 +2025,27 @@ def create_react_workflow(
         resp = temp.get("review_llm_response", {})
         if not isinstance(resp, dict):
             resp = {}
+
+        absorbed = resp.get("absorbed_failure")
+        if absorbed is not None:
+            # The absorbed-failure record is the runtime's `_absorb_failure`
+            # shape ({"ok": False, "absorbed_failure": <error>}) — the verifier
+            # call failed terminally. Verifier failure must never be worse than
+            # no verifier: accept the held final answer and complete, loudly
+            # (#FALLBACK marker in scratchpad/report + a dedicated emit). The
+            # ledger already recorded the effect failure honestly.
+            reason = str(absorbed or "").strip() or "unknown error"
+            skipped = scratchpad.get("review_skipped")
+            if not isinstance(skipped, list):
+                skipped = []
+                scratchpad["review_skipped"] = skipped
+            skipped.append({"reason": reason, "warning": "#FALLBACK"})
+            emit(
+                "review_skipped",
+                {"reason": reason, "warning": "#FALLBACK", "accepted_held_answer": True},
+            )
+            temp.pop("review_llm_response", None)
+            return StepPlan(node_id="review_parse", next_node="done")
 
         data = resp.get("data")
         if data is None and isinstance(resp.get("content"), str):
@@ -1988,7 +2118,10 @@ def create_react_workflow(
         task = str(context.get("task", "") or "")
         answer = str(temp.get("final_answer") or "No answer provided")
 
-        emit("done", {"answer": answer})
+        # `handed_off` disambiguates composition (visit turns: the RUN continues
+        # past this turn's final answer) from true run completion for hook
+        # consumers reading turn_end/final_answer as terminal.
+        emit("done", {"answer": answer, "handed_off": bool(final_next_node)})
 
         messages = context.get("messages")
         if isinstance(messages, list):
@@ -2013,11 +2146,12 @@ def create_react_workflow(
             # continues — the seam node reads _temp.react_output / _temp.final_answer.
             temp["react_output"] = output
             return StepPlan(node_id="done", next_node=final_next_node)
+        _discard_hook_steering_at_terminal()
         return StepPlan(node_id="done", complete_output=output)
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
-        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
+        max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
         emit("max_iterations", {"iterations": max_iterations})
@@ -2026,6 +2160,7 @@ def create_react_workflow(
         # to synthesize a final report + next steps while the scratchpad is still in context.
         resp = temp.get("max_iterations_llm_response")
         if not isinstance(resp, dict):
+            _fold_hook_steering(runtime_ns)
             drained_guidance = _drain_inbox(runtime_ns)
             conclude_directive = (
                 "You have reached the maximum allowed ReAct iterations.\n"
@@ -2163,22 +2298,26 @@ def create_react_workflow(
             # the seam node decides what an out-of-budget visit turn does next.
             temp["react_output"] = output
             return StepPlan(node_id="max_iterations", next_node=final_next_node)
+        _discard_hook_steering_at_terminal()
         return StepPlan(node_id="max_iterations", complete_output=output)
 
     return WorkflowSpec(
         workflow_id=str(workflow_id or "react_agent"),
         entry_node="init",
         nodes={
-            "init": init_node,
-            "reason": reason_node,
-            "parse": parse_node,
-            "act": act_node,
-            "observe": observe_node,
-            "handle_user_response": handle_user_response_node,
-            "maybe_review": maybe_review_node,
-            "review": review_node,
-            "review_parse": review_parse_node,
-            "done": done_node,
-            "max_iterations": max_iterations_node,
+            node_id: _with_run_context(node_fn)
+            for node_id, node_fn in {
+                "init": init_node,
+                "reason": reason_node,
+                "parse": parse_node,
+                "act": act_node,
+                "observe": observe_node,
+                "handle_user_response": handle_user_response_node,
+                "maybe_review": maybe_review_node,
+                "review": review_node,
+                "review_parse": review_parse_node,
+                "done": done_node,
+                "max_iterations": max_iterations_node,
+            }.items()
         },
     )

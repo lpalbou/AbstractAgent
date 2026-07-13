@@ -8,6 +8,7 @@ from abstractcore.tools import ToolDefinition
 from abstractruntime import RunState, RunStatus, Runtime, WorkflowSpec
 
 from .base import BaseAgent
+from ..adapters.loop_hooks import LoopHooks
 from ..adapters.codeact_runtime import create_codeact_workflow
 from ..logic.builtins import (
     ASK_USER_TOOL,
@@ -51,7 +52,8 @@ class CodeActAgent(BaseAgent):
         runtime: Runtime,
         tools: Optional[List[Callable[..., Any]]] = None,
         on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-        max_iterations: int = 25,
+        hooks: Optional[LoopHooks] = None,
+        max_iterations: int = 20,
         max_history_messages: int = -1,
         max_tokens: Optional[int] = None,
         plan_mode: bool = False,
@@ -60,6 +62,7 @@ class CodeActAgent(BaseAgent):
         actor_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
+        self.hooks = hooks
         self._max_iterations = int(max_iterations)
         if self._max_iterations < 1:
             self._max_iterations = 1
@@ -102,7 +105,7 @@ class CodeActAgent(BaseAgent):
             max_tokens=self._max_tokens,
         )
         self.logic = logic
-        return create_codeact_workflow(logic=logic, on_step=self.on_step)
+        return create_codeact_workflow(logic=logic, on_step=self.on_step, hooks=self.hooks)
 
     def start(
         self,
@@ -253,7 +256,7 @@ def create_codeact_agent(
     model: str = "qwen3:1.7b-q4_K_M",
     tools: Optional[List[Callable[..., Any]]] = None,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    max_iterations: int = 25,
+    max_iterations: int = 20,
     max_history_messages: int = -1,
     max_tokens: Optional[int] = None,
     plan_mode: bool = False,

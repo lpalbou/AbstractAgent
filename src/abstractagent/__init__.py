@@ -1,5 +1,6 @@
 """AbstractAgent - Agent implementations using AbstractRuntime and AbstractCore."""
 
+from .adapters.loop_hooks import DEFAULT_EVENT_MAP, HookEvent, LoopHooks
 from .agents import (
     BaseAgent,
     ReactAgent,
@@ -26,6 +27,10 @@ from .tools import (
 __all__ = [
     # Base class for custom agents
     "BaseAgent",
+    # First-class loop hooks (listen + steer + capture)
+    "DEFAULT_EVENT_MAP",
+    "HookEvent",
+    "LoopHooks",
     # ReAct agent
     "ReactAgent",
     "create_react_workflow",

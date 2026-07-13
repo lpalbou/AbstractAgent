@@ -40,6 +40,12 @@ All workflows compute an effective allowlist and keep it under `vars["_runtime"]
 
 - If you pass `allowed_tools=[...]` to `agent.start(...)`, the workflow uses that allowlist (filtered to known tools).
 - Tool execution payloads include `allowed_tools` so the runtime/tool-executor can enforce it.
+- Grant entries that do not resolve to a registered tool are dropped **loudly**:
+  the durable note `vars["_runtime"]["allowlist_pruned"]` records `dropped`
+  (unknown names), `requested` (the original grant), and `invalid` (non-name
+  entries, as reprs), and an `allowlist_pruned` step event fires once per prune
+  event. Deny-safe behavior is unchanged — unknown names are never offered nor
+  executable; the note makes the refusal visible to hosts/operators.
 
 Implementation pointers:
 - ReAct allowlist + payload wiring: `src/abstractagent/adapters/react_runtime.py` (`_effective_allowlist`, `EffectType.TOOL_CALLS` payload)

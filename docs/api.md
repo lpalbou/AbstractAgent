@@ -35,6 +35,16 @@ Notes:
 - **MemAct** is not currently re-exported at the package top-level.
   Import it from `abstractagent.agents.memact` (see below).
 
+### Loop hooks
+
+```python
+from abstractagent import LoopHooks, HookEvent, DEFAULT_EVENT_MAP
+```
+
+All three agents and workflow factories accept `hooks=LoopHooks(...)` for
+listen/steer/capture on the running loop. See [`docs/hooks.md`](hooks.md)
+for the event vocabulary and contract.
+
 ### Tools
 
 ```python

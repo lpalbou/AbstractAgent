@@ -47,6 +47,7 @@ def _run_loop(
     runtime_ns: Optional[Dict[str, Any]] = None,
     limits: Optional[Dict[str, Any]] = None,
     allowed_tools: Optional[List[str]] = None,
+    steps: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
 ) -> Tuple[List[Dict[str, Any]], RunState]:
     captured: List[Dict[str, Any]] = []
     calls = {"n": 0}
@@ -73,6 +74,10 @@ def _run_loop(
         ledger_store=InMemoryLedgerStore(),
         effect_handlers={EffectType.LLM_CALL: llm_handler, EffectType.TOOL_CALLS: tool_handler},
     )
+    def on_step(step: str, data: Dict[str, Any]) -> None:
+        if steps is not None:
+            steps.append((step, data))
+
     workflow = create_react_workflow(
         logic=ReActLogic(
             tools=[
@@ -84,6 +89,7 @@ def _run_loop(
         provider="stub",
         model="stub",
         allowed_tools=allowed_tools,
+        on_step=on_step if steps is not None else None,
     )
     ns: Dict[str, Any] = {"inbox": []}
     if runtime_ns:
@@ -154,3 +160,74 @@ def test_iteration_budget_rides_limits_and_conclusion_runs_on_exhaustion() -> No
     output = state.output if isinstance(state.output, dict) else {}
     assert "Budget reached" in str(output.get("answer") or "")
     assert int(output.get("iterations") or 0) == 2
+
+
+def test_unknown_granted_tool_prunes_visibly_never_silently() -> None:
+    """Config-object conformance (works-or-loud): a grant naming a tool this
+    adapter has NO definition for stays deny-safe (never offered, never
+    executable) AND becomes VISIBLE — `_runtime.allowlist_pruned` records the
+    dropped names durably so the door/operator can see the grant did not take.
+    The registered half of the grant still resolves."""
+    steps: List[Tuple[str, Dict[str, Any]]] = []
+    payloads, state = _run_loop(
+        [_FINAL_REPLY],
+        runtime_ns={"allowed_tools": ["diary_read", "not_a_registered_tool"]},
+        steps=steps,
+    )
+    # Offered set = the registered intersection only.
+    tools = payloads[0].get("tools") or []
+    names = {str(t.get("name")) for t in tools if isinstance(t, dict)}
+    assert names == {"diary_read"}
+    # The prune is durable, names exactly the dropped grant, and carries the
+    # original requested list so a reader can judge the note's freshness.
+    ns = (state.vars or {}).get("_runtime") or {}
+    note = ns.get("allowlist_pruned")
+    assert isinstance(note, dict)
+    assert note["dropped"] == ["not_a_registered_tool"]
+    assert note["requested"] == ["diary_read", "not_a_registered_tool"]
+    # The emit fired exactly once (per prune event, not per cycle).
+    prune_events = [d for s, d in steps if s == "allowlist_pruned"]
+    assert len(prune_events) == 1
+    assert prune_events[0]["dropped"] == ["not_a_registered_tool"]
+    assert prune_events[0]["kept"] == ["diary_read"]
+    # A fully-registered grant leaves no prune note behind.
+    _, state_clean = _run_loop([_FINAL_REPLY], runtime_ns={"allowed_tools": ["diary_read"]})
+    ns_clean = (state_clean.vars or {}).get("_runtime") or {}
+    assert "allowlist_pruned" not in ns_clean
+
+
+def test_non_name_grant_entries_are_loud_worst_case_full_deny() -> None:
+    """A grant of non-name garbage (e.g. [None]) normalizes to a FULL DENY —
+    that must never be silent. The prune note records the rejected entries as
+    reprs under `invalid`."""
+    payloads, state = _run_loop(
+        [_FINAL_REPLY],
+        runtime_ns={"allowed_tools": [None, "   "]},
+    )
+    assert not (payloads[0].get("tools") or [])  # deny-safe held
+    ns = (state.vars or {}).get("_runtime") or {}
+    note = ns.get("allowlist_pruned")
+    assert isinstance(note, dict)
+    assert note.get("invalid") == ["None", "'   '"]
+    assert note["dropped"] == [] and note["requested"] == []
+
+
+def test_factory_channel_grant_prunes_visibly_too() -> None:
+    """The FACTORY channel (`create_react_workflow(allowed_tools=...)`) is the
+    path the shipped entity door rides — gateway now passes the RAW resolver
+    grant there (c802) and RELIES on this note firing for names the middle
+    carries no definition for. Same works-or-loud contract as the run-var
+    channel: the undeclarable name is never offered AND lands durably in
+    `_runtime.allowlist_pruned`."""
+    payloads, state = _run_loop(
+        [_FINAL_REPLY],
+        allowed_tools=["diary_read", "undeclarable_tool"],
+    )
+    tools = payloads[0].get("tools") or []
+    names = {str(t.get("name")) for t in tools if isinstance(t, dict)}
+    assert names == {"diary_read"}
+    ns = (state.vars or {}).get("_runtime") or {}
+    note = ns.get("allowlist_pruned")
+    assert isinstance(note, dict)
+    assert note["dropped"] == ["undeclarable_tool"]
+    assert note["requested"] == ["diary_read", "undeclarable_tool"]

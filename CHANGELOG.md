@@ -1,6 +1,164 @@
 # Changelog
 
+## Unreleased (2026-07-12)
+
+### Fixed (2026-07-13)
+- **Verifier failure degrades to accept-with-#FALLBACK (backlog 0027, c1128
+  incident class)**: with `review_mode` on, a terminally failed verifier
+  LLM call (structured validation, provider error, anything) used to FAIL a
+  run whose `_temp.final_answer` already held a valid answer — a verification
+  aid killing a succeeded run, plus wasted retries on a deterministic failure.
+  Both verifier forks (ReAct `review_node` + CodeAct's) now opt into the
+  runtime's failure absorption (`payload._absorb_failure`, the fdf01e0 rule
+  class): the terminal failure lands as `{"ok": false, "absorbed_failure":
+  <error>}` at the result key, and `review_parse` contains it — the held
+  answer is ACCEPTED and the run completes, loudly: `scratchpad.review_skipped`
+  marker (`#FALLBACK` + reason), a `review: #FALLBACK skipped (...)` line in
+  the final report, and a dedicated `review_skipped` emit
+  (`accepted_held_answer: true`). CodeAct specifically no longer falls through
+  into the unactionable-retry path (which re-issued the failing call and then
+  re-entered `reason`). Runtimes without the absorption mechanism ignore the
+  payload key — behavior there is exactly as before. The review SUCCESS path
+  is byte-unchanged. This is the agent half of the c1128 review re-default
+  condition (core's example-generator fix is the other half, shipped c1201);
+  the `review_mode` default stays opt-in in this adapter — the re-default
+  decision is the consuming CLI's (abstractcode c1139). Pinned in
+  `tests/test_review_failure_containment.py` (kernel failure run, success
+  guard, CodeAct containment).
+
+### Docs
+- **Backlog system normalized (codex backlog skill)**: `docs/backlog/` now has
+  the full lifecycle layout (overview, planned/proposed/completed/deprecated,
+  recurrent hygiene tasks); the legacy date-named item renamed to
+  `0001_agent_gateway_install_boundary.md`. The maintainer-endorsed loops
+  meta-audit proposal set (IDs A1–A4, B1–B4, C1–C5, D1–D4 + hooks-wave
+  follow-ups) recorded as the `loops_improvement` track: defects as planned
+  items 0010–0013 (fenced-block intent bug, sibling transcript repair,
+  delegate-budget honesty, MemAct dead knobs), features/decisions as proposed
+  items 0014–0026 with explicit promotion criteria (C5 fold = maintainer
+  ruling; A2 kernel = runtime executor lane per the agreed seam).
+
+### Added (cont.)
+- **Streaming passthrough (`_runtime.stream`)**: `runtime_llm_params` passes
+  `stream: true` into LLM_CALL params when `_runtime.stream is True` — the
+  last link for end-to-end CLI token streaming (runtime's `on_token`
+  callback, code seat c1007). STRICT bool only: truthy strings ("true", "1")
+  are the tool-args coercion class and never enable streaming; absent/False
+  emits no key. Pinned in `test_generation_params_media_policies.py`.
+
+### Fixed
+- **Volatile loop tail no longer defeats local prompt caches (B1 pair, agent
+  half)**: the ReAct per-cycle trailing message (`[loop] iteration N of M.` +
+  plan render) was fingerprinted by runtime's llm_client, forcing a full
+  local-cache re-prefill EVERY cycle (code seat's adversary c971; my
+  prefix-reuse metric had pinned the symptom as the adjacency-guard trade).
+  The separate trailing tail now carries the structural marker
+  `volatile: true` (top-level, runtime-confirmed spelling c986) — runtime
+  excludes flagged messages from the fingerprint sequence and strips the key
+  before any provider SDK sees it. The merged first-turn leg cannot carry the
+  flag (it holds the real task) and dies with runtime's B3 boundary-merge.
+  Pinned in `test_react_prompt_prefix_stability.py` + a cross-package smoke
+  against runtime's real `_strip_volatile_markers`.
+
+### Added
+- **First-class loop hooks (listen + steer + capture; maintainer directive
+  2026-07-12)**: new shared `adapters/loop_hooks.py` (`LoopHooks`, `HookEvent`,
+  `DEFAULT_EVENT_MAP`, root-exported) wired through all three adapters and
+  agent constructors (`hooks=` beside `on_step`). LISTEN: every emit point
+  dispatches structured `HookEvent`s under canonical names (cycle_start /
+  tool_proposed / tool_executed / turn_end+outcome / message_drained; unmapped
+  steps pass through raw — total coverage); handlers receive a COPY of the
+  payload so mutation cannot corrupt the loop. STEER: handler returns
+  (`"text"` or `{"inject": ...}`) queue PER RUN and fold into the durable
+  `_runtime.inbox` at the reason boundary — one drain point shared with
+  inject_guidance; at-most-once from host memory (documented); undelivered
+  steering is discarded LOUDLY at terminals (`hook_steer_discarded`), never
+  leaked into a later run (pinned: two sequential runs on one workflow
+  product). CAPTURE: handler exceptions contained + surfaced as `hook_error`
+  to BOTH the flat `on_step` stream and the handlers themselves (hooks-only
+  hosts observe their own failures — pinned); unsupported action shapes are
+  loud. Events carry run_id + agent + iteration; `done` emits carry
+  `handed_off` so visit-composition turn_ends are distinguishable from run
+  completion. Fleet seam: `message_drained` fires when the reason boundary
+  consumes delivered guidance — the in-loop "message received" hook.
+  Adversary-reviewed (2 P1s fixed pre-ship: cross-run queue leakage via the
+  shared workflow product; follow-up invisibility without on_step). Handler
+  TIME BUDGET (plan H-row, sync-on-tick DoS): calls over `slow_budget_s`
+  (default 1s) earn loud `hook_slow` strikes; `max_slow_strikes` (default 3)
+  DISABLES the handler for the instance — main dispatches and notifications
+  both stop; fast handlers unaffected. Tests: `tests/test_loop_hooks.py` (12).
+
 ## Unreleased (2026-07-11)
+
+### Fixed
+- **Act-only rerun refs no longer downgrade to record text (R3 P0, agent
+  half)**: runtime's tool+args generalization (64398ff) added a second
+  addressable ref shape — `{tool, args}` re-run refs (diary_list; the listing
+  re-executes fresh at send time) next to `{tool, entry_id}` entry refs.
+  `_act_only_frame_is_dereferenceable` accepted only `entry_id`, so a
+  well-authored diary_list frame rendered as inert record text and never
+  reached runtime's resolver. Now shape-based: non-empty `entry_id` OR an
+  `args` dict qualifies for the ref form; reference-free frames (failures,
+  suppressions) keep rendering as inert record text. No tool-name list is
+  copied into this adapter (runtime's dispatch owns that; unknown refs
+  tombstone loudly since the wedge amendment). Interop test runs the rendered
+  bytes through runtime's shipped dereference.
+
+### Changed (maintainer rulings c726/c786)
+- **`max_iterations` default 25 → 20 everywhere**: the maintainer ruled 20 as
+  THE framework default ("i never said 50", c726; runtime's agent-node pin and
+  the published basic-agent bundle both carry 20). This package's 25 was a
+  third value in the ecosystem — the copied-default drift class the room
+  keeps closing. Flipped: the three agent constructors, the three adapters'
+  scratchpad seeds, and `resolve_max_iterations(default=)`. Explicit
+  workflow/host values stay authoritative (the "workflow decides" amendment);
+  the ruled 100 calls/turn failsafe ceiling is enforced upstream
+  (runtime compiler / gateway config), never silently in the loop.
+- **Phase-grant boundary tests are spelling-independent**: the ruled
+  visit/work/personal/sleep rename (c786) must not redden this suite — the
+  boundary tests now derive phase keys from runtime's `PHASES` tuple
+  (semantic-order unpack) instead of hardcoding "tasked"/"own_time" era
+  spellings. The adapter itself is phase-blind (consumes resolved grants,
+  never phase words).
+
+### Added
+- **Phase-grant boundary conformance pins (config-object build phase)**:
+  `tests/test_react_phase_grant_boundary.py` runs runtime's REAL
+  `resolve_tool_grant`/`write_policy_file` against a temp home and pins the
+  adapter's consumption contract on BOTH channels (run vars = the plan's
+  destination; factory param = the shipped door's channel): default grants
+  offer exactly the resolver's set per ruled phase (registry imported from
+  runtime's constants, never copied); sleep's default arrives strictly
+  narrower than visit and diary-free; a narrow `tasked` policy file arrives
+  narrow (N8 consumer half) incl. the maximal-narrow `tasked: []` -> deny-all;
+  the TOOL_CALLS execution payload carries the same allowlist as the offer;
+  an unknown-name grant prunes loudly. Adversary-reviewed (channel-honesty
+  docstring rewrite, imported-constants fixture, execution-payload pin added).
+- **Visible allowlist pruning (`_runtime.allowlist_pruned`)**: grant entries
+  that do not resolve to a registered tool were dropped silently (deny-safe but
+  invisible). All three adapters (ReAct/CodeAct/MemAct, via the shared
+  `adapters/tool_allowlist.py`) now record a durable note
+  `{"dropped", "requested"[, "invalid"]}` and emit one `allowlist_pruned` step
+  event per prune event — including the worst case where a grant of non-name
+  garbage (e.g. `[None]`) normalizes to a FULL deny. Deny-safety is unchanged;
+  the refusal is now visible to doors/operators (works-or-loud, the
+  config-object conformance boundary). Tests:
+  `test_react_entity_dress_conformance.py` (2 new pins incl. emit-once).
+
+### Fixed (adversarial audit findings, config-object task)
+- **`thinking` freeform strings no longer hard-fail at the provider boundary
+  (adversary P2-1)**: `normalize_thinking` forwarded any non-empty string, but
+  core RAISES ValueError for non-enum values — the same collision class as the
+  prompt_cache_binding incident. Unknown strings are now DROPPED (None = do not
+  send, matching `normalize_seed`'s policy); known values emit in canonical
+  form. A drift-pin test runs every emitted value through core's real
+  normalizer so enum drift is named, never silent.
+- **Explicit `max_iterations=0` no longer falls open to 25 (adversary P2-2)**:
+  the inline `limits.get("max_iterations", 0) or scratchpad... or 25` pattern
+  (8 sites across react/codeact/memact adapters) treated an explicit 0 as
+  unspecified. New shared `resolve_max_iterations` resolves presence-first and
+  clamps explicit sub-floor values to 1 — an explicit narrow budget never
+  silently widens (the agency-caps invariant).
 
 ### Changed
 - **delegate_agent child iteration budget (agency-caps ruling 2026-07-11)**: the

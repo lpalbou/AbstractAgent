@@ -9,7 +9,8 @@ Important notes (source-of-truth hints):
 - Docs entrypoint: `README.md` → `docs/getting-started.md` → `docs/README.md`
 - Runtime behavior lives in workflow adapters: `src/abstractagent/adapters/*_runtime.py`
 - Prompting/parsing logic stays runtime-agnostic: `src/abstractagent/logic/*` (no `abstractruntime` imports)
-- `src/abstractagent/adapters/generation_params.py` is the shared LLM param normalizer for temperature, seed, media policy, prompt-cache binding, and Core `thinking`.
+- `src/abstractagent/adapters/generation_params.py` is the shared LLM param normalizer for temperature, seed, media policy, prompt-cache identity, streaming passthrough, and Core `thinking`.
+- `src/abstractagent/adapters/loop_hooks.py` is the shared loop-hook layer (listen/steer/capture); see `docs/hooks.md`.
 - MemAct is not re-exported at the package top-level; import from `abstractagent.agents.memact` (see `docs/api.md`).
 - After changes, run tests: `pytest -q`
 
@@ -28,6 +29,7 @@ Important notes (source-of-truth hints):
 - [API](docs/api.md): Public API surface
 - [Agents](docs/agents.md): Agent types + API
 - [Tools](docs/tools.md): Default tools, allowlists, built-ins (adapter-mapped + runtime-owned)
+- [Loop hooks](docs/hooks.md): Listen/steer/capture hooks on the agent loops (`LoopHooks`, `HookEvent`)
 - [Persistence](docs/persistence.md): Pause/resume across restarts
 - [Architecture](docs/architecture.md): How logic/adapters/agents fit together (diagrams)
 - [ReAct pipeline](docs/react-pipeline.md): ReAct workflow details

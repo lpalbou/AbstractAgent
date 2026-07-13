@@ -170,6 +170,18 @@ def test_react_volatile_state_rides_only_the_trailing_message() -> None:
     assert "Create a project folder" in firsts[0]
     assert "[loop]" not in firsts[1]  # later iterations carry the pure task message
 
+    # Structural volatile marker (B1 pair, code c971 → runtime c986): when the
+    # tail rides as a SEPARATE trailing message (iterations 2+, the tool-loop
+    # shape), it carries top-level `volatile: true` — runtime's llm_client
+    # excludes it from the prompt-cache fingerprint sequence and strips the
+    # key before any provider sees it. The merged first-turn message must NOT
+    # carry the flag (it holds the real task).
+    for p in payloads[1:]:
+        tail_msg = (p.get("messages") or [])[-1]
+        assert tail_msg.get("volatile") is True
+    first_msg = (payloads[0].get("messages") or [])[0]
+    assert "volatile" not in first_msg
+
 
 def test_react_assistant_tool_call_messages_retain_reasoning_content() -> None:
     payloads, state = _run_scripted_loop()

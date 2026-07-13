@@ -11,8 +11,10 @@ from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
 
-from .generation_params import runtime_llm_params
+from .generation_params import resolve_max_iterations, runtime_llm_params
 from .media import extract_media_from_context
+from .loop_hooks import LoopHooks
+from .tool_allowlist import note_pruned_grants
 from ..logic.codeact import CodeActLogic
 
 
@@ -87,12 +89,12 @@ def ensure_codeact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], 
 
     max_iterations = scratchpad.get("max_iterations")
     if max_iterations is None:
-        scratchpad["max_iterations"] = 25
+        scratchpad["max_iterations"] = 20
     elif not isinstance(max_iterations, int):
         try:
             scratchpad["max_iterations"] = int(max_iterations)
         except (TypeError, ValueError):
-            scratchpad["max_iterations"] = 25
+            scratchpad["max_iterations"] = 20
 
     if scratchpad["max_iterations"] < 1:
         scratchpad["max_iterations"] = 1
@@ -111,10 +113,54 @@ def create_codeact_workflow(
     *,
     logic: CodeActLogic,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    hooks: Optional[LoopHooks] = None,
 ) -> WorkflowSpec:
+    if hooks is not None and not hooks.agent:
+        hooks.agent = "codeact_agent"
+
     def emit(step: str, data: Dict[str, Any]) -> None:
         if on_step:
             on_step(step, data)
+        if hooks is not None:
+            # First-class hooks (shared contract, see adapters/loop_hooks.py):
+            # dispatch never raises; follow-ups re-enter the flat stream.
+            for fu_step, fu_data in hooks.dispatch(step, data):
+                if on_step:
+                    on_step(fu_step, fu_data)
+
+    def _fold_hook_steering(runtime_ns: Dict[str, Any]) -> None:
+        if hooks is None or not isinstance(runtime_ns, dict):
+            return
+        for text in hooks.drain_pending_injections(hooks.current_run_id()):
+            inbox = runtime_ns.get("inbox")
+            if not isinstance(inbox, list):
+                inbox = []
+                runtime_ns["inbox"] = inbox
+            inbox.append({"role": "system", "content": str(text or "")})
+
+    def _with_run_context(node_fn):
+        """Bind the hooks' run context around node execution (per-run queues:
+        one workflow product serves many runs; see adapters/loop_hooks.py)."""
+        if hooks is None:
+            return node_fn
+
+        def wrapper(run, ctx):
+            hooks.push_run(str(getattr(run, "run_id", "") or ""))
+            try:
+                return node_fn(run, ctx)
+            finally:
+                hooks.pop_run()
+
+        wrapper.__name__ = getattr(node_fn, "__name__", "node")
+        return wrapper
+
+    def _discard_hook_steering_at_terminal() -> None:
+        if hooks is None:
+            return
+        dropped = hooks.discard_run(hooks.current_run_id())
+        if dropped:
+            emit("hook_steer_discarded", {"count": dropped})
+
 
     def _current_tool_defs() -> list[ToolDefinition]:
         defs = getattr(logic, "tools", None)
@@ -166,10 +212,16 @@ def create_codeact_workflow(
 
     def _effective_allowlist(runtime_ns: Dict[str, Any]) -> list[str]:
         if isinstance(runtime_ns, dict) and "allowed_tools" in runtime_ns:
-            normalized = _normalize_allowlist(runtime_ns.get("allowed_tools"))
+            raw = runtime_ns.get("allowed_tools")
+            normalized = _normalize_allowlist(raw)
             # Filter to currently known tools (dynamic), preserving order.
             current = _tool_by_name()
             filtered = [name for name in normalized if name in current]
+            # Works-or-loud: names the grant lost are recorded durably, never
+            # silently dropped (shared note — one source across adapters).
+            payload = note_pruned_grants(runtime_ns, raw, filtered)
+            if payload is not None:
+                emit("allowlist_pruned", payload)
             runtime_ns["allowed_tools"] = filtered
             return filtered
         return list(_default_allowlist())
@@ -392,14 +444,12 @@ def create_codeact_workflow(
         # Read from _limits (canonical) with fallback to scratchpad (backward compat)
         if "current_iteration" in limits:
             iteration = int(limits.get("current_iteration", 0) or 0)
-            max_iterations = int(limits.get("max_iterations", 25) or 25)
         else:
             # Backward compatibility: use scratchpad
             iteration = int(scratchpad.get("iteration", 0) or 0)
-            max_iterations = int(scratchpad.get("max_iterations") or 25)
-
-        if max_iterations < 1:
-            max_iterations = 1
+        # Presence-based budget resolution (explicit 0 clamps to 1, never falls
+        # open to the default — agency-caps adversary P2-2).
+        max_iterations = resolve_max_iterations(limits, scratchpad)
 
         if iteration >= max_iterations:
             return StepPlan(node_id="reason", next_node="max_iterations")
@@ -413,6 +463,7 @@ def create_codeact_workflow(
         # ReAct adapter): the previous rendering folded it into the system prompt for ONE call,
         # which both mutated the cached prefix and was forgotten on the next cycle — a final
         # answer written later re-anchored on the original task and dropped the correction.
+        _fold_hook_steering(runtime_ns)
         inbox = runtime_ns.get("inbox", [])
         guidance = ""
         if isinstance(inbox, list) and inbox:
@@ -428,6 +479,7 @@ def create_codeact_workflow(
                     metadata={"kind": "operator_guidance"},
                 )
             )
+            emit("inbox_drained", {"chars": len(guidance)})
 
         messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
@@ -1109,6 +1161,13 @@ def create_codeact_workflow(
             "response_schema": schema,
             "response_schema_name": "CodeActVerifier",
             "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2}),
+            # Review-failure containment (backlog 0027; same contract as the
+            # ReAct verifier): a terminally failed verifier call lands as
+            # {"ok": False, "absorbed_failure": <error>} at result_key instead
+            # of failing a run that already holds a valid answer; review_parse
+            # degrades to accept-with-#FALLBACK. Runtimes without the
+            # absorption mechanism ignore this key (behavior unchanged there).
+            "_absorb_failure": True,
         }
         media = extract_media_from_context(context)
         if media:
@@ -1128,10 +1187,32 @@ def create_codeact_workflow(
         )
 
     def review_parse_node(run: RunState, ctx) -> StepPlan:
-        _, _, runtime_ns, temp, _ = ensure_codeact_vars(run)
+        _, scratchpad, runtime_ns, temp, _ = ensure_codeact_vars(run)
         resp = temp.get("review_llm_response", {})
         if not isinstance(resp, dict):
             resp = {}
+
+        absorbed = resp.get("absorbed_failure")
+        if absorbed is not None:
+            # Review-failure containment (backlog 0027): the verifier call
+            # failed terminally (runtime `_absorb_failure` shape). Verifier
+            # failure must never be worse than no verifier — accept the held
+            # final answer and complete, loudly. Without this, the absorbed
+            # record would fall through the tolerant parse into the
+            # "unactionable" retry (re-issuing a failing call) and then
+            # re-enter `reason` — worse than no verifier on both counts.
+            reason = str(absorbed or "").strip() or "unknown error"
+            skipped = scratchpad.get("review_skipped")
+            if not isinstance(skipped, list):
+                skipped = []
+                scratchpad["review_skipped"] = skipped
+            skipped.append({"reason": reason, "warning": "#FALLBACK"})
+            emit(
+                "review_skipped",
+                {"reason": reason, "warning": "#FALLBACK", "accepted_held_answer": True},
+            )
+            temp.pop("review_llm_response", None)
+            return StepPlan(node_id="review_parse", next_node="done")
 
         data = resp.get("data")
         if data is None and isinstance(resp.get("content"), str):
@@ -1221,6 +1302,7 @@ def create_codeact_workflow(
             if last_role != "assistant" or str(last_content or "") != answer:
                 messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer"}))
 
+        _discard_hook_steering_at_terminal()
         return StepPlan(
             node_id="done",
             complete_output={
@@ -1234,13 +1316,14 @@ def create_codeact_workflow(
         context, scratchpad, _, _, limits = ensure_codeact_vars(run)
 
         # Prefer _limits, fall back to scratchpad
-        max_iterations = int(limits.get("max_iterations", 0) or scratchpad.get("max_iterations", 25) or 25)
+        max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
         emit("max_iterations", {"iterations": max_iterations})
 
         messages = list(context.get("messages") or [])
         last_content = messages[-1]["content"] if messages else "Max iterations reached"
+        _discard_hook_steering_at_terminal()
         return StepPlan(
             node_id="max_iterations",
             complete_output={
@@ -1254,6 +1337,8 @@ def create_codeact_workflow(
         workflow_id="codeact_agent",
         entry_node="init",
         nodes={
+            node_id: _with_run_context(node_fn)
+            for node_id, node_fn in {
             "init": init_node,
             "plan": plan_node,
             "plan_parse": plan_parse_node,
@@ -1268,5 +1353,6 @@ def create_codeact_workflow(
             "review_parse": review_parse_node,
             "done": done_node,
             "max_iterations": max_iterations_node,
+            }.items()
         },
     )
