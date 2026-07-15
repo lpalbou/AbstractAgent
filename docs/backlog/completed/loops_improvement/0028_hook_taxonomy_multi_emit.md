@@ -1,9 +1,9 @@
-# Proposed: hook taxonomy multi-emit + report accumulation (audit residue)
+# Completed: hook taxonomy multi-emit + report accumulation (audit residue)
 
 ## Metadata
 - Created: 2026-07-13
-- Status: Proposed
-- Completed: N/A
+- Status: Completed
+- Completed: 2026-07-15
 - Proposal ID: audit-2026-07-13 P2-4 / P2-7
 
 ## Context
@@ -43,3 +43,14 @@ across all three loops with loop extras additive. Remaining 0028 scope: none
 — the naming split was resolved at the inventory's founding publication
 (RENAMED_STEPS) and the payload/emission contracts above close the rest.
 Item promotable to completed at the next backlog pass.
+
+## Completion report
+- Date: 2026-07-15 (backlog pass alongside 0026's close)
+- Outcome: all substance shipped in the 2026-07-14 batch-4 contract wave (see
+  the execution note above — one turn_end per turn, per-turn report resets,
+  parse common core, RENAMED_STEPS record). This close is the promotion the
+  note announced; no code changed at close time.
+- Validation: pins live in `tests/test_gated_remainder_wave_2026_07_14.py`
+  (parse common core, turn-boundary resets) and the emit-inventory drift
+  test; 0026's same-day wave re-ran the full suite over them (233/2 green).
+- Follow-ups: none.

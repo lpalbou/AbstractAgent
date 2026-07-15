@@ -41,6 +41,21 @@ Additional system instructions:
   narrowed allowlist would mislead it). Runs you start YOURSELF (nested
   workflows, work doors) take slots via their own `_runtime` or the facade
   `start(..., skills_block=..., system_prompt_extra=...)` parameters.
+- **Agent-node composition (the other lane, ruled 2026-07-15)**: the
+  `delegate_agent` exclusion covers MODEL-ELECTED delegation only. Visual
+  Agent nodes are HOST-STRUCTURED composition — the workflow compiler builds
+  the child vars, with provider/model/thinking inheritance precedent — so
+  parent `skills_block` passthrough there is the sanctioned lane, not an
+  exception (commons c2286→c2290→c2429; shipped in abstractruntime's
+  compiler: setdefault at child creation, so byte-stability holds per child
+  run). `read_skill` is appended to an EXPLICIT non-empty child allowlist
+  when a block rides; an EMPTY allowlist (= registry defaults downstream)
+  stays untouched — appending there would restrict the child to one tool,
+  and registry defaults already carry `read_skill` where the host registered
+  it. Known property, host's to weigh: an Agent node whose tools pin narrows
+  below what the block teaches will have the block naming unavailable tools
+  — visible in the graph (unlike model-elected narrowing), and progressive
+  disclosure via `read_skill` keeps working under any narrowing.
 
 ## Progressive disclosure: `read_skill`
 

@@ -106,6 +106,8 @@ Important notes (source-of-truth hints):
 - [Act-only observation](tests/test_react_act_only_observation.py): act-frames on the tool result channel
 - [Gated-remainder wave pins](tests/test_gated_remainder_wave_2026_07_14.py): A1 fence gate, `read_skill`, side-effect classifier, `reset_react_task`, parse common core, turn-boundary resets
 - [Audit-residue claim pins](tests/test_claim_0029_residue_2026_07_14.py): explicit budgets beat defaults, honest budget terminals, compose spin guard, marked truncation, repeat-guard bookkeeping, steering discard on failed runs
+- [0026 follow-up pins](tests/test_loop_hooks_0026_follow_ups.py): 3-loop `init`/`tool_proposed` parity, `inbox_undelivered` terminal honesty, conclusion both-halves, composition-handoff exemption
+- [prompt-cache telemetry pins](tests/test_parse_prompt_cache_capture.py): additive `parse.prompt_cache` struct surfaced when the provider reports one, absent otherwise
 
 ## Optional
 

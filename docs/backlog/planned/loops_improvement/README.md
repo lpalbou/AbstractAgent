@@ -1,8 +1,11 @@
 # Loops improvement track (planned half)
 
 ## Status
-Planned (correctness defects only — the feature half of the same track lives in
-`proposed/loops_improvement/`).
+COMPLETE (2026-07-15 hygiene note): every defect item in this half shipped —
+0010/0012/0013/0027 (2026-07-13), 0011 (2026-07-14, via the transcripts.py
+extraction). The files live in `completed/loops_improvement/`; this README
+stays as the track's provenance record. The feature half of the same track
+lives in `proposed/loops_improvement/`.
 
 ## Purpose
 Fold the 2026-07-12 loops meta-audit into durable planning memory. Two adversarial

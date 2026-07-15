@@ -33,10 +33,22 @@ findings), 2026-07-12.
   every wave lands once.
 - `0022_codeact_fold_decision.md` (C5): fold CodeAct into ReAct — MAINTAINER
   RULING REQUIRED.
-- `0023_memact_status_honesty.md` (D1): experimental label or root export.
+- `0023_memact_status_honesty.md` (D1): experimental label or root export
+  (docs half executed 2026-07-14; root-export question stays maintainer
+  preference).
 - `0024_dead_public_surface_pruning.md` (D2): dead factories/stubs/re-exports.
 - `0025_cross_seat_integration_flags.md` (D3+D4): other seats' lanes, tracked.
-- `0026_loop_hooks_follow_ups.md`: named P2/P3 leftovers from the hooks wave.
+- `0026_loop_hooks_follow_ups.md`: named P2/P3 leftovers from the hooks wave —
+  COMPLETED 2026-07-15, now in `completed/loops_improvement/`.
+- `0028_hook_taxonomy_multi_emit.md` (added 2026-07-13): COMPLETED 2026-07-15
+  (substance shipped in the 2026-07-14 contract wave), now in
+  `completed/loops_improvement/`.
+- `0029_audit_residue_2026_07_13.md` (added 2026-07-13): whole-package audit
+  residue; only #9 (0024-gated) and #10's conclusion-call half (0021-gated)
+  remain open.
+- `0030_capability_and_honesty_residue.md` (added 2026-07-13): twin-audit
+  residue; mostly executed across batches 2/4 + the 2026-07-15 telemetry
+  surface; remaining items gated (core/gateway lanes, green lights).
 
 ## Reading order / suggested execution order (as proposed to the maintainer)
 planned 0010+0012+0013 (trivial, same day) -> 0017+0019+0020 (small, high

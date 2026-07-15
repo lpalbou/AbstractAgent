@@ -281,17 +281,37 @@ def test_hooks_only_config_observes_hook_error_without_on_step() -> None:
 
 
 def test_handler_mutation_of_event_data_cannot_corrupt_the_loop() -> None:
-    """Adversary P2-1: handlers receive a COPY of the emit payload — mutating
-    event.data must not rewrite the tool arguments the loop executes."""
+    """Adversary P2-1 + 0026 act-payload pin: handlers receive a COPY of the
+    emit payload AT EVERY DEPTH.
+
+    The original version of this test keyed `tool_calls` off `tool_proposed`
+    — whose payload only carries `{"count": N}` — so its "mutation" never
+    touched anything and the pin was VACUOUS (0026 named it: "a REAL mutation
+    pin against the act payload"). The exact leak the deepcopy exists for:
+    the `act` emit's `args` value and the TOOL_CALLS effect payload share the
+    SAME live `arguments` dict (react_runtime act_node builds
+    `formatted_calls` from the same references AFTER the emit fired), so a
+    shallow copy would let a handler rewrite what executes. The vandal below
+    corrupts EVERY mutable value on EVERY event; execution and the durable
+    transcript must stay pristine."""
     tool_payloads: List[Dict[str, Any]] = []
 
+    def _vandalize(value: Any) -> None:
+        if isinstance(value, dict):
+            for key in list(value.keys()):
+                nested = value[key]
+                if isinstance(nested, (dict, list)):
+                    _vandalize(nested)
+                else:
+                    value[key] = "CORRUPTED"
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, (dict, list)):
+                    _vandalize(item)
+            value.append("CORRUPTED")
+
     def mutating_handler(event: HookEvent) -> None:
-        if event.name == "tool_proposed":
-            calls = event.data.get("tool_calls")
-            if isinstance(calls, list):
-                for c in calls:
-                    if isinstance(c, dict) and isinstance(c.get("arguments"), dict):
-                        c["arguments"]["q"] = "CORRUPTED"
+        _vandalize(event.data)
 
     hooks = LoopHooks().add(mutating_handler)
 
@@ -337,10 +357,16 @@ def test_handler_mutation_of_event_data_cannot_corrupt_the_loop() -> None:
         state = runtime.tick(workflow=workflow, run_id=run_id, max_steps=1)
         if state.status in (RunStatus.COMPLETED, RunStatus.FAILED):
             break
-    assert runtime.get_state(run_id).status == RunStatus.COMPLETED
+    final_state = runtime.get_state(run_id)
+    assert final_state.status == RunStatus.COMPLETED
     assert tool_payloads, "the tool call must have executed"
     executed_args = (tool_payloads[0].get("tool_calls") or [{}])[0].get("arguments") or {}
     assert executed_args.get("q") == "x", "handler mutation must never reach execution"
+    # The durable transcript is equally out of the vandal's reach.
+    durable = ((final_state.vars or {}).get("context") or {}).get("messages") or []
+    assert not any(
+        "CORRUPTED" in str(m.get("content") or "") for m in durable if isinstance(m, dict)
+    ), "handler mutation must never reach the durable transcript"
 
 
 def test_events_carry_run_identity() -> None:

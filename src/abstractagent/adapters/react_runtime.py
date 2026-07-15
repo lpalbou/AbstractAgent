@@ -31,12 +31,14 @@ from .generation_params import (
     compose_prompt_slots,
     context_usage_warning,
     is_side_effect_tool,
+    prompt_cache_capture,
     resolve_max_iterations,
     runtime_llm_params,
+    suppress_loop_tail,
     tool_tags_map,
     verifier_response_schema,
 )
-from .loop_hooks import LoopHooks
+from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .media import extract_media_from_context
 from .tool_allowlist import note_pruned_grants
 from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
@@ -747,6 +749,15 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
         # used_tools is the same per-turn latch class (wave-F P4): a toolless
         # turn 2 must not report turn 1's tool use.
         scratchpad["used_tools"] = False
+        # Turn fence for the repeat-side-effect guard (c2447 F5): cycles are
+        # deliberately kept across turns (append-only history), but the guard
+        # judging "same batch as before" must never reach into a PRIOR turn —
+        # a visit is a relationship, and repeating yesterday's identical
+        # memory search is legitimate, not a loop. The fence records where
+        # this turn's cycles begin; absent (plain task runs) = whole-run scan,
+        # unchanged.
+        cycles = scratchpad.get("cycles")
+        scratchpad["turn_first_cycle"] = len(cycles) if isinstance(cycles, list) else 0
     limits = run_vars.get("_limits")
     if isinstance(limits, dict):
         limits["current_iteration"] = 0
@@ -854,6 +865,18 @@ def create_react_workflow(
         dropped = hooks.discard_run(hooks.current_run_id())
         if dropped:
             emit("hook_steer_discarded", {"count": dropped})
+
+    def _note_undelivered_inbox_at_terminal(runtime_ns: Dict[str, Any]) -> None:
+        """Conclude-phase drain honesty (0026): guidance that landed in the
+        durable inbox AFTER the loop's last drain (e.g. inject_guidance while
+        the final/conclusion LLM call was in flight) can no longer influence
+        this run — say so loudly instead of completing over it silently. The
+        entries stay in the durable vars (the record shows what missed);
+        composition handoffs never call this — the continuing run drains them
+        at its next reason boundary."""
+        stats = undelivered_inbox_stats(runtime_ns)
+        if stats:
+            emit("inbox_undelivered", stats)
 
     def _current_tool_defs() -> list[Any]:
         defs = getattr(logic, "tools", None)
@@ -1024,6 +1047,12 @@ def create_react_workflow(
         if task and (not msgs or msgs[-1].get("role") != "user" or msgs[-1].get("content") != task):
             msgs.append(_new_message(ctx, role="user", content=task))
 
+        # Run-init emit (0026 follow-up, 2026-07-15): parity with CodeAct/
+        # MemAct — every loop announces the run's task once at workflow entry.
+        # Composed hosts (visit turns) re-enter at `reason`, never here, so
+        # this stays a RUN moment, not a turn moment.
+        emit("init", {"task": task})
+
         allow = _effective_allowlist(runtime_ns)
         allowed_defs = _allowed_tool_defs(allow)
         include_examples = _tool_prompt_examples_enabled(runtime_ns)
@@ -1144,18 +1173,29 @@ def create_react_workflow(
         # enters the cached prefix (0212). This is analogous to how the runtime grounding envelope
         # is kept out of the stable prefix. Guidance no longer rides here: it is a durable
         # transcript message (see the drain above).
+        #
+        # SUPPRESSION KNOB (c2447 incident, 2026-07-15): loop-position tails are
+        # TASK-AGENT chrome. In composed entity visits the merge branch below
+        # lands the tail INSIDE the visitor's user message (BRIDGE appends the
+        # visitor's words last), so the entity reads "[loop] iteration N of M."
+        # as part of what the human said — the reported "something automated is
+        # running" perception. Hosts that compose these nodes for an entity set
+        # `_runtime.suppress_loop_tail` (runtime's BRIDGE, their spelling from
+        # c2453) and the whole tail block — iteration line AND [plan] render —
+        # stays out of the payload. Absent/falsy = unchanged task-agent behavior.
         tail_parts: list[str] = []
-        tail_parts.append(f"[loop] iteration {int(iteration)} of {int(max_iterations)}.")
-        plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
-        if isinstance(plan_text, str) and plan_text.strip():
-            # Bound the rendered plan so a pathological (or runaway) plan cannot balloon every
-            # subsequent request. The full plan stays durable in scratchpad; this is a display cap.
-            plan_render = plan_text.strip()
-            _plan_cap = 4000
-            if len(plan_render) > _plan_cap:
-                #[WARNING:TRUNCATION] bounded plan render in the trailing loop message
-                plan_render = plan_render[:_plan_cap].rstrip() + f"\n… (plan truncated, {len(plan_text.strip()):,} chars total)"
-            tail_parts.append(f"[plan]\n{plan_render}")
+        if not suppress_loop_tail(runtime_ns):
+            tail_parts.append(f"[loop] iteration {int(iteration)} of {int(max_iterations)}.")
+            plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
+            if isinstance(plan_text, str) and plan_text.strip():
+                # Bound the rendered plan so a pathological (or runaway) plan cannot balloon every
+                # subsequent request. The full plan stays durable in scratchpad; this is a display cap.
+                plan_render = plan_text.strip()
+                _plan_cap = 4000
+                if len(plan_render) > _plan_cap:
+                    #[WARNING:TRUNCATION] bounded plan render in the trailing loop message
+                    plan_render = plan_render[:_plan_cap].rstrip() + f"\n… (plan truncated, {len(plan_text.strip()):,} chars total)"
+                tail_parts.append(f"[plan]\n{plan_render}")
         tail_text = "\n\n".join(tail_parts).strip()
         if tail_text and isinstance(payload.get("messages"), list):
             msgs_out = list(payload["messages"])
@@ -1246,25 +1286,29 @@ def create_react_workflow(
                 reasoning_text = str(rc or "")
         except Exception:
             reasoning_text = ""
-        emit(
-            "parse",
-            {
-                "iteration": cycle_i,
-                "max_iterations": max_iterations,
-                # COMMON CORE across all three loops (0028 contract wave,
-                # 2026-07-14): has_tool_calls + tool_calls + content_preview
-                # are guaranteed keys in every adapter's parse payload;
-                # loop-specific extras (full content/reasoning here) are
-                # additive on top. Consumers key on the core.
-                "has_tool_calls": bool(tool_calls),
-                "tool_calls": [
-                    {"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls
-                ],
-                "content_preview": (str(content or "")[:200] if content else "(no content)"),
-                "content": str(content or ""),
-                "reasoning": reasoning_text,
-            },
-        )
+        parse_payload: Dict[str, Any] = {
+            "iteration": cycle_i,
+            "max_iterations": max_iterations,
+            # COMMON CORE across all three loops (0028 contract wave,
+            # 2026-07-14): has_tool_calls + tool_calls + content_preview
+            # are guaranteed keys in every adapter's parse payload;
+            # loop-specific extras (full content/reasoning here) are
+            # additive on top. Consumers key on the core.
+            "has_tool_calls": bool(tool_calls),
+            "tool_calls": [
+                {"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls
+            ],
+            "content_preview": (str(content or "")[:200] if content else "(no content)"),
+            "content": str(content or ""),
+            "reasoning": reasoning_text,
+        }
+        # Additive cache observability (0030 residue, 2026-07-15): the
+        # provider's per-call prompt-cache telemetry, present only when the
+        # provider reported one (local-cache backends today).
+        cache_struct = prompt_cache_capture(response)
+        if cache_struct is not None:
+            parse_payload["prompt_cache"] = cache_struct
+        emit("parse", parse_payload)
         cycle: Dict[str, Any] = {"i": cycle_i, "thought": content, "tool_calls": [], "observations": []}
         cycles = scratchpad.get("cycles")
         if isinstance(cycles, list):
@@ -1293,9 +1337,17 @@ def create_react_workflow(
 
                 if has_side_effect:
                     cycles_list = scratchpad.get("cycles")
+                    # Turn fence (c2447 F5): in composed visits reset_react_turn
+                    # records where THIS turn's cycles start — the guard never
+                    # judges against a prior turn's cycle (repeating the same
+                    # search days later in one visit is legitimate). Plain task
+                    # runs never set the fence: whole-run scan, unchanged.
+                    turn_fence_raw = scratchpad.get("turn_first_cycle")
+                    turn_fence = max(0, turn_fence_raw) if isinstance(turn_fence_raw, int) else 0
                     prev_cycle: Optional[Dict[str, Any]] = None
                     if isinstance(cycles_list, list) and len(cycles_list) >= 2:
-                        for c in reversed(cycles_list[:-1]):
+                        for idx in range(len(cycles_list) - 2, turn_fence - 1, -1):
+                            c = cycles_list[idx]
                             if not isinstance(c, dict):
                                 continue
                             # Skipped cycles are NOT "the previous tool cycle"
@@ -1469,6 +1521,10 @@ def create_react_workflow(
                             "success": False,
                             "output": None,
                             "error": f"Tool '{name}' is not allowed for this agent",
+                            # Structural marker (c2447 F3): a BLOCKED call never
+                            # executed — observe's tools_ran capture must not
+                            # count it (never keyed on error prose).
+                            "blocked": True,
                         }
                     ]
                 }
@@ -1840,6 +1896,7 @@ def create_react_workflow(
         act_only_names = _act_only_tool_names()
 
         obs_list: list[dict[str, Any]] = []
+        ran_names: list[str] = []
         for r in results:
             if not isinstance(r, dict):
                 continue
@@ -1847,6 +1904,13 @@ def create_react_workflow(
             success = bool(r.get("success"))
             output = r.get("output", "")
             error = r.get("error", "")
+            # tools_ran capture (c2447 F3): every result that reached execution
+            # counts — success or failure, act-only included; BLOCKED synthetic
+            # results (structural marker, never error prose) never executed and
+            # are excluded. Order preserved, duplicates meaningful (two searches
+            # = two tools ran).
+            if not r.get("blocked"):
+                ran_names.append(name)
 
             # Act-only results (frozen seam spec, a2a 0013 v2 §2): the durable transcript,
             # scratchpad cycles, and emit lane carry the ACT-FRAME REFERENCE only — never
@@ -1924,6 +1988,19 @@ def create_react_workflow(
                     "rendered": rendered,
                 }
             )
+
+        # Export executed tool names into the turn-capture contract (c2447 F3):
+        # the visit workflow's HARVEST folds `turn_captures.tools_ran` into the
+        # turn report — before this export the key was never written, so the
+        # drawer's "0 tools" was structurally zero (true zero and false zero
+        # indistinguishable). Same accumulation pattern as parse_node's diary
+        # captures; reset_react_turn clears it at the turn boundary.
+        if ran_names:
+            captures = temp.get("turn_captures")
+            if not isinstance(captures, dict):
+                captures = {}
+                temp["turn_captures"] = captures
+            captures["tools_ran"] = list(captures.get("tools_ran") or []) + ran_names
 
         if last_cycle is not None:
             # EXTEND, never assign (fable5 P1 2026-07-13): observe runs
@@ -2183,7 +2260,7 @@ def create_react_workflow(
         return StepPlan(node_id="review_parse", next_node="done")
 
     def done_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, temp, limits = ensure_react_vars(run)
+        context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
         task = str(context.get("task", "") or "")
         answer = str(temp.get("final_answer") or "No answer provided")
 
@@ -2226,6 +2303,7 @@ def create_react_workflow(
             temp["react_output"] = output
             return StepPlan(node_id="done", next_node=final_next_node)
         _discard_hook_steering_at_terminal()
+        _note_undelivered_inbox_at_terminal(runtime_ns)
         return StepPlan(node_id="done", complete_output=output)
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
@@ -2257,20 +2335,36 @@ def create_react_workflow(
                 # same listen point as the reason-boundary drain — a capture
                 # host waiting for consumption confirmation never saw these.
                 emit("inbox_drained", {"chars": len(drained_guidance), "iteration": max_iterations})
-            conclude_directive = (
-                "You have reached the maximum allowed ReAct iterations.\n"
-                "You MUST stop using tools now and provide a best-effort conclusion.\n\n"
-                "In your response, include:\n"
-                "1) A concise progress report (what you did + key observations).\n"
-                "2) The best current answer you can give based on evidence.\n"
-                "3) Remaining uncertainties / missing info.\n"
-                "4) Next steps: exact actions to finish (files to inspect/edit, commands/tools to run, what to look for).\n\n"
-                "Rules:\n"
-                "- Do NOT call tools.\n"
-                "- Do NOT output tool-call markup (e.g. <tool_call>...</tool_call>).\n"
-                "- Do NOT mention internal scratchpads; just present the report.\n"
-                "- Prefer bullet points and concrete next steps."
-            )
+            # Conclusion chrome under suppression (c2447 residual gap, code's
+            # C3 finding): the task-report directive + "## Max iterations
+            # reached" header + scratchpad render merge into the last USER
+            # message exactly like the reason-node tail — a budget-exhausted
+            # visit turn would show the entity the incident's perception
+            # class post-fix. Entity lanes get a functional, host-voiced
+            # wrap-up line with NO loop vocabulary and NO scratchpad dump
+            # (the visit transcript already carries everything durable).
+            _suppress_chrome = suppress_loop_tail(runtime_ns)
+            if _suppress_chrome:
+                conclude_directive = (
+                    "Please bring your reply to a close now: do not use tools "
+                    "or tool-call markup — give your best answer from what you "
+                    "already have, in your own words."
+                )
+            else:
+                conclude_directive = (
+                    "You have reached the maximum allowed ReAct iterations.\n"
+                    "You MUST stop using tools now and provide a best-effort conclusion.\n\n"
+                    "In your response, include:\n"
+                    "1) A concise progress report (what you did + key observations).\n"
+                    "2) The best current answer you can give based on evidence.\n"
+                    "3) Remaining uncertainties / missing info.\n"
+                    "4) Next steps: exact actions to finish (files to inspect/edit, commands/tools to run, what to look for).\n\n"
+                    "Rules:\n"
+                    "- Do NOT call tools.\n"
+                    "- Do NOT output tool-call markup (e.g. <tool_call>...</tool_call>).\n"
+                    "- Do NOT mention internal scratchpads; just present the report.\n"
+                    "- Prefer bullet points and concrete next steps."
+                )
 
             task = str(context.get("task", "") or "")
             messages_view = list(context.get("messages") or [])
@@ -2312,10 +2406,13 @@ def create_react_workflow(
             if drained_guidance:
                 block_parts.append(f"Host guidance:\n{drained_guidance}")
             block_parts.append(conclude_directive)
-            scratch_txt = _render_cycles_for_conclusion_prompt(scratchpad)
-            if scratch_txt:
-                block_parts.append(f"## Scratchpad (ReAct cycles so far)\n{scratch_txt}")
-            tail_text = ("## Max iterations reached\n" + "\n\n".join(block_parts)).strip()
+            if not _suppress_chrome:
+                scratch_txt = _render_cycles_for_conclusion_prompt(scratchpad)
+                if scratch_txt:
+                    block_parts.append(f"## Scratchpad (ReAct cycles so far)\n{scratch_txt}")
+                tail_text = ("## Max iterations reached\n" + "\n\n".join(block_parts)).strip()
+            else:
+                tail_text = "\n\n".join(block_parts).strip()
             if isinstance(payload.get("messages"), list):
                 msgs_out = list(payload["messages"])
                 if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
@@ -2361,32 +2458,49 @@ def create_react_workflow(
             retries = int(temp.get("max_iterations_conclude_retries", 0) or 0)
             if retries < 1:
                 temp["max_iterations_conclude_retries"] = retries + 1
-                _push_inbox(
-                    runtime_ns,
-                    "You are out of iterations and tool use is disabled.\n"
-                    "Return ONLY the final report and next steps as plain text.\n"
-                    "Do NOT include any tool calls or tool-call markup (e.g. <tool_call>...</tool_call>).",
-                )
+                # Same chrome rule as the directive (c2447/C3): the retry line
+                # is read by the model on the next conclusion prompt — entity
+                # lanes get the functional half without loop vocabulary.
+                if suppress_loop_tail(runtime_ns):
+                    _push_inbox(
+                        runtime_ns,
+                        "Tool use is not available for this reply.\n"
+                        "Return ONLY your answer as plain text, without tool calls or tool-call markup.",
+                    )
+                else:
+                    _push_inbox(
+                        runtime_ns,
+                        "You are out of iterations and tool use is disabled.\n"
+                        "Return ONLY the final report and next steps as plain text.\n"
+                        "Do NOT include any tool calls or tool-call markup (e.g. <tool_call>...</tool_call>).",
+                    )
                 return StepPlan(node_id="max_iterations", next_node="max_iterations")
             # Last resort: strip any leaked tool markup so we don't persist it as the final answer.
             answer = _strip_tool_call_markup(answer).strip()
 
         if not answer:
-            # Fallback: avoid returning the last tool observation as the "answer".
-            # Provide a deterministic report so users don't lose scratchpad context.
-            scratch_view = _render_cycles_for_conclusion_prompt(scratchpad)
-            parts = [
-                "Max iterations reached.",
-                "I could not produce a final assistant response in time.",
-            ]
-            if scratch_view:
-                parts.append("## Progress (from scratchpad)\n" + scratch_view)
-            parts.append(
-                "## Next steps\n"
-                "- Increase `max_iterations` and rerun, or use `/conclude` earlier to force a wrap-up.\n"
-                "- If you need me to continue, re-run with a higher iteration budget and I will pick up from the report above."
-            )
-            answer = "\n\n".join(parts).strip()
+            if suppress_loop_tail(runtime_ns):
+                # Entity-lane fallback (c2447/C3): this text becomes the reply
+                # the VISITOR reads and rests durably in the visit transcript —
+                # loop vocabulary and scratchpad dumps are exactly the incident
+                # class. One honest line, no machine chrome.
+                answer = "I couldn't finish putting this reply together — what I have is incomplete."
+            else:
+                # Fallback: avoid returning the last tool observation as the "answer".
+                # Provide a deterministic report so users don't lose scratchpad context.
+                scratch_view = _render_cycles_for_conclusion_prompt(scratchpad)
+                parts = [
+                    "Max iterations reached.",
+                    "I could not produce a final assistant response in time.",
+                ]
+                if scratch_view:
+                    parts.append("## Progress (from scratchpad)\n" + scratch_view)
+                parts.append(
+                    "## Next steps\n"
+                    "- Increase `max_iterations` and rerun, or use `/conclude` earlier to force a wrap-up.\n"
+                    "- If you need me to continue, re-run with a higher iteration budget and I will pick up from the report above."
+                )
+                answer = "\n\n".join(parts).strip()
 
         # Persist final answer into the conversation history (so it shows up in /history and seeds next runs).
         messages = context.get("messages")
@@ -2419,6 +2533,7 @@ def create_react_workflow(
             temp["react_output"] = output
             return StepPlan(node_id="max_iterations", next_node=final_next_node)
         _discard_hook_steering_at_terminal()
+        _note_undelivered_inbox_at_terminal(runtime_ns)
         return StepPlan(node_id="max_iterations", complete_output=output)
 
     return WorkflowSpec(

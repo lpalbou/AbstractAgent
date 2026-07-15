@@ -42,6 +42,18 @@ remainder on operator green light; see CHANGELOG):
   When core's `prompt_cache` telemetry struct lands in GenerateResponse
   metadata, surface outcome/degraded_reason on LLM-call captures (additive;
   the emit-inventory drift test forces the declaration).
+  - **EXECUTED 2026-07-15 (telemetry surface half)**: core's struct landed
+    (mlx_provider writes `metadata["prompt_cache"]` with outcome /
+    cached_tokens / fed_tokens / #FALLBACK degraded_reason; runtime's
+    llm_client folds metadata into every LLM result). All three loops now
+    lift it onto the `parse` payload as an additive `prompt_cache` key
+    (`generation_params.prompt_cache_capture` — present exactly when the
+    provider reported one, never an empty placeholder; no new step name, so
+    the drift test is untouched by design). Pinned in
+    `tests/test_parse_prompt_cache_capture.py` (present + absent, all three
+    loops); documented in docs/hooks.md beside the 0028 common core. The
+    bloc-scale `skills_block` composition question itself stays open (core's
+    bloc-store lane).
 
 ## Context
 The operator asked "do you see anything else to improve our agents… is

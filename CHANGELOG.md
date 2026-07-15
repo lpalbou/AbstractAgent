@@ -2,6 +2,101 @@
 
 ## Unreleased (2026-07-12)
 
+### Fixed (2026-07-15 — c2447 incident: loop tail in entity consciousness + the broken "0 tools" gauge)
+- **`_runtime.suppress_loop_tail` (all three loops)**: the loop-position
+  tail ("[loop] iteration N of M." + the [plan] render) is task-agent
+  chrome, and in composed entity visits the merge branch landed it INSIDE
+  the visitor's user message (BRIDGE appends the visitor's words last), so
+  the entity read the counter as part of what the human said — the
+  operator-reported "something automated is still running" perception
+  (adversarial audit: report in commons fs
+  reports/entity-cant-remember-awake.md; converged independently with
+  uic's 431-hit ledger measurement and flow's lane audit). Hosts composing
+  the adapters for an entity set the flag (runtime's BRIDGE, spelling
+  agreed on the incident thread) and the whole tail block stays out of
+  every payload — merge and volatile branches both. One shared predicate
+  (`generation_params.suppress_loop_tail`, bool/int/str spellings) across
+  ReAct/CodeAct/MemAct; absent = task-agent behavior byte-unchanged.
+- **`turn_captures.tools_ran` now written at ReAct's observe boundary**:
+  the visit workflow's HARVEST folds `captures.tools_ran` into the turn
+  report, but nothing ever wrote the key — the drawer's "0 tools" was
+  STRUCTURALLY zero (true zero and false zero indistinguishable; the
+  maintainer diagnosed the incident on that broken gauge). Every result
+  that reached execution now counts (success or failure, act-only
+  included, order preserved, duplicates meaningful); BLOCKED builtin calls
+  carry a structural `blocked` marker at the act gate and are excluded
+  (never keyed on error prose). Runtime-executor refusals of external
+  tools arrive as executed-and-failed results and count as attempted
+  activity — documented deliberately in the pin.
+- **Turn-scoped repeat-guard window under composition (F5)**:
+  `reset_react_turn` now records `scratchpad.turn_first_cycle` (where this
+  turn's cycles begin) and the repeat-side-effect guard never scans past it
+  — a visit is a relationship, and repeating yesterday's identical memory
+  search in a later turn is legitimate, not a loop. Plain task runs never
+  set the fence: whole-run scan byte-unchanged (control pinned).
+- **Conclusion chrome behind the same knob (code's C3 finding, c2500)**:
+  the max-iterations conclusion path merged its own chrome into the last
+  user message unconditionally — the "## Max iterations reached" header,
+  the ReAct-vocabulary directive, the scratchpad render, the
+  out-of-iterations retry line, and (worst) the empty-answer fallback that
+  becomes the VISITOR-facing durable reply ("Max iterations reached… use
+  /conclude"). Under `suppress_loop_tail` all of it is replaced by
+  functional, host-voiced text with zero loop vocabulary (wrap-up
+  instruction; markup-free retry line; one honest fallback sentence);
+  task-agent behavior byte-unchanged.
+- 13 pins in `tests/test_c2447_visit_lane_honesty.py` (3-loop suppression
+  incl. merge-branch cleanliness + string spelling; default-unchanged;
+  tools_ran capture + blocked exclusion; fence control/fence/reset trio;
+  suppressed-conclusion chrome-free wire + visitor-facing answer). Suite
+  252. Remaining incident item tracked on the thread: entity-lane framing
+  for retry nudges (needs a vocabulary decision — a visit-lane nudge must
+  not be called "[Operator guidance]").
+
+### Added (2026-07-15 — 0030 residue: prompt-cache telemetry on `parse`)
+- **`prompt_cache` additive key on every loop's `parse` payload**: core's
+  local-cache providers now record per-call cache telemetry into
+  `GenerateResponse.metadata["prompt_cache"]` (outcome, cached_tokens,
+  fed_tokens, `#FALLBACK` degraded_reason) and the runtime folds `metadata`
+  into every LLM result — the 0030 gate ("when core's telemetry struct
+  lands") is lifted. `generation_params.prompt_cache_capture` lifts the
+  struct onto the `parse` emit in all three loops: present exactly when the
+  provider reported one, absent otherwise (never an empty placeholder), no
+  new step name (the emit inventory is untouched by design). Capture hosts
+  can now see cache hit/degradation per reasoning cycle. Pins:
+  `tests/test_parse_prompt_cache_capture.py` (present + absent, all three
+  loops); documented in docs/hooks.md beside the 0028 parse common core.
+
+### Added (2026-07-15 — backlog 0026: loop-hooks parity + terminal honesty)
+- **`tool_proposed` fires on all three loops**: CodeAct and MemAct now emit
+  the raw `parse_tool_calls` step (payload `{"count": N}`) at the tool-batch
+  commit point, exactly like ReAct — the canonical `tool_proposed` event is
+  loop-independent. CodeAct's fenced-code path deliberately does not fire it
+  (no tool batch is proposed; the documented `parse.has_code` signal carries
+  that path).
+- **ReAct emits `init`**: the founding "ReAct emits no `init`" asymmetry is
+  closed — all three loops announce the run's task once at workflow entry
+  (composed visit turns re-enter at `reason` and never re-fire it). `init`
+  and `parse_tool_calls` moved to `COMMON_STEPS` in the emit inventory.
+- **`inbox_undelivered` terminal event (conclude-phase drain honesty)**:
+  durable-inbox guidance that lands AFTER a loop's last drain point (e.g.
+  `inject_guidance` while the final/conclusion LLM call is in flight) could
+  never influence the run and was previously completed over in silence. All
+  three loops' true terminals now emit `inbox_undelivered` `{count, chars}`
+  when `_runtime.inbox` still holds guidance — WITHOUT consuming the entries
+  (the completed run's vars keep the honest record). Guidance drained at
+  ReAct's conclusion boundary still influences (it rides the conclusion
+  prompt as "Host guidance:"); composition handoffs (`final_next_node`) do
+  not fire the event — the continuing run drains at its next reason boundary.
+- **Vacuous mutation pin rewritten**: the hooks suite's payload-mutation test
+  keyed `tool_calls` off `tool_proposed` — whose payload only carries
+  `count` — so its mutation never touched anything. Now a vandal handler
+  corrupts every mutable value on every event and the loop must execute
+  pristine tool arguments and keep a pristine durable transcript (the `act`
+  emit's `args` shares the live `arguments` dict with the TOOL_CALLS effect
+  payload — the exact leak the dispatch deepcopy exists for).
+- 5 new pins in `tests/test_loop_hooks_0026_follow_ups.py`; docs/hooks.md
+  updated (event table, asymmetry note, undelivered contract). Suite 233.
+
 ### Fixed (2026-07-15 — verifier schema strict-mode expressibility, airelay 422 incident)
 - **Review verifier schema was inexpressible under OpenAI strict validators**:
   `next_tool_calls[].arguments` declared a free-form dict

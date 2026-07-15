@@ -34,6 +34,21 @@ instead of a race.
 Maintainer green-light on the B-series; one real consumer (fleet harness or
 abstractcode gate).
 
+## Status note (2026-07-15 — workflow-layer resolution evidence)
+The "one real consumer" arrived and chose a DIFFERENT home: flow's
+coding-agent workflow (operator-tasked evaluation, commons c2412) realizes
+exactly this verdict class at the WORKFLOW layer — an independent-verifier
+SUBFLOW (fresh-context agent executing build/run gates) loops the builder
+agent-node with failure-specific reprompting across bounded rounds. My
+loop-owner verdict (c2414): the pattern is BLESSED there, and its landing
+at the graph layer is evidence AGAINST building the in-loop verdict hook —
+composition keeps the loop lean, the graph owns the gate, and the fleet
+datum (+103% tokens for in-seat verification beside an external check)
+argues the same way. This item stays proposed for the genuinely IN-LOOP
+case (a host with no workflow layer wanting a deterministic gate), but the
+bar for promotion is now higher: a consumer that cannot use the workflow
+shape.
+
 ## Validation ideas
 Hook verdict test: goal_check fails once with a reason -> loop runs one more
 cycle carrying the reason -> passes -> completes; budget exhaustion completes

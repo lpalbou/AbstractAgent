@@ -94,6 +94,39 @@ class HookEvent:
 HookHandler = Callable[[HookEvent], Any]
 
 
+def undelivered_inbox_stats(runtime_ns: Any) -> Optional[Dict[str, int]]:
+    """Stats for guidance still sitting in the durable inbox (`_runtime.inbox`).
+
+    Terminal honesty (backlog 0026, conclude-phase drain): guidance that lands
+    AFTER a loop's last drain point — e.g. `inject_guidance` arriving while the
+    final/conclusion LLM call is in flight — can no longer influence the run.
+    The adapters call this at their true terminals and emit a loud
+    `inbox_undelivered` event when it returns non-None. READ-ONLY by design:
+    the entries stay in the run's durable vars (the record honestly shows what
+    never got delivered); only the silence is removed.
+
+    Returns {"count": N, "chars": M} over non-empty entries, or None when the
+    inbox is absent/empty (nothing undelivered, no event owed).
+    """
+    if not isinstance(runtime_ns, dict):
+        return None
+    inbox = runtime_ns.get("inbox")
+    if not isinstance(inbox, list) or not inbox:
+        return None
+    count = 0
+    chars = 0
+    for entry in inbox:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content")
+        if isinstance(content, str) and content.strip():
+            count += 1
+            chars += len(content)
+    if count == 0:
+        return None
+    return {"count": count, "chars": chars}
+
+
 @dataclass
 class LoopHooks:
     """Host-side hook registry + per-run steer queues for one workflow product.

@@ -40,6 +40,16 @@ COMMON_STEPS = frozenset(
         "delegate_agent_substrate_skew",
         "done",
         "hook_steer_discarded",
+        # 0026 follow-ups (2026-07-15): `init` and `parse_tool_calls` became
+        # common — ReAct gained the run-init emit (the "ReAct emits no init"
+        # asymmetry recorded at founding publication is CLOSED), CodeAct and
+        # MemAct gained the tool-batch commit signal (canonical
+        # `tool_proposed` now fires on all three loops). `inbox_undelivered`
+        # is new: a true terminal reached with undrained durable-inbox
+        # guidance says so loudly ({count, chars}) instead of completing
+        # over it silently; the entries stay in the run's durable vars.
+        "inbox_undelivered",
+        "init",
         "inbox_drained",
         "max_iterations",
         "memory_compact",
@@ -48,14 +58,13 @@ COMMON_STEPS = frozenset(
         "memory_tag",
         "observe",
         "parse",
+        "parse_tool_calls",
         "reason",
         "user_response",
         "vars_query",
     }
 )
 
-# NOTE: ReAct deliberately emits no `init` (CodeAct/MemAct do) — a consumer
-# asymmetry that predates the inventory; recorded here rather than papered over.
 REACT_STEPS = COMMON_STEPS | frozenset(
     {
         # 0028 multi-emit fix (2026-07-14): `max_iterations_reached` announces
@@ -68,7 +77,6 @@ REACT_STEPS = COMMON_STEPS | frozenset(
         "parse_retry_empty",
         "parse_retry_plan_only",
         "parse_retry_truncated",
-        "parse_tool_calls",
         "review",
         "review_request",
         "review_skipped",
@@ -79,7 +87,6 @@ REACT_STEPS = COMMON_STEPS | frozenset(
 
 CODEACT_STEPS = COMMON_STEPS | frozenset(
     {
-        "init",
         "parse_retry_empty",
         "plan",
         "plan_request",
@@ -92,7 +99,6 @@ CODEACT_STEPS = COMMON_STEPS | frozenset(
 
 MEMACT_STEPS = COMMON_STEPS | frozenset(
     {
-        "init",
         "compose",
         "compose_query",
         "finalize",

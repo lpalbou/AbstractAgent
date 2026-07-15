@@ -112,7 +112,7 @@ Canonical names come from `DEFAULT_EVENT_MAP` (pluggable per
 | canonical | raw step(s) | fires | loops |
 |---|---|---|---|
 | `cycle_start` | `reason` | each reasoning cycle begins | all three |
-| `tool_proposed` | `parse_tool_calls` | model proposed a tool batch | ReAct (CodeAct/MemAct emit the raw `parse` step instead) |
+| `tool_proposed` | `parse_tool_calls` | model proposed a tool batch (payload: `count`) | all three (since 2026-07-15; previously ReAct-only). CodeAct's fenced-code path deliberately does NOT fire it — no tool batch is proposed there; key on `parse`'s `has_code` |
 | `tool_executed` | `observe` | one tool result observed — payload carries `tool`, `success`, `result`, and `call_id` (since 2026-07-13; empty string when the batch carried none) so fleet controllers can correlate tool_call → approval → result | all three |
 | `turn_end` | `done`, `max_iterations` | turn finished; `data.outcome` = `final_answer` \| `iteration_budget` | all three |
 | `user_wait` | `ask_user` | loop asked the user | all three |
@@ -147,6 +147,15 @@ block routes to execution. CodeAct's parse payload carries the additive
 inspection UI from parse payloads must treat `has_tool_calls || has_code`
 as "an action is coming" on CodeAct.
 
+Additive on the same payload (2026-07-15): `prompt_cache` — the provider's
+per-call prompt-cache telemetry struct (`mode`, `key`, `outcome`,
+`cached_tokens`, `fed_tokens`, `#FALLBACK`-prefixed `degraded_reason` when
+reuse degraded), lifted verbatim from the LLM result's
+`metadata["prompt_cache"]`. Present exactly when the provider reported one
+(core's local-cache backends today — MLX/llama.cpp lanes); absent otherwise,
+never an empty placeholder. The struct's field vocabulary is core's contract,
+not this layer's — treat unknown fields as additive.
+
 Budget exhaustion emits exactly ONCE per turn (0028 multi-emit fix): ReAct's
 conclusion node announces `max_iterations_reached` at first entry (before the
 conclusion call's latency) and fires `max_iterations` (canonical `turn_end`,
@@ -165,7 +174,10 @@ Stability contract:
   `emit_inventory.RENAMED_STEPS` (the migration record). Executed at founding
   publication (2026-07-13, zero consumers existed): CodeAct's
   `parse_retry_empty_response` → `parse_retry_empty` (one semantic, one name).
-  Known asymmetry kept: ReAct emits no `init` (siblings do).
+  The founding asymmetry "ReAct emits no `init`" was CLOSED 2026-07-15
+  (backlog 0026): all three loops now emit `init` (payload: `task`) once at
+  workflow entry — a RUN moment, not a turn moment (composed visit turns
+  re-enter at `reason` and never re-fire it).
 - **`#FALLBACK` / `#TRUNCATION` markers** in payloads are stable.
 - **Error prose is NOT a contract** — key on step names, payload keys, and
   `metadata.kind`, never on error strings. Every event carries `run_id` and
@@ -183,6 +195,15 @@ mapping):
 | `hook_error` | a handler raised, returned an unsupported shape, or steered outside a run context — contained, run unaffected |
 | `hook_slow` | a handler call exceeded `slow_budget_s` (a strike) |
 | `hook_steer_discarded` | a gracefully completing run dropped undelivered steering (count included) |
+
+The durable-inbox twin (loop-layer, not hook-layer): `inbox_undelivered`
+fires at a run's TRUE terminal when `_runtime.inbox` still holds guidance
+that landed after the loop's last drain point — e.g. `inject_guidance`
+arriving while the final/conclusion LLM call was in flight (payload:
+`count`, `chars`). The entries are NOT consumed or deleted: they stay in the
+completed run's durable vars as the honest record of what never got
+delivered. Composition handoffs (`final_next_node`) do not fire it — the
+continuing run drains the inbox at its next reason boundary.
 
 ## Contract
 
@@ -202,7 +223,10 @@ mapping):
   not yet folded dies with the process, and a run that fails or is cancelled
   does not reach the discard point — its queued steering is simply never
   delivered. Hosts needing guaranteed delivery write the run store's inbox
-  directly (`BaseAgent.inject_message`).
+  directly (`BaseAgent.inject_message`) — and even that channel has a
+  terminal-honesty bound: guidance landing after the loop's last drain
+  cannot influence the run and is reported as `inbox_undelivered` at the
+  terminal (0026 conclude-phase honesty), never silently completed over.
 - **Failures are contained and observable.** A raising handler never kills
   the run; the failure surfaces as `hook_error` on the flat `on_step` stream
   AND as a pure-listen notification to the handlers themselves (returns

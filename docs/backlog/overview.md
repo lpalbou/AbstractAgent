@@ -6,13 +6,13 @@ AbstractRuntime, plus their shared logic (tools contract, generation params,
 loop hooks, allowlist handling). This backlog is the package's durable
 planning memory.
 
-## Counts (2026-07-13)
+## Counts (2026-07-15)
 
 | State | Count |
 |---|---|
-| Planned | 1 |
-| Proposed | 17 |
-| Completed | 4 |
+| Planned | 0 |
+| Proposed | 15 |
+| Completed | 7 |
 | Deprecated | 0 |
 | Recurrent | 2 |
 
@@ -31,18 +31,16 @@ default-model and max_tokens decisions.)
 
 ## Next recommended work
 
-1. `planned/loops_improvement/0011` — sibling transcript repair; check
-   proposed `0021` (shared-core refactor) first: if 0021 is green-lit, 0011
-   folds into it.
-2. Everything in `proposed/loops_improvement/` waits on its stated promotion
+1. Everything in `proposed/loops_improvement/` waits on its stated promotion
    criteria (mostly maintainer green-light per proposal ID; `0022` C5 is an
    explicit maintainer ruling; `0015` A2 is gated on runtime's executor lane).
+   The hooks lane is fully closed (0026 + 0028 completed 2026-07-15).
 
 ## Planned items
 
 | ID | Item | Area |
 |---|---|---|
-| 0011 | `planned/loops_improvement/0011_sibling_transcript_repair_strict_providers.md` (C2) | codeact+memact adapters |
+| (none) | | |
 
 ## Proposed items
 
@@ -61,9 +59,7 @@ default-model and max_tokens decisions.)
 | 0023 | `proposed/loops_improvement/0023_memact_status_honesty.md` (D1) | maintainer preference |
 | 0024 | `proposed/loops_improvement/0024_dead_public_surface_pruning.md` (D2) | green-light (semver-relevant) |
 | 0025 | `proposed/loops_improvement/0025_cross_seat_integration_flags.md` (D3+D4) | other seats' lanes; close when superseded |
-| 0026 | `proposed/loops_improvement/0026_loop_hooks_follow_ups.md` | next hooks build wave |
-| 0028 | `proposed/loops_improvement/0028_hook_taxonomy_multi_emit.md` | hook consumer report or next loop_hooks contract revision |
-| 0029 | `proposed/loops_improvement/0029_audit_residue_2026_07_13.md` | per-finding (see item); several fold into 0011/0021/0024 |
+| 0029 | `proposed/loops_improvement/0029_audit_residue_2026_07_13.md` | residue: only #9 (0024 green-light) + #10's conclusion-call half (0021) remain |
 | 0030 | `proposed/loops_improvement/0030_capability_and_honesty_residue.md` | per-finding; surgical parts next defect batch, decisions need green-light |
 
 ## Topic tracks
@@ -78,6 +74,9 @@ default-model and max_tokens decisions.)
 
 | Date | ID | Item | Outcome |
 |---|---|---|---|
+| 2026-07-15 | 0028 | `completed/loops_improvement/0028_hook_taxonomy_multi_emit.md` | Substance shipped in the 2026-07-14 batch-4 contract wave (one turn_end per turn, per-turn report resets, parse common core, RENAMED_STEPS); promoted at this pass per its own execution note. |
+| 2026-07-15 | 0026 | `completed/loops_improvement/0026_loop_hooks_follow_ups.md` | Hooks parity + terminal honesty: `init` and `parse_tool_calls` (→ canonical `tool_proposed`) now fire on all three loops; the vacuous mutation pin rewritten as a vandal-handler pin (act payload's live `args` covered); true terminals emit `inbox_undelivered` for durable-inbox guidance that landed after the last drain (entries preserved, never consumed; composition handoffs exempt). Inventory + docs/hooks.md updated. Suite 233/2. |
+| 2026-07-14 | 0011 | `completed/loops_improvement/0011_sibling_transcript_repair_strict_providers.md` | Sibling transcripts satisfy strict providers via EXTRACTION: ReAct's proven pipeline moved to shared `adapters/transcripts.py` (durable `tool_calls` preservation, orphan repair both directions), all three adapters delegate; ReAct byte-identical (prefix pins as harness); latent foreign-id class fixed. Pins in `test_sibling_strict_transcripts_0011.py`. Suite 221. |
 | 2026-07-13 | 0027 | `completed/loops_improvement/0027_review_failure_degrades_to_accept.md` | Verifier failure contained in both forks via runtime `_absorb_failure`: held answer accepted, run completes, loud #FALLBACK (scratchpad marker + report line + `review_skipped` emit). Agent half of the c1128 review re-default condition; adapter default stays opt-in (flip is abstractcode's, c1139). Suite 144/2. |
 | 2026-07-13 | 0010 | `completed/loops_improvement/0010_codeact_fenced_block_intent_bug.md` | FINAL check precedes fenced extraction (a final answer never executes); fallback flag-gated (`codeact_fenced_fallback`, default ON — deviation reasoned in report: default flip belongs to A1's wave). 3 pins. Suite 156/2. |
 | 2026-07-13 | 0012 | `completed/loops_improvement/0012_sibling_delegate_budget_honesty.md` | CodeAct+MemAct delegate children now honor the shared schema (explicit arg wins; else parent budget, floor 20 — ReAct's ruled resolution mirrored). 8 parametrized pins. |

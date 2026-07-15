@@ -294,6 +294,55 @@ def context_usage_warning(
     }
 
 
+def suppress_loop_tail(runtime_ns: Any) -> bool:
+    """True when the host asked the loop-position tail to stay OUT of payloads.
+
+    c2447 incident (2026-07-15): "[loop] iteration N of M." is task-agent
+    chrome — loop-position awareness for a model working a bounded task. In
+    composed entity visits the adapters' merge branch lands that tail INSIDE
+    the visitor's user message (BRIDGE appends the visitor's words last), so
+    the entity reads it as part of what the human said. Hosts composing these
+    adapters for an entity set `_runtime.suppress_loop_tail` (runtime's
+    BRIDGE, spelling agreed on the incident thread) and the whole tail block
+    — iteration line and [plan] render — stays out. One shared predicate for
+    all three adapters (bool/int/str spellings per the tool-arg coercion
+    lesson); absent/falsy = unchanged task-agent behavior.
+    """
+    if not isinstance(runtime_ns, dict):
+        return False
+    val = runtime_ns.get("suppress_loop_tail")
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return False
+
+
+def prompt_cache_capture(response: Any) -> Optional[Dict[str, Any]]:
+    """The provider's prompt-cache telemetry struct from an LLM result dict.
+
+    0030 residue (gate lifted 2026-07-15): core's local-cache providers record
+    per-call cache telemetry into `GenerateResponse.metadata["prompt_cache"]`
+    (`mode`, `key`, `outcome`, `cached_tokens`, `fed_tokens`, and a
+    `#FALLBACK`-prefixed `degraded_reason` when the reuse degraded); the
+    runtime's llm_client folds `metadata` into every LLM result dict. This
+    helper lifts the struct for the parse emit — an ADDITIVE payload key,
+    present only when the provider reported one (remote providers and older
+    stacks simply don't carry it). Returns a copy or None; never raises.
+    """
+    if not isinstance(response, dict):
+        return None
+    metadata = response.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    struct = metadata.get("prompt_cache")
+    if not isinstance(struct, dict) or not struct:
+        return None
+    return dict(struct)
+
+
 def verifier_response_schema() -> Dict[str, Any]:
     """Verifier JSON schema shared by the ReAct and CodeAct review nodes.
 

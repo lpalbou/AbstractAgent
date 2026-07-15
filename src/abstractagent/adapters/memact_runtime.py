@@ -16,12 +16,14 @@ from .generation_params import (
     coerce_iterations,
     compose_prompt_slots,
     context_usage_warning,
+    prompt_cache_capture,
     resolve_max_iterations,
     runtime_llm_params,
+    suppress_loop_tail,
 )
 from .media import extract_media_from_context
 from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
-from .loop_hooks import LoopHooks
+from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .tool_allowlist import note_pruned_grants
 from ..logic.memact import MemActLogic
 
@@ -194,6 +196,14 @@ def create_memact_workflow(
         if dropped:
             emit("hook_steer_discarded", {"count": dropped})
 
+    def _note_undelivered_inbox_at_terminal(runtime_ns: Dict[str, Any]) -> None:
+        """Conclude-phase drain honesty (0026): durable-inbox guidance that
+        landed after the loop's last drain (e.g. during the finalize call)
+        can no longer influence this run — emit loudly instead of completing
+        over it silently. Entries stay in the durable vars."""
+        stats = undelivered_inbox_stats(runtime_ns)
+        if stats:
+            emit("inbox_undelivered", stats)
 
     def _current_tool_defs() -> list[Any]:
         defs = getattr(logic, "tools", None)
@@ -596,8 +606,10 @@ def create_memact_workflow(
         # Volatile loop position rides a trailing ephemeral message, never the
         # system prompt (0212 propagated, fable5 2026-07-13 — the head counter
         # busted the prefix cache every cycle). Adjacency guard mirrors ReAct.
-        tail_text = f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}."
-        if isinstance(payload.get("messages"), list):
+        # `_runtime.suppress_loop_tail` (c2447): loop tails are task-agent
+        # chrome — entity-lane hosts suppress the tail (ReAct/CodeAct parity).
+        tail_text = "" if suppress_loop_tail(runtime_ns) else f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}."
+        if tail_text and isinstance(payload.get("messages"), list):
             msgs_out = list(payload["messages"])
             if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
                 last = dict(msgs_out[-1])
@@ -633,14 +645,16 @@ def create_memact_workflow(
 
         # COMMON CORE parse payload (0028 contract wave, 2026-07-14): every
         # loop guarantees has_tool_calls + tool_calls + content_preview.
-        emit(
-            "parse",
-            {
-                "has_tool_calls": bool(tool_calls),
-                "tool_calls": [{"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls],
-                "content_preview": (str(content or "")[:200] if content else "(no content)"),
-            },
-        )
+        parse_payload: Dict[str, Any] = {
+            "has_tool_calls": bool(tool_calls),
+            "tool_calls": [{"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls],
+            "content_preview": (str(content or "")[:200] if content else "(no content)"),
+        }
+        # Additive cache observability (0030 residue, 2026-07-15).
+        cache_struct = prompt_cache_capture(response)
+        if cache_struct is not None:
+            parse_payload["prompt_cache"] = cache_struct
+        emit("parse", parse_payload)
 
         if tool_calls:
             # Durable tool_calls preservation (0011): the assistant turn that
@@ -656,6 +670,9 @@ def create_memact_workflow(
                 )
             )
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
+            # tool_proposed on all three loops (0026 follow-up, 2026-07-15):
+            # the canonical commit signal, same raw step + payload as ReAct.
+            emit("parse_tool_calls", {"count": len(tool_calls)})
             return StepPlan(node_id="parse", next_node="act")
 
         # Tool-free: draft answer becomes input to the envelope finalization call.
@@ -1215,7 +1232,7 @@ def create_memact_workflow(
         return StepPlan(node_id="finalize_parse", next_node="done")
 
     def done_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, temp, limits = ensure_memact_vars(run)
+        context, scratchpad, runtime_ns, temp, limits = ensure_memact_vars(run)
         answer = str(temp.get("final_answer") or "No answer provided")
         emit("done", {"answer": answer, "outcome": "final_answer"})
 
@@ -1230,6 +1247,7 @@ def create_memact_workflow(
                 messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer"}))
 
         _discard_hook_steering_at_terminal()
+        _note_undelivered_inbox_at_terminal(runtime_ns)
         return StepPlan(
             node_id="done",
             complete_output={
@@ -1245,7 +1263,7 @@ def create_memact_workflow(
         )
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, _, limits = ensure_memact_vars(run)
+        context, scratchpad, runtime_ns, _, limits = ensure_memact_vars(run)
         max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
@@ -1272,6 +1290,7 @@ def create_memact_workflow(
             messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer", "budget_exhausted": True}))
             context["messages"] = messages
         _discard_hook_steering_at_terminal()
+        _note_undelivered_inbox_at_terminal(runtime_ns)
         return StepPlan(
             node_id="max_iterations",
             complete_output={

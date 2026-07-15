@@ -17,13 +17,15 @@ from .generation_params import (
     coerce_verifier_tool_arguments,
     compose_prompt_slots,
     context_usage_warning,
+    prompt_cache_capture,
     resolve_max_iterations,
     runtime_llm_params,
+    suppress_loop_tail,
     verifier_response_schema,
 )
 from .media import extract_media_from_context
 from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
-from .loop_hooks import LoopHooks
+from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .tool_allowlist import note_pruned_grants
 from ..logic.codeact import CodeActLogic
 
@@ -199,6 +201,15 @@ def create_codeact_workflow(
         dropped = hooks.discard_run(hooks.current_run_id())
         if dropped:
             emit("hook_steer_discarded", {"count": dropped})
+
+    def _note_undelivered_inbox_at_terminal(runtime_ns: Dict[str, Any]) -> None:
+        """Conclude-phase drain honesty (0026): durable-inbox guidance that
+        landed after the loop's last drain can no longer influence this run —
+        emit loudly instead of completing over it silently. Entries stay in
+        the durable vars (the record shows what missed)."""
+        stats = undelivered_inbox_stats(runtime_ns)
+        if stats:
+            emit("inbox_undelivered", stats)
 
 
     def _current_tool_defs() -> list[ToolDefinition]:
@@ -571,16 +582,20 @@ def create_codeact_workflow(
         # local servers). Adjacency guard mirrors ReAct: merge into a trailing
         # user message; else append flagged `volatile: True` (runtime excludes
         # flagged messages from the cache fingerprint and strips the key).
-        tail_parts: list[str] = [f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}."]
-        if _flag(runtime_ns, "plan_mode", default=False):
-            plan_text = scratchpad.get("plan")
-            if isinstance(plan_text, str) and plan_text.strip():
-                plan_render = plan_text.strip()
-                _plan_cap = 4000
-                if len(plan_render) > _plan_cap:
-                    #[WARNING:TRUNCATION] bounded plan render in the trailing loop message
-                    plan_render = plan_render[:_plan_cap].rstrip() + f"\n… (plan truncated, {len(plan_text.strip()):,} chars total)"
-                tail_parts.append(f"[plan]\n{plan_render}")
+        # `_runtime.suppress_loop_tail` (c2447): loop tails are task-agent
+        # chrome — entity-lane hosts suppress the whole block (ReAct parity).
+        tail_parts: list[str] = []
+        if not suppress_loop_tail(runtime_ns):
+            tail_parts.append(f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}.")
+            if _flag(runtime_ns, "plan_mode", default=False):
+                plan_text = scratchpad.get("plan")
+                if isinstance(plan_text, str) and plan_text.strip():
+                    plan_render = plan_text.strip()
+                    _plan_cap = 4000
+                    if len(plan_render) > _plan_cap:
+                        #[WARNING:TRUNCATION] bounded plan render in the trailing loop message
+                        plan_render = plan_render[:_plan_cap].rstrip() + f"\n… (plan truncated, {len(plan_text.strip()):,} chars total)"
+                    tail_parts.append(f"[plan]\n{plan_render}")
         tail_text = "\n\n".join(tail_parts).strip()
         if tail_text and isinstance(payload.get("messages"), list):
             msgs_out = list(payload["messages"])
@@ -637,17 +652,19 @@ def create_codeact_workflow(
         # loop guarantees has_tool_calls + tool_calls + content_preview (200
         # chars); extras are loop-specific additions (has_code is CodeAct's).
         # Preview bound unified 100 -> 200 (declared in hooks.md).
-        emit(
-            "parse",
-            {
-                "has_tool_calls": bool(tool_calls),
-                "tool_calls": [
-                    {"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls
-                ],
-                "content_preview": (content[:200] if content else "(no content)"),
-                "has_code": bool(fenced_code),
-            },
-        )
+        parse_payload: Dict[str, Any] = {
+            "has_tool_calls": bool(tool_calls),
+            "tool_calls": [
+                {"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls
+            ],
+            "content_preview": (content[:200] if content else "(no content)"),
+            "has_code": bool(fenced_code),
+        }
+        # Additive cache observability (0030 residue, 2026-07-15).
+        cache_struct = prompt_cache_capture(response)
+        if cache_struct is not None:
+            parse_payload["prompt_cache"] = cache_struct
+        emit("parse", parse_payload)
 
         if tool_calls:
             # A non-empty reply ends the CONSECUTIVE-empty streak (fable5 P1
@@ -672,6 +689,11 @@ def create_codeact_workflow(
                 if isinstance(updated, str) and updated.strip():
                     scratchpad["plan"] = updated.strip()
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
+            # tool_proposed on all three loops (0026 follow-up, 2026-07-15):
+            # the canonical commit signal, same raw step + payload as ReAct.
+            # The fenced-code path deliberately stays out — no tool batch is
+            # proposed there; `parse`'s additive `has_code` carries it.
+            emit("parse_tool_calls", {"count": len(tool_calls)})
             return StepPlan(node_id="parse", next_node="act")
 
         # Empty response is an invalid step: recover with a bounded retry that carries evidence.
@@ -1525,7 +1547,7 @@ def create_codeact_workflow(
         return StepPlan(node_id="review_parse", next_node="reason")
 
     def done_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, temp, limits = ensure_codeact_vars(run)
+        context, scratchpad, runtime_ns, temp, limits = ensure_codeact_vars(run)
         answer = str(temp.get("final_answer") or "No answer provided")
         emit("done", {"answer": answer, "outcome": "final_answer"})
 
@@ -1543,6 +1565,7 @@ def create_codeact_workflow(
                 messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer"}))
 
         _discard_hook_steering_at_terminal()
+        _note_undelivered_inbox_at_terminal(runtime_ns)
         # Loudness parity with ReAct's report line (fable5 P2 2026-07-13): a
         # skipped verifier round must be visible in the RUN OUTPUT, not only in
         # the emit lane — CodeAct's output carried no report, so the #FALLBACK
@@ -1567,7 +1590,7 @@ def create_codeact_workflow(
         return StepPlan(node_id="done", complete_output=complete_output)
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, _, limits = ensure_codeact_vars(run)
+        context, scratchpad, runtime_ns, _, limits = ensure_codeact_vars(run)
 
         # Prefer _limits, fall back to scratchpad
         max_iterations = resolve_max_iterations(limits, scratchpad)
@@ -1598,6 +1621,7 @@ def create_codeact_workflow(
             messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer", "budget_exhausted": True}))
             context["messages"] = messages
         _discard_hook_steering_at_terminal()
+        _note_undelivered_inbox_at_terminal(runtime_ns)
         return StepPlan(
             node_id="max_iterations",
             complete_output={
