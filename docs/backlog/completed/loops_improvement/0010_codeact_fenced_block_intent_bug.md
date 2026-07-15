@@ -2,8 +2,8 @@
 
 ## Metadata
 - Created: 2026-07-12
-- Status: Planned
-- Completed: N/A
+- Status: Completed
+- Completed: 2026-07-13
 - Proposal ID: A4
 
 ## ADR status
@@ -53,6 +53,29 @@ the block NOT executed; (b) flag-on, non-final reply with a fenced block
 executes exactly as today.
 
 ## Progress checklist
-- [ ] Reorder final-answer check before extraction
-- [ ] Flag-gate the fenced fallback
-- [ ] Two tests + changelog
+- [x] Reorder final-answer check before extraction
+- [x] Flag-gate the fenced fallback
+- [x] Two tests + changelog (three shipped: FINAL-never-executes, default
+      path unchanged, flag-off disables)
+
+## Completion report
+- Date: 2026-07-13
+- Outcome: parse_node reordered — FINAL detection precedes extraction (the
+  security defect: a final answer never executes anything); fenced extraction
+  gated on `_runtime.codeact_fenced_fallback`.
+- DELIBERATE DEVIATION from the item's clause (2), on the record: the flag
+  DEFAULT is ON, not off. The shipped CodeAct system prompt actively teaches
+  the fence ("call `execute_python` (preferred) or output a fenced ```python
+  block") — a default-off flag would ship a loop whose own prompt teaches a
+  convention its parser ignores, silently breaking every prompted-model
+  CodeAct user inside a "trivial defect batch". That default flip is exactly
+  proposal 0014 (A1, native-primary path), which awaits its green-light; when
+  A1 lands, the prompt and the default flip together in one coherent wave.
+  The validation clause "(b) flag-on ... executes exactly as today" is
+  satisfied verbatim; clause (3) (never extract without action intent) is
+  satisfied for the discriminable case (FINAL) — under the loop's own taught
+  convention, a non-final fenced block IS the action signal, and guessing
+  intent beyond the marker would be prose-parsing (the class this workspace
+  forbids at render).
+- Validation: tests/test_sibling_loop_defects_batch.py (3 pins); full suite
+  156 passed / 2 skipped.

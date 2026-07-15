@@ -49,9 +49,15 @@ def test_react_max_iterations_triggers_tool_free_conclusion_call() -> None:
                 }
             )
 
+        # B-F7 (2026-07-13): the conclusion directive rides a TRAILING message
+        # (volatile-tail pattern), never the system prompt — appending it to the
+        # system prompt forced a full re-prefill under the same cache key.
         sys = str(payload.get("system_prompt") or "")
-        assert "Max iterations reached" in sys or "max iterations" in sys.lower()
-        assert "Do NOT call tools" in sys or "do not call tools" in sys.lower()
+        assert "Max iterations reached" not in sys
+        msgs = payload.get("messages") or []
+        tail = str(msgs[-1].get("content") or "") if msgs else str(payload.get("prompt") or "")
+        assert "Max iterations reached" in tail
+        assert "Do NOT call tools" in tail or "do not call tools" in tail.lower()
         return EffectOutcome.completed({"content": "FINAL REPORT", "tool_calls": [], "finish_reason": "stop"})
 
     def tool_handler(run: RunState, effect: Effect, default_next_node: Optional[str]) -> EffectOutcome:

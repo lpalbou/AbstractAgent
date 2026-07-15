@@ -42,6 +42,36 @@ OPEN_ATTACHMENT_TOOL = ToolDefinition(
     ),
 )
 
+# Progressive disclosure for attached skills (0030 promoted 2026-07-14, the
+# open_attachment precedent): the host attaches a skills INDEX via
+# `_runtime.skills_block` (names + one-line descriptions only — the cache
+# contract keeps the block small and byte-stable), and the model activates a
+# skill on demand by reading its full body through this tool. SCHEMA-ONLY in
+# this package: execution is HOST-OWNED (the tool executor must map
+# `read_skill` to its skill shelf — abstractskill's select/read surface, the
+# gateway's resolved_tree_hashes lane, or a local directory). Deliberately NOT
+# in any default tool list: exposing it without a skills_block (or without an
+# executor) manufactures dead calls — hosts opt in with both halves together
+# (see docs/skills-attachment.md).
+READ_SKILL_TOOL = ToolDefinition(
+    name="read_skill",
+    description=(
+        "Read the full body of an attached skill by name (progressive disclosure: the system prompt "
+        "lists available skills; this loads one on demand)."
+    ),
+    parameters={
+        "name": {
+            "type": "string",
+            "description": "Exact skill name as listed under 'Available skills:' in the system prompt.",
+        },
+        "max_chars": {"type": "integer", "description": "Maximum characters to return (default 16000).", "default": 16000},
+    },
+    when_to_use=(
+        "Use when a listed skill looks relevant to the current task and you need its full instructions. "
+        "Only names listed under 'Available skills:' exist; do not guess names."
+    ),
+)
+
 RECALL_MEMORY_TOOL = ToolDefinition(
     name="recall_memory",
     description="Recall archived memory spans with provenance (by span_id/query/tags/time range).",
@@ -315,6 +345,16 @@ DELEGATE_AGENT_TOOL = ToolDefinition(
             "description": (
                 "Iteration budget for the delegated agent (optional). "
                 "When omitted, the delegated agent inherits the parent's budget (min 20)."
+            ),
+            "default": None,
+        },
+        "substrate": {
+            "type": "string",
+            "description": (
+                "Named substrate profile for the delegated agent (optional). Must be one of the "
+                "names the HOST granted via `_runtime.delegate_substrates`; unknown names fail "
+                "loudly. When omitted, the child inherits the parent's provider/model. "
+                "Never accepts raw provider/model strings — the palette is host-gated by design."
             ),
             "default": None,
         },

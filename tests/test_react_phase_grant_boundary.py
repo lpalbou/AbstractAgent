@@ -19,9 +19,9 @@ Pinned:
 - default grants (no policy file) offer exactly the resolver's set for every
   ruled phase, tuple-shaped input accepted natively;
 - sleep's ruled default is strictly narrower than visit and diary-free;
-- a narrow `tasked` policy file arrives NARROW on both channels — never a
+- a narrow `work` policy file arrives NARROW on both channels — never a
   permissive fallthrough to the full set (N8's consumer half) — and the
-  maximal-narrow word (`tasked: []` -> `tools=()`) arrives as DENY-ALL;
+  maximal-narrow word (`work: []` -> `tools=()`) arrives as DENY-ALL;
 - the TOOL_CALLS execution payload carries the SAME allowlist as the offer
   (execution is the second half of consumption — the door's executor
   intersects against it);
@@ -179,11 +179,11 @@ def test_sleep_default_is_narrower_than_visit_and_carries_no_diary(tmp_path: Pat
     assert not {"diary_list", "diary_read", "write_file"} & set(_offered(offered_sleep[0]))
 
 
-def test_narrow_tasked_policy_file_arrives_narrow_on_both_channels(tmp_path: Path) -> None:
-    """N8 consumer half: a policy file narrowing `tasked` must be CONSULTED —
-    the adapter offers exactly the file's word, never the full default set.
-    Pinned on BOTH consumption channels (run vars = the plan's destination;
-    factory param = the shipped door's channel today)."""
+def test_narrow_work_policy_file_arrives_narrow_on_both_channels(tmp_path: Path) -> None:
+    """N8 consumer half: a policy file narrowing the `work` phase must be
+    CONSULTED — the adapter offers exactly the file's word, never the full
+    default set. Pinned on BOTH consumption channels (run vars = the plan's
+    destination; factory param = the shipped door's channel today)."""
     home = tmp_path / "home"
     home.mkdir()
     # Deliberately NOT in canonical registry order: the resolver reorders the
@@ -212,7 +212,7 @@ def test_narrow_tasked_policy_file_arrives_narrow_on_both_channels(tmp_path: Pat
 
 
 def test_empty_policy_word_arrives_as_deny_all_never_falls_open(tmp_path: Path) -> None:
-    """The file's maximal-narrow word: `tasked: []` resolves to `tools=()`
+    """The file's maximal-narrow word: `work: []` resolves to `tools=()`
     and MUST arrive as deny-all (zero specs offered) — the truthiness
     fall-open class (`() or default`) is exactly what this pins against."""
     home = tmp_path / "home"

@@ -67,13 +67,33 @@ class MemActAgent(BaseAgent):
         hooks: Optional[LoopHooks] = None,
         max_iterations: int = 20,
         max_history_messages: int = -1,
+        # max_tokens = the context ACCOUNTING ceiling (drives warn_tokens_pct /
+        # context_warning), NOT an output cap. For an output-token cap use
+        # max_output_tokens (fable5 B-F9 honesty split, 2026-07-13).
         max_tokens: Optional[int] = None,
-        plan_mode: bool = False,
-        review_mode: bool = False,
-        review_max_rounds: int = 1,
+        max_output_tokens: Optional[int] = None,
         actor_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        # DEPRECATED-IGNORED (backlog 0013 / C4): MemAct never had plan or
+        # review nodes, so these were accepted-and-ignored — the silent
+        # fall-open class. The 0013 hard removal (TypeError) broke shipped
+        # abstractcode agent-switch call sites (regression adversary P0,
+        # 2026-07-13), so a one-release shim warns loudly on non-default
+        # values and ignores the legacy defaults. Removal lands next release;
+        # MemAct verifier parity stays a deliberate non-goal.
+        plan_mode: Optional[bool] = None,
+        review_mode: Optional[bool] = None,
+        review_max_rounds: Optional[int] = None,
     ):
+        if plan_mode or review_mode or (review_max_rounds is not None and int(review_max_rounds) != 3):
+            import warnings
+
+            warnings.warn(
+                "MemActAgent has no plan/review nodes — plan_mode/review_mode/review_max_rounds "
+                "are deprecated-ignored (no-ops; removal next release)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.hooks = hooks
         self._max_iterations = int(max_iterations)
         if self._max_iterations < 1:
@@ -82,11 +102,7 @@ class MemActAgent(BaseAgent):
         if self._max_history_messages != -1 and self._max_history_messages < 1:
             self._max_history_messages = 1
         self._max_tokens = max_tokens
-        self._plan_mode = bool(plan_mode)
-        self._review_mode = bool(review_mode)
-        self._review_max_rounds = int(review_max_rounds)
-        if self._review_max_rounds < 0:
-            self._review_max_rounds = 0
+        self._max_output_tokens = max_output_tokens
 
         self.logic: Optional[MemActLogic] = None
         self.session_active_memory: Optional[Dict[str, Any]] = None
@@ -111,11 +127,7 @@ class MemActAgent(BaseAgent):
             DELEGATE_AGENT_TOOL,
             *tool_defs,
         ]
-        logic = MemActLogic(
-            tools=tool_defs,
-            max_history_messages=self._max_history_messages,
-            max_tokens=self._max_tokens,
-        )
+        logic = MemActLogic(tools=tool_defs)
         self.logic = logic
         return create_memact_workflow(logic=logic, on_step=self.on_step, hooks=self.hooks)
 
@@ -134,13 +146,14 @@ class MemActAgent(BaseAgent):
         self,
         task: str,
         *,
-        plan_mode: Optional[bool] = None,
-        review_mode: Optional[bool] = None,
-        review_max_rounds: Optional[int] = None,
         allowed_tools: Optional[List[str]] = None,
         temperature: Optional[float] = None,
         seed: Optional[int] = None,
         attachments: Optional[List[Any]] = None,
+        # Named system-prompt slots (docs/skills-attachment.md); byte-stable
+        # for the run (cache prefix).
+        skills_block: Optional[str] = None,
+        system_prompt_extra: Optional[str] = None,
     ) -> str:
         task = str(task or "").strip()
         if not task:
@@ -163,21 +176,29 @@ class MemActAgent(BaseAgent):
             max_tokens_override = None
         if isinstance(max_tokens_override, int) and max_tokens_override > 0:
             limits["max_tokens"] = max_tokens_override
-        if not isinstance(limits.get("max_tokens"), int) or int(limits.get("max_tokens") or 0) <= 0:
-            limits["max_tokens"] = 32768
-
-        eff_plan_mode = self._plan_mode if plan_mode is None else bool(plan_mode)
-        eff_review_mode = self._review_mode if review_mode is None else bool(review_mode)
-        eff_review_max_rounds = self._review_max_rounds if review_max_rounds is None else int(review_max_rounds)
-        if eff_review_max_rounds < 0:
-            eff_review_max_rounds = 0
+        # No facade-level ceiling fallback (operator ruling 2026-07-13,
+        # "overengineering"): the accounting ceiling is the RUNTIME'S to
+        # default (config -> model registry -> DEFAULT_MAX_TOKENS inside
+        # to_limits_dict, and again at its own read sites). A facade literal
+        # was a third copy that fired only when the runtime lookup failed —
+        # fabricating a warning threshold unrelated to any real window in
+        # exactly the case where nothing is known. Missing ceiling = the
+        # context_warning stays silent, which is the honest signal.
+        # Output cap: the honest name (max_tokens above is accounting-only).
+        try:
+            out_cap = int(self._max_output_tokens) if self._max_output_tokens is not None else None
+        except Exception:
+            out_cap = None
+        if isinstance(out_cap, int) and out_cap > 0:
+            limits["max_output_tokens"] = out_cap
 
         runtime_ns: Dict[str, Any] = {
             "inbox": [],
-            "plan_mode": eff_plan_mode,
-            "review_mode": eff_review_mode,
-            "review_max_rounds": eff_review_max_rounds,
         }
+        if isinstance(skills_block, str) and skills_block.strip():
+            runtime_ns["skills_block"] = skills_block
+        if isinstance(system_prompt_extra, str) and system_prompt_extra.strip():
+            runtime_ns["system_prompt_extra"] = system_prompt_extra
         if temperature is not None:
             try:
                 runtime_ns["temperature"] = float(temperature)
@@ -241,13 +262,17 @@ class MemActAgent(BaseAgent):
 
 def create_memact_agent(
     *,
-    provider: str = "ollama",
-    model: str = "qwen3:1.7b-q4_K_M",
+    # None = resolve from AbstractCore config global defaults (set via
+    # `abstractcore --config`); packaged fallback pair applies with a loud
+    # #FALLBACK warning when nothing is configured (B-F8, 2026-07-13).
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
     tools: Optional[List[Callable[..., Any]]] = None,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     max_iterations: int = 20,
     max_history_messages: int = -1,
     max_tokens: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
     llm_kwargs: Optional[Dict[str, Any]] = None,
     run_store: Optional[Any] = None,
     ledger_store: Optional[Any] = None,
@@ -262,6 +287,10 @@ def create_memact_agent(
         from ..tools import ALL_TOOLS
 
         tools = list(ALL_TOOLS)
+
+    from .defaults import resolve_provider_model
+
+    provider, model = resolve_provider_model(provider, model)
 
     runtime = create_local_runtime(
         provider=provider,
@@ -278,6 +307,7 @@ def create_memact_agent(
         max_iterations=max_iterations,
         max_history_messages=max_history_messages,
         max_tokens=max_tokens,
+        max_output_tokens=max_output_tokens,
         actor_id=actor_id,
         session_id=session_id,
     )

@@ -2,8 +2,8 @@
 
 ## Metadata
 - Created: 2026-07-12
-- Status: Planned
-- Completed: N/A
+- Status: Completed
+- Completed: 2026-07-14
 - Proposal ID: C2
 
 ## ADR status
@@ -29,6 +29,14 @@ messages" contract holds). CodeAct and MemAct never received this wave.
 ## Problem
 A functional bug: both sibling loops are broken on the provider class the
 framework treats as first-tier.
+
+Independently re-confirmed by the 2026-07-13 whole-package fable5 audit
+(finding 2), with fresh line evidence: CodeAct parse appends assistant
+messages content-only (~549-557), its sanitizer emits `role:"tool"` +
+`tool_call_id` with no orphan repair (~244-306); MemAct identical
+(~241-274, ~579-585); abstractcore's native OpenAI provider forwards tool
+messages untouched (openai_provider.py:204-211) so nothing downstream
+repairs them. ReAct documents and repairs the exact class.
 
 ## What we want to do
 Port ReAct's assistant-tool_calls preservation + orphan repair to both
@@ -56,3 +64,14 @@ entry in the sanitized payload.
 - [ ] Preserve assistant tool_calls in sibling transcripts
 - [ ] Port orphan repair
 - [ ] Tests + changelog
+
+## Execution notes (2026-07-14, batch 8)
+Executed via the preferred EXTRACTION: `src/abstractagent/adapters/transcripts.py`
+now owns the pipeline (assistant `tool_calls` payload building, sanitization,
+orphan repair both directions, adjacent-user merge); all three adapters
+delegate. Sibling parse nodes append assistant messages WITH `tool_calls`
+metadata; truncation bounds ride in as a hook. ReAct byte-identical (prefix
+pins as the regression harness). Bonus find: foreign-id tool messages inside
+an answering run (latent in ReAct's original) now fold to inert user notes.
+Pinned in `tests/test_sibling_strict_transcripts_0011.py`. If 0021 lands, the
+shared module IS its transcript slice.

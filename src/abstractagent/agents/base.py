@@ -7,10 +7,13 @@ All agent types (ReAct, CodeAct, etc.) inherit from BaseAgent to get:
 - Common lifecycle methods
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractruntime import Runtime, RunState, RunStatus, WorkflowSpec
+
+logger = logging.getLogger(__name__)
 
 
 class BaseAgent(ABC):
@@ -170,8 +173,36 @@ class BaseAgent(ABC):
         state = self.step()
         while state.status == RunStatus.RUNNING:
             state = self.step()
-        
+
+        self._discard_hook_steering_if_dead(state)
         return state
+
+    def _discard_hook_steering_if_dead(self, state: Optional[RunState]) -> None:
+        """Drop queued hook steering for a run that reached a DEAD status.
+
+        0029 #14: the adapters discard at their done/max_iterations terminal
+        NODES, but a run that terminates by FAILURE (or cancellation) never
+        executes a terminal node — its queued steering leaked in the host's
+        LoopHooks._pending forever (memory-only rot on long-lived hosts).
+        The facade sees every terminal status, so it is the deterministic
+        discard point for the paths no node covers.
+        """
+        if state is None or state.status not in (RunStatus.FAILED, RunStatus.CANCELLED):
+            return
+        hooks = getattr(self, "hooks", None)
+        discard = getattr(hooks, "discard_run", None)
+        if callable(discard):
+            try:
+                dropped = discard(str(state.run_id))
+                if dropped:
+                    logger.warning(
+                        "#FALLBACK dropped %d undelivered hook steering injection(s) for %s run %s",
+                        dropped,
+                        state.status.value,
+                        state.run_id,
+                    )
+            except Exception:
+                pass
     
     def get_state(self) -> Optional[RunState]:
         """Get current agent state.
@@ -291,6 +322,7 @@ class BaseAgent(ABC):
         )
         if state2.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
             self._sync_session_caches_from_state(state2)
+        self._discard_hook_steering_if_dead(state2)
         return state2
     
     def attach(self, run_id: str) -> RunState:

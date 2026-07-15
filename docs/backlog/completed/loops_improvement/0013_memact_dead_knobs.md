@@ -2,8 +2,8 @@
 
 ## Metadata
 - Created: 2026-07-12
-- Status: Planned
-- Completed: N/A
+- Status: Completed
+- Completed: 2026-07-13
 - Proposal ID: C4
 
 ## ADR status
@@ -42,6 +42,25 @@ Constructor test: passing review_mode/plan_mode raises (or the params are gone
 and mypy/tests confirm no references).
 
 ## Progress checklist
-- [ ] Remove or raise
-- [ ] docs/agents.md alignment
-- [ ] Test + changelog
+- [x] Remove or raise
+- [x] docs/agents.md alignment
+- [x] Test + changelog
+
+## Completion report
+- Date: 2026-07-13
+- Outcome: REMOVED (the preferred shape) — `plan_mode`/`review_mode`/
+  `review_max_rounds` deleted from `MemActAgent.__init__` and `start()`, the
+  `_runtime` entries no longer written. Passing any of them raises TypeError
+  (the raise-or-delete requirement satisfied by the signature itself).
+  Verified pre-removal: zero reads in memact_runtime.py AND logic/memact.py
+  (grep clean — all three genuinely dead, not just the review pair).
+- docs/agents.md: the stale line 41 ("ReAct ... does not apply them")
+  replaced with the accurate split — review_mode HONORED by the ReAct
+  verifier (0217) with 0027 failure containment; plan_mode stored-but-unread
+  by the ReAct adapter (plan rides the always-on update_plan tool +
+  check_plan gate); MemAct section documents the removal. Note for backlog
+  0024 (dead-surface pruning): ReactAgent's own `plan_mode` param is the same
+  accepted-but-unread class — named there, out of this item's scope.
+- Validation: TypeError pins + a source-level no-live-reference check in
+  tests/test_sibling_loop_defects_batch.py; full suite 156 passed / 2
+  skipped.

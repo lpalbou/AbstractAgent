@@ -18,7 +18,9 @@ If you are new to the stack, start with [`docs/getting-started.md`](getting-star
 - **Agents (ReAct / CodeAct / MemAct)**: [`docs/agents.md`](agents.md)
 - **Tools and allowlists**: [`docs/tools.md`](tools.md)
 - **Loop hooks (listen / steer / capture)**: [`docs/hooks.md`](hooks.md)
+- **Skills attachment + system-prompt slots**: [`docs/skills-attachment.md`](skills-attachment.md)
 - **State + persistence (pause/resume)**: [`docs/persistence.md`](persistence.md)
+- **Queued work (task after task)**: `reset_react_task` — see the "Task reset" section in [`docs/api.md`](api.md)
 
 ## Deep dives
 

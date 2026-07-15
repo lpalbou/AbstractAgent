@@ -19,7 +19,7 @@ def test_extract_code_from_python_block() -> None:
 
 
 def test_build_request_includes_codeact_instructions() -> None:
-    logic = CodeActLogic(tools=[execute_python._tool_definition], max_history_messages=-1, max_tokens=123)
+    logic = CodeActLogic(tools=[execute_python._tool_definition])
     req = logic.build_request(
         task="Compute something",
         messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],

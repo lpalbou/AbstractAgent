@@ -23,14 +23,35 @@ class MemActLogic:
         self,
         *,
         tools: List[ToolDefinition],
-        max_history_messages: int = -1,
+        max_history_messages: Optional[int] = None,
         max_tokens: Optional[int] = None,
     ):
+        # max_history_messages/max_tokens are DEPRECATED-IGNORED (fable5 B-F9
+        # 2026-07-13): they were always accepted-and-ignored here (the dead-knob
+        # class) — window policy lives in _limits, output caps in
+        # _limits.max_output_tokens. A hard TypeError removal broke shipped
+        # abstractcode call sites (regression adversary P0, same day), so the
+        # one-release shim warns loudly on MEANINGFUL values and ignores the
+        # legacy no-op spellings (None / -1). Removal lands next release.
+        if max_history_messages is not None and max_history_messages != -1:
+            import warnings
+
+            warnings.warn(
+                "max_history_messages on the Logic constructor was never applied and is "
+                "deprecated-ignored; window policy lives in _limits (removal next release)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if max_tokens is not None:
+            import warnings
+
+            warnings.warn(
+                "max_tokens on the Logic constructor was never applied and is "
+                "deprecated-ignored; use the agent facades' max_output_tokens (removal next release)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._tools = list(tools)
-        self._max_history_messages = int(max_history_messages)
-        if self._max_history_messages != -1 and self._max_history_messages < 1:
-            self._max_history_messages = 1
-        self._max_tokens = max_tokens
 
     @property
     def tools(self) -> List[ToolDefinition]:
@@ -64,8 +85,12 @@ class MemActLogic:
         if isinstance(max_output_tokens, int) and max_output_tokens > 0:
             output_budget_line = f"- Output token limit for this response: {max_output_tokens}.\n"
 
+        # Cache stability (0212 propagated 2026-07-13): the iteration counter
+        # is NOT rendered here — it mutated the system-prompt head every cycle
+        # and busted the provider prefix cache; the adapter carries loop
+        # position in a trailing volatile message instead.
+        _ = iteration
         system_prompt = (
-            f"Iteration: {int(iteration)}/{int(max_iterations)}\n\n"
             "You are an autonomous MemAct agent.\n"
             "Taking action / having an effect means calling a tool.\n\n"
             "Rules:\n"

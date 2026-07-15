@@ -24,7 +24,7 @@ Architecture overview: [`docs/architecture.md`](architecture.md)
 
 - Use **ReAct** if you want a tool-first loop that decides when to call tools and stops when the model emits **no tool calls**.
   Entry points: `create_react_agent()` / `ReactAgent` in `src/abstractagent/agents/react.py`.
-- Use **CodeAct** if the task is primarily Python-centric: fenced ` ```python ... ``` ` blocks are executed via `execute_python`.
+- Use **CodeAct** if the task is primarily Python-centric: code runs via `execute_python` tool calls; on prompted-tools models, fenced ` ```python ... ``` ` blocks are also extracted and executed (capability-conditional — see `codeact_fenced_fallback` in docs/agents.md).
   Entry points: `create_codeact_agent()` / `CodeActAgent` in `src/abstractagent/agents/codeact.py`.
 - Use **MemAct** if you need runtime-owned “Active Memory” in addition to the transcript/tool loop.
   Entry points: `create_memact_agent()` / `MemActAgent` in `src/abstractagent/agents/memact.py`.
@@ -46,6 +46,40 @@ agent = create_react_agent(
     llm_kwargs={"base_url": "http://localhost:1234/v1"},
 )
 ```
+
+## How do I run an agent unattended (no human watching)?
+
+Use the packaged recipe — it excludes `ask_user` (which would park the run on a
+human wait) and sets the no-questions directive. Raw-workflow hosts (the `run_vars`
+you pass to `runtime.start(...)`):
+
+```python
+from abstractagent.agents.unattended import unattended_runtime_overrides
+
+run_vars["_runtime"].update(unattended_runtime_overrides(base_allowlist=my_tools))
+```
+
+Facade users get both halves through `start(...)`:
+
+```python
+from abstractagent.agents.unattended import UNATTENDED_DIRECTIVE, unattended_allowlist
+
+agent.start(task, allowed_tools=unattended_allowlist(my_tools),
+            system_prompt_extra=UNATTENDED_DIRECTIVE)
+```
+
+## Can a delegated sub-agent run on a different model?
+
+Only if the HOST grants it: set `_runtime.delegate_substrates = {"name": {"provider": ..., "model": ..., "description": ...}}`
+and the model may pass `substrate="name"` to `delegate_agent` (granted names +
+descriptions are rendered into the system prompt so the model can see what it
+may ask for). Unknown names fail as loud tool errors; raw provider/model strings
+in tool args are structurally impossible (a model choosing its own substrate
+would be self-escalation). The palette AUTHORITY never propagates to
+grandchildren (each level needs its own grant), though the resolved
+provider/model do cascade to the child's own delegations like any inherited
+substrate. Without a palette, children inherit the parent's
+provider/model/temperature/seed/thinking/output-cap.
 
 ## How do I add my own tools?
 
@@ -117,6 +151,37 @@ Example: [`docs/getting-started.md`](getting-started.md)
 - Per-agent defaults are set at agent construction (`max_iterations`, etc.) and seeded into `vars["_limits"]` in `start(...)`.
   See: `src/abstractagent/agents/react.py`, `src/abstractagent/agents/codeact.py`, `src/abstractagent/agents/memact.py`.
 - `ReactAgent` and `CodeActAgent` also expose `update_limits(...)` to change limits mid-run.
+
+## What happens when a long run exceeds the model's context window?
+
+Honestly: **nothing compacts or trims by default.** ReAct deliberately sends the full transcript
+every cycle (that is its design; MemAct's memory blocks ride *on top of* the full transcript unless
+spans are archived). When the transcript outgrows the model window:
+
+- **OpenAI-compatible servers** (LM Studio, vLLM, …) return a deterministic 400 — the run FAILS
+  loudly mid-loop.
+- **Ollama** (the factory default) is the trap: its server default context (~4k) **silently
+  truncates from the oldest content first** — which is the system prompt and tool instructions.
+  The symptom is not an error but an inexplicably degraded agent (tool calls stop, retries churn,
+  the run burns to `max_iterations`). Remedies, either lane:
+  - per-call: `create_react_agent(..., llm_kwargs={"num_ctx": <model max>})` — AbstractCore
+    forwards it to Ollama's `options.num_ctx` (added 2026-07-13 after this FAQ flagged the gap;
+    invalid values raise loudly, absence sends nothing so Modelfile defaults stand);
+  - server-side: `OLLAMA_CONTEXT_LENGTH=<model max> ollama serve` or a Modelfile
+    `PARAMETER num_ctx <model max>`.
+
+  House rule either way: always the MODEL'S MAXIMUM available context unless you explicitly
+  choose otherwise — any fixed number below the model's window is a hidden ceiling that
+  silently kills workflows needing more (the same trap, relocated).
+
+Since 2026-07-13 the loops emit a one-shot `context_warning` step (with `#FALLBACK` marker) when
+estimated usage crosses `warn_tokens_pct` (default 80%) of the `max_tokens` accounting ceiling
+(a second one fires if usage crosses the ceiling itself) — subscribe via `on_step`/hooks.
+Honest scope: the accounting uses the SERVER-REPORTED input tokens of the last call, so on an
+Ollama server that is already truncating, reported usage plateaus at the serving window and the
+warning may never fire — it catches the approach on providers that report true prompt usage
+against the model window (OpenAI-compatible servers), not the Ollama silent-truncation cliff
+itself.
 
 ## How do I set temperature / seed?
 

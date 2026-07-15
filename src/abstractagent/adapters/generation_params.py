@@ -92,12 +92,226 @@ def resolve_max_iterations(
     """
     for source in (limits, scratchpad):
         if isinstance(source, dict) and source.get("max_iterations") is not None:
-            try:
-                value = int(source["max_iterations"])
-            except (TypeError, ValueError):
+            value = coerce_iterations(source["max_iterations"])
+            if value is None:
                 continue
             return value if value >= 1 else 1
     return int(default)
+
+
+# Side-effect classification for the repeat guard (0030 promoted 2026-07-14).
+# ONE classifier, three signals, deny-safe by construction (a misclassified
+# read-only tool only SKIPS re-executing an identical already-succeeded batch):
+# (1) the curated local-name set; (2) the `mcp::` name prefix — MCP tools cross
+# a boundary these loops cannot classify; (3) ToolDefinition.tags, so the day
+# core tags MCP/mutating tools at registration the classifier lights up with
+# zero changes here (origin-READY, not origin-dependent — core's tags field
+# exists today, MCP tagging does not yet).
+SIDE_EFFECT_TOOL_NAMES = frozenset(
+    {
+        "write_file",
+        "edit_file",
+        "execute_command",
+        # fetch_url is never read-only-safe (2026-07-12 finding: the
+        # model-controlled method can POST — remote_write_capable).
+        "fetch_url",
+        # Shell session tools (env-gated toolset; at least as side-effectful
+        # as execute_command).
+        "shell_exec",
+        "shell_write_stdin",
+        "shell_close",
+        # Comms tools (side-effectful; avoid duplicate sends). The agora hub
+        # tools are wired for unattended resident agents — exactly where the
+        # repeat guard matters most (wave-F P2: a repeated identical
+        # agora_post_message batch is the duplicate-send class verbatim).
+        "send_email",
+        "send_whatsapp_message",
+        "send_telegram_message",
+        "send_telegram_artifact",
+        "agora_post_message",
+        "agora_send_dm",
+        "agora_ack_inbox",
+    }
+)
+
+SIDE_EFFECT_TAGS = frozenset({"mcp", "side_effect", "mutating", "write"})
+
+
+def is_side_effect_tool(
+    name: Any,
+    *,
+    tool_tags: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when a tool call may have external side effects.
+
+    `tool_tags` is an optional {tool_name: [tags]} map (built from the logic's
+    ToolDefinitions) — absent or unknown names fall back to the name signals.
+    """
+    n = str(name or "").strip()
+    if not n:
+        return False
+    if n in SIDE_EFFECT_TOOL_NAMES:
+        return True
+    if n.startswith("mcp::"):
+        return True
+    if isinstance(tool_tags, dict):
+        tags = tool_tags.get(n)
+        if isinstance(tags, (list, tuple, set, frozenset)) and any(
+            str(t).strip().lower() in SIDE_EFFECT_TAGS for t in tags
+        ):
+            return True
+    return False
+
+
+def tool_tags_map(tools: Any) -> Dict[str, Any]:
+    """{name: tags} from a list of ToolDefinitions (missing tags -> ())."""
+    out: Dict[str, Any] = {}
+    if isinstance(tools, (list, tuple)):
+        for t in tools:
+            name = getattr(t, "name", None)
+            if isinstance(name, str) and name.strip():
+                out[name.strip()] = tuple(getattr(t, "tags", None) or ())
+    return out
+
+
+# Ordered system-prompt slot table — ONE source for all three adapters
+# (design adversary P1 2026-07-13: the composition was hand-copied into three
+# files, the exact divergence class the system_prompt_extra fix had just paid
+# for). Adding a future slot (phase directives, workspace policy) is one row
+# here, never three parallel edits. Cache contract: slot VALUES must be
+# byte-stable for the run (they live in the provider prefix).
+PROMPT_SLOTS: tuple = (
+    ("skills_block", "Available skills:"),
+    ("system_prompt_extra", "Additional system instructions:"),
+)
+
+#: Palette profile keys the delegate branches understand. Anything else in a
+#: granted profile is version skew and must warn loudly (silent half-applied
+#: grants are the fall-open class).
+DELEGATE_SUBSTRATE_KEYS = frozenset({"provider", "model", "description"})
+
+
+def compose_prompt_slots(base: str, runtime_ns: Optional[Dict[str, Any]]) -> str:
+    """Compose the named `_runtime` prompt slots onto a base system prompt.
+
+    Fixed order per PROMPT_SLOTS (skills before behavioral directives), plus
+    the delegate-substrate self-description: a granted palette the model
+    cannot SEE manufactures dead `substrate=` guesses (the skills-doc argument
+    in reverse), so granted names + host-authored descriptions render into the
+    stable prefix. Provider/model strings deliberately do NOT render — tokens
+    like locale/model names in prompts have flipped behavior before; the name
+    is the model's whole vocabulary, resolution stays host-side.
+    """
+    sys = str(base or "").rstrip()
+    ns = runtime_ns if isinstance(runtime_ns, dict) else {}
+    for key, header in PROMPT_SLOTS:
+        raw = ns.get(key)
+        if isinstance(raw, str) and raw.strip():
+            sys = f"{sys}\n\n{header}\n{raw.strip()}"
+    palette = ns.get("delegate_substrates")
+    if isinstance(palette, dict) and palette:
+        lines: list = []
+        for name in sorted(str(k) for k in palette.keys()):
+            prof = palette.get(name)
+            desc = str(prof.get("description") or "").strip() if isinstance(prof, dict) else ""
+            lines.append(f"- {name}" + (f": {desc}" if desc else ""))
+        if lines:
+            sys = (
+                f"{sys}\n\nAvailable delegate substrates (optional `substrate` argument to delegate_agent):\n"
+                + "\n".join(lines)
+            )
+    return sys.strip()
+
+
+def context_usage_warning(
+    limits: Optional[Dict[str, Any]],
+    scratchpad: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """One-shot context-budget warning payload (fable5 B-F3 2026-07-13).
+
+    The runtime accounts real token usage into `_limits.estimated_tokens_used`
+    after every LLM call, and the facades seed `warn_tokens_pct` — but nothing
+    ever CHECKED it: the loops sail silently past the model's window until the
+    provider 400s (OpenAI-compatible) or silently truncates (Ollama without
+    num_ctx — the oldest content, i.e. the system prompt, goes first). This
+    helper turns the existing accounting audible: returns the warning payload
+    exactly ONCE when usage crosses `warn_tokens_pct`% of `max_tokens`
+    (latched in the scratchpad), None otherwise. Emitting it is the caller's
+    one line; it never blocks or mutates the run beyond the latch.
+    """
+    if not isinstance(limits, dict) or not isinstance(scratchpad, dict):
+        return None
+    try:
+        used = int(limits.get("estimated_tokens_used") or 0)
+        ceiling = int(limits.get("max_tokens") or 0)
+        pct = int(limits.get("warn_tokens_pct") or 0)
+    except (TypeError, ValueError):
+        return None
+    if used <= 0 or ceiling <= 0 or pct <= 0:
+        return None
+    # Two latches (wave adversary 2026-07-13): one at the warning threshold,
+    # one when usage crosses the ceiling itself — a single 80% latch followed
+    # by silence through 100% under-informs exactly when it matters most.
+    # NOTE: this is ACCOUNTING/OBSERVABILITY ONLY — it never trims, gates, or
+    # stops anything (the no-silent-truncation / no-token-budget ADR; the
+    # loops run full-context by policy). The ceiling is registry-derived via
+    # the runtime config wherever available; honest scope: usage is the
+    # SERVER-REPORTED input tokens of the last call, so a server that is
+    # already silently truncating plateaus below the threshold (see faq.md).
+    if used >= ceiling and not scratchpad.get("context_exceeded_emitted"):
+        scratchpad["context_exceeded_emitted"] = True
+        scratchpad["context_warning_emitted"] = True
+        return {
+            "estimated_tokens_used": used,
+            "max_tokens": ceiling,
+            "warn_tokens_pct": pct,
+            "exceeded": True,
+            "warning": (
+                "#FALLBACK context accounting ceiling EXCEEDED: reported input usage passed the "
+                "configured window — expect provider 400s (OpenAI-compatible servers) or already-"
+                "active silent truncation (servers without an explicit context size). Nothing is "
+                "trimmed by this loop; this is observability only."
+            ),
+        }
+    if scratchpad.get("context_warning_emitted"):
+        return None
+    threshold = (ceiling * pct) // 100
+    if used < threshold:
+        return None
+    scratchpad["context_warning_emitted"] = True
+    return {
+        "estimated_tokens_used": used,
+        "max_tokens": ceiling,
+        "warn_tokens_pct": pct,
+        "exceeded": False,
+        "warning": (
+            "#FALLBACK context accounting warning: estimated usage crossed the warning threshold "
+            "of the configured window — long transcripts may overflow the model window (provider "
+            "400, or silent truncation on servers without an explicit context size). Nothing is "
+            "trimmed by this loop; this is observability only."
+        ),
+    }
+
+
+def coerce_iterations(raw: Any) -> Optional[int]:
+    """Coerce an iteration budget that may arrive as a non-int (tool-call arg
+    coercion class: several tool-call formats preserve raw strings, so budgets
+    arrive as "25", "8.5", or floats). `int("8.5")` raises — before this
+    helper, a string-float EXPLICIT budget silently fell open to the default
+    (the explicit-narrow-budget-must-never-silently-widen class, again).
+    Booleans are refused (True would coerce to a 1-iteration child — never an
+    operator's intent). Returns None when unparseable; callers fall back
+    loudly or by their documented default."""
+    if isinstance(raw, bool):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def runtime_llm_params(

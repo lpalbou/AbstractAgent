@@ -2,8 +2,8 @@
 
 ## Metadata
 - Created: 2026-07-12
-- Status: Planned
-- Completed: N/A
+- Status: Completed
+- Completed: 2026-07-13
 - Proposal ID: C3
 
 ## ADR status
@@ -39,6 +39,20 @@ No change to the no-recursion allowlist strip (wait-safety, correct as-is).
 Parametrized tests per sibling: (25,None)->25, (5,None)->20, (25,40)->40, (25,8)->8.
 
 ## Progress checklist
-- [ ] CodeAct fix + pins
-- [ ] MemAct fix + pins
-- [ ] Changelog
+- [x] CodeAct fix + pins
+- [x] MemAct fix + pins
+- [x] Changelog
+
+## Completion report
+- Date: 2026-07-13
+- Outcome: ReAct's ruled resolution mirrored verbatim in both siblings'
+  delegate_agent branches (explicit `max_iterations` arg wins, even below 20
+  — an operator/model's explicit choice; otherwise inherit the parent's
+  budget via `resolve_max_iterations` with the ruled 20 floor). The shared
+  DELEGATE_AGENT_TOOL schema now tells the truth for all three loops.
+- Validation: parametrized 4-case matrix per sibling ((25,None)->25,
+  (5,None)->20, (25,40)->40, (25,8)->8) in
+  tests/test_sibling_loop_defects_batch.py; full suite 156 passed / 2
+  skipped. Harness note: the allowlist gate intersects with the LOGIC's
+  declared tools, so node-level delegate tests must declare
+  DELEGATE_AGENT_TOOL on the logic (the agent constructors do).

@@ -11,8 +11,16 @@ from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
 
-from .generation_params import resolve_max_iterations, runtime_llm_params
+from .generation_params import (
+    DELEGATE_SUBSTRATE_KEYS,
+    coerce_iterations,
+    compose_prompt_slots,
+    context_usage_warning,
+    resolve_max_iterations,
+    runtime_llm_params,
+)
 from .media import extract_media_from_context
+from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
 from .loop_hooks import LoopHooks
 from .tool_allowlist import note_pruned_grants
 from ..logic.codeact import CodeActLogic
@@ -47,12 +55,37 @@ def _new_message(
     }
 
 
+def _new_assistant_message_with_tool_calls(
+    ctx: Any,
+    *,
+    content: str,
+    tool_calls: List[Any],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Assistant message preserving tool_calls metadata (0011 shared shape)."""
+    msg = _new_message(ctx, role="assistant", content=content, metadata=metadata)
+    tc_payload = assistant_tool_calls_payload(tool_calls)
+    if tc_payload:
+        msg["tool_calls"] = tc_payload
+    return msg
+
+
 def ensure_codeact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """Ensure namespaced vars exist and migrate legacy flat keys in-place.
 
     Returns:
         Tuple of (context, scratchpad, runtime_ns, temp, limits) dicts.
     """
+    # Captured BEFORE ensure_limits materializes defaults (0029 #6): an
+    # explicit legacy/flat budget used to lose to the materialized
+    # `_limits.max_iterations=20` at the resolver (limits wins).
+    _raw_limits = run.vars.get("_limits")
+    _caller_set_budget = isinstance(_raw_limits, dict) and _raw_limits.get("max_iterations") is not None
+    _raw_scratchpad = run.vars.get("scratchpad")
+    _legacy_budget = "max_iterations" in run.vars or (
+        isinstance(_raw_scratchpad, dict) and _raw_scratchpad.get("max_iterations") is not None
+    )
+
     ensure_namespaces(run.vars)
     limits = ensure_limits(run.vars)
     context = run.vars["context"]
@@ -98,6 +131,10 @@ def ensure_codeact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], 
 
     if scratchpad["max_iterations"] < 1:
         scratchpad["max_iterations"] = 1
+
+    # 0029 #6: explicit legacy budget seeds _limits unless the caller set it.
+    if _legacy_budget and not _caller_set_budget:
+        limits["max_iterations"] = scratchpad["max_iterations"]
 
     return context, scratchpad, runtime_ns, temp, limits
 
@@ -241,14 +278,27 @@ def create_codeact_workflow(
             return raw
         return None
 
-    def _sanitize_llm_messages(messages: Any, *, limits: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    def _compose_system_prompt(runtime_ns: Dict[str, Any], *, base: str) -> str:
+        """Override-or-base + the SHARED named slots (fable5 A-F1 2026-07-13):
+        this adapter WROTE system_prompt_extra into its delegated children but
+        never READ it — the sub-agent directive was silently dropped on every
+        CodeAct delegation. Slot order/headers live in ONE place
+        (`generation_params.PROMPT_SLOTS`, all three adapters); values must be
+        byte-stable for the run (cache contract; docs/skills-attachment.md)."""
+        override = _system_prompt(runtime_ns)
+        sys = override if override is not None else base
+        return compose_prompt_slots(str(sys or ""), runtime_ns)
+
+    def _sanitize_llm_messages(messages: Any, *, limits: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Convert runtime-owned message dicts into OpenAI-style {role, content, ...}.
 
-        Runtime messages can include extra metadata fields (`timestamp`, `metadata`) that many providers
-        will reject. Keep only the fields the LLM API expects.
+        Shared extraction (backlog 0011): delegates to adapters/transcripts.py —
+        assistant `tool_calls` metadata now survives to the wire and orphaned
+        tool messages are repaired, so multi-iteration tool use no longer 400s
+        on strict providers (native OpenAI's assistant-tool_calls-then-tool-
+        messages contract). CodeAct's one local concern stays local: the
+        optional marked-truncation bounds ride in as the truncate hook.
         """
-        if not isinstance(messages, list) or not messages:
-            return []
         def _limit_int(key: str, default: int) -> int:
             if not isinstance(limits, dict):
                 return default
@@ -267,43 +317,18 @@ def create_codeact_workflow(
             suffix = f"\n… (truncated, {len(text):,} chars total)"
             keep = max_chars - len(suffix)
             if keep < 200:
-                keep = max_chars
-                suffix = ""
+                # Even at a tiny bound, never emit an UNMARKED slice
+                # (ADR-0026; 0029 #15 — this branch used to drop the suffix).
+                keep = max(0, max_chars - 1)
+                suffix = "…"
             #[WARNING:TRUNCATION] bounded message content for LLM payload
             return text[:keep].rstrip() + suffix
 
-        out: List[Dict[str, str]] = []
-        for m in messages:
-            if not isinstance(m, dict):
-                continue
-            role = str(m.get("role") or "").strip()
-            content = m.get("content")
-            if not role or content is None:
-                continue
-            content_str = str(content)
-            if not content_str.strip():
-                continue
+        def _bound(text: str, role: str) -> str:
             limit = max_tool_message_chars if role == "tool" else max_message_chars
-            entry: Dict[str, str] = {"role": role, "content": _truncate(content_str, max_chars=limit)}
-            if role == "tool":
-                meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
-                call_id = meta.get("call_id") if isinstance(meta, dict) else None
-                if call_id is not None and str(call_id).strip():
-                    entry["tool_call_id"] = str(call_id).strip()
-            out.append(entry)
+            return _truncate(text, max_chars=limit)
 
-        # Adjacent USER turns (operator guidance drained before the first assistant reply) are
-        # legal in durable history but 400 on alternation-strict chat templates (Mistral/Gemma-
-        # class). Payload-boundary repair only: join them; the durable records stay distinct.
-        merged: List[Dict[str, str]] = []
-        for entry in out:
-            if merged and entry.get("role") == "user" and merged[-1].get("role") == "user":
-                prev = dict(merged[-1])
-                prev["content"] = f"{str(prev.get('content') or '').rstrip()}\n\n{str(entry.get('content') or '')}"
-                merged[-1] = prev
-                continue
-            merged.append(entry)
-        return merged
+        return sanitize_transcript_messages(messages, truncate=_bound)
 
     def _flag(runtime_ns: Dict[str, Any], key: str, *, default: bool = False) -> bool:
         if not isinstance(runtime_ns, dict) or key not in runtime_ns:
@@ -406,9 +431,18 @@ def create_codeact_workflow(
         media = extract_media_from_context(context)
         if media:
             payload["media"] = media
-        sys = _system_prompt(runtime_ns)
+        sys = _compose_system_prompt(runtime_ns, base="")
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
+
+        # Same per-run routing as reason (split-brain fix, 2026-07-13): a run
+        # routed to a specific model must plan on that model too.
+        eff_provider = runtime_ns.get("provider")
+        eff_model = runtime_ns.get("model")
+        if isinstance(eff_provider, str) and eff_provider.strip():
+            payload["provider"] = eff_provider.strip()
+        if isinstance(eff_model, str) and eff_model.strip():
+            payload["model"] = eff_model.strip()
 
         return StepPlan(
             node_id="plan",
@@ -507,6 +541,10 @@ def create_codeact_workflow(
         )
 
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
+        ctx_warn = context_usage_warning(limits, scratchpad)
+        if ctx_warn:
+            emit("context_warning", ctx_warn)
+
 
         # IMPORTANT: When we send `messages`, do not also send a non-empty `prompt`.
         # Some providers/servers will append `prompt` as an extra user message even when the
@@ -520,9 +558,49 @@ def create_codeact_workflow(
         media = extract_media_from_context(context)
         if media:
             payload["media"] = media
-        sys = _system_prompt(runtime_ns) or req.system_prompt
+        sys = _compose_system_prompt(runtime_ns, base=str(req.system_prompt or ""))
         if isinstance(sys, str) and sys.strip():
             payload["system_prompt"] = sys
+
+        # Volatile per-call state (loop position + live plan) rides a TRAILING
+        # ephemeral message, never the system prompt (0212 propagated from
+        # ReAct, fable5 2026-07-13: the `Iteration: N/M` head line busted the
+        # provider prefix cache on EVERY cycle — full re-prefill per call on
+        # local servers). Adjacency guard mirrors ReAct: merge into a trailing
+        # user message; else append flagged `volatile: True` (runtime excludes
+        # flagged messages from the cache fingerprint and strips the key).
+        tail_parts: list[str] = [f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}."]
+        if _flag(runtime_ns, "plan_mode", default=False):
+            plan_text = scratchpad.get("plan")
+            if isinstance(plan_text, str) and plan_text.strip():
+                plan_render = plan_text.strip()
+                _plan_cap = 4000
+                if len(plan_render) > _plan_cap:
+                    #[WARNING:TRUNCATION] bounded plan render in the trailing loop message
+                    plan_render = plan_render[:_plan_cap].rstrip() + f"\n… (plan truncated, {len(plan_text.strip()):,} chars total)"
+                tail_parts.append(f"[plan]\n{plan_render}")
+        tail_text = "\n\n".join(tail_parts).strip()
+        if tail_text and isinstance(payload.get("messages"), list):
+            msgs_out = list(payload["messages"])
+            if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
+                last = dict(msgs_out[-1])
+                last["content"] = f"{str(last.get('content') or '').rstrip()}\n\n{tail_text}"
+                msgs_out[-1] = last
+            else:
+                msgs_out.append({"role": "user", "content": tail_text, "volatile": True})
+            payload["messages"] = msgs_out
+
+        # Per-run substrate override honesty (fable5 B-F10 2026-07-13): ReAct
+        # and MemAct honor `_runtime.provider/model` (the gateway's per-run
+        # routing channel); CodeAct silently ignored it — a host swapping
+        # models per run got the runtime default with no warning.
+        eff_provider = runtime_ns.get("provider")
+        eff_model = runtime_ns.get("model")
+        if isinstance(eff_provider, str) and eff_provider.strip():
+            payload["provider"] = eff_provider.strip()
+        if isinstance(eff_model, str) and eff_model.strip():
+            payload["model"] = eff_model.strip()
+
         params: Dict[str, Any] = {}
         if req.max_tokens is not None:
             params["max_tokens"] = req.max_tokens
@@ -544,15 +622,53 @@ def create_codeact_workflow(
         content, tool_calls = logic.parse_response(response)
 
         temp.pop("llm_response", None)
-        emit("parse", {"has_tool_calls": bool(tool_calls), "content_preview": (content[:100] if content else "(no content)")})
+        # Fence decision computed BEFORE the emit (wave-F P3: on the fenced
+        # path the parse payload said has_tool_calls=False with no code
+        # signal, then the loop executed code — an action a common-core
+        # consumer never saw coming). Same conditions as the extraction
+        # branch below, which reuses this result (one decision, two readers).
+        fenced_code: Optional[str] = None
+        if not tool_calls and isinstance(content, str) and content.strip():
+            if not content.lstrip().upper().startswith("FINAL:") and logic.fenced_fallback_enabled(runtime_ns):
+                fenced_code = logic.extract_code(content)
+        # COMMON CORE parse payload (0028 contract wave, 2026-07-14): every
+        # loop guarantees has_tool_calls + tool_calls + content_preview (200
+        # chars); extras are loop-specific additions (has_code is CodeAct's).
+        # Preview bound unified 100 -> 200 (declared in hooks.md).
+        emit(
+            "parse",
+            {
+                "has_tool_calls": bool(tool_calls),
+                "tool_calls": [
+                    {"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls
+                ],
+                "content_preview": (content[:200] if content else "(no content)"),
+                "has_code": bool(fenced_code),
+            },
+        )
 
         if tool_calls:
-            if content:
-                context["messages"].append(_new_message(ctx, role="assistant", content=content))
-                if _flag(runtime_ns, "plan_mode", default=False):
-                    updated = _extract_plan_update(content)
-                    if isinstance(updated, str) and updated.strip():
-                        scratchpad["plan"] = updated.strip()
+            # A non-empty reply ends the CONSECUTIVE-empty streak (fable5 P1
+            # 2026-07-13: without the reset, two recovered empties early in a
+            # run made every LATER single empty reply skip its retries and end
+            # the run with the "can't proceed" error despite remaining budget).
+            scratchpad["empty_response_retry_count"] = 0
+            # Durable tool_calls preservation (0011): the assistant turn that
+            # PROPOSED the batch must announce the ids its tool results answer
+            # — content-only appends orphaned every tool message on strict
+            # providers (native OpenAI 400s the request at iteration 2).
+            context["messages"].append(
+                _new_assistant_message_with_tool_calls(
+                    ctx,
+                    content=str(content or ""),
+                    tool_calls=tool_calls,
+                    metadata={"kind": "tool_calls"},
+                )
+            )
+            if content and _flag(runtime_ns, "plan_mode", default=False):
+                updated = _extract_plan_update(content)
+                if isinstance(updated, str) and updated.strip():
+                    scratchpad["plan"] = updated.strip()
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
             return StepPlan(node_id="parse", next_node="act")
 
@@ -565,7 +681,7 @@ def create_codeact_workflow(
 
             if empty_retries < 2:
                 scratchpad["empty_response_retry_count"] = empty_retries + 1
-                emit("parse_retry_empty_response", {"retries": empty_retries + 1})
+                emit("parse_retry_empty", {"retries": empty_retries + 1})
                 inbox = runtime_ns.get("inbox")
                 if not isinstance(inbox, list):
                     inbox = []
@@ -590,17 +706,6 @@ def create_codeact_workflow(
             scratchpad["empty_response_retry_count"] = 0
             return StepPlan(node_id="parse", next_node="maybe_review")
 
-        code = logic.extract_code(content)
-        if code:
-            if content:
-                context["messages"].append(_new_message(ctx, role="assistant", content=content))
-                if _flag(runtime_ns, "plan_mode", default=False):
-                    updated = _extract_plan_update(content)
-                    if isinstance(updated, str) and updated.strip():
-                        scratchpad["plan"] = updated.strip()
-            temp["pending_code"] = code
-            return StepPlan(node_id="parse", next_node="execute_code")
-
         def _extract_final_answer(text: str) -> tuple[bool, str]:
             if not isinstance(text, str) or not text.strip():
                 return False, ""
@@ -609,6 +714,15 @@ def create_codeact_workflow(
                 return True, s[len("FINAL:") :].lstrip()
             return False, text
 
+        # Reaching here = a NON-EMPTY reply: the consecutive-empty streak ends
+        # regardless of which branch (FINAL / fenced / default-final) exits.
+        scratchpad["empty_response_retry_count"] = 0
+
+        # Intent before extraction (backlog 0010 / A4): the FINAL check MUST
+        # precede fenced-code extraction — a reply "FINAL: here's an example:
+        # ```python ..." is a final ANSWER whose illustrative block used to
+        # execute (unintended execution on a turn that carried no action
+        # intent). A final answer never executes anything.
         raw = str(content or "").strip()
         is_final, final = _extract_final_answer(raw)
         if is_final:
@@ -621,6 +735,25 @@ def create_codeact_workflow(
             temp["final_answer"] = final or "No answer provided"
             temp["pending_tool_calls"] = []
             return StepPlan(node_id="parse", next_node="maybe_review")
+
+        # Fenced-code fallback for prompted models (the CodeAct convention the
+        # system prompt teaches when enabled). A1 landed 2026-07-14 (operator
+        # green light): the DEFAULT is capability-conditional — explicit
+        # `_runtime.codeact_fenced_fallback` wins both ways, otherwise
+        # NOT supports_native_tools (runtime seeds the bit per run). ONE
+        # resolver shared with the prompt line (CodeActLogic.
+        # fenced_fallback_enabled) so parser and teaching can never disagree:
+        # teaching a disabled channel manufactures dead replies; extracting an
+        # untaught one executes illustrations.
+        if fenced_code:
+            if content:
+                context["messages"].append(_new_message(ctx, role="assistant", content=content))
+                if _flag(runtime_ns, "plan_mode", default=False):
+                    updated = _extract_plan_update(content)
+                    if isinstance(updated, str) and updated.strip():
+                        scratchpad["plan"] = updated.strip()
+            temp["pending_code"] = fenced_code
+            return StepPlan(node_id="parse", next_node="execute_code")
 
         # Default: treat as a final answer even without an explicit FINAL marker.
         if raw:
@@ -757,6 +890,35 @@ def create_codeact_workflow(
                 if delegated_context:
                     combined_task = f"{delegated_task}\n\nContext:\n{delegated_context}"
 
+                # Child iteration budget (backlog 0012 / C3 — ReAct's ruled resolution
+                # applied to this sibling; the shared DELEGATE_AGENT_TOOL schema already
+                # documents it): an explicit `max_iterations` tool arg wins; otherwise
+                # the child inherits the PARENT's budget with the ruled 20 as floor.
+                # The old hardcoded 10 made the shared schema lie for this loop.
+                parent_iterations = resolve_max_iterations(
+                    run.vars.get("_limits") if isinstance(run.vars.get("_limits"), dict) else {},
+                    run.vars.get("scratchpad") if isinstance(run.vars.get("scratchpad"), dict) else {},
+                )
+                # Arg-coercion tolerance (fable5 P1 2026-07-13): string-float
+                # budgets ("8.5") raised in int() and silently widened.
+                raw_child_iters = args.get("max_iterations")
+                child_val = coerce_iterations(raw_child_iters) if raw_child_iters is not None else None
+                if raw_child_iters is not None and child_val is None:
+                    emit(
+                        "delegate_agent_budget_fallback",
+                        {"raw": str(raw_child_iters), "warning": "#FALLBACK unparseable max_iterations; inheriting parent"},
+                    )
+                if isinstance(child_val, int):
+                    # Explicit values are honored even when falsy (0029 #15,
+                    # resolver-contract parity): explicit <=0 clamps to the
+                    # loop floor of 1 — it must never silently WIDEN to the
+                    # inheritance default.
+                    child_iterations = child_val if child_val >= 1 else 1
+                else:
+                    # Absent or unparseable: inherit the parent's budget with
+                    # the ruled 20 as the floor guard.
+                    child_iterations = max(int(parent_iterations or 0), 20)
+
                 sub_vars: Dict[str, Any] = {
                     "context": {"task": combined_task, "messages": []},
                     "_runtime": {
@@ -769,8 +931,87 @@ def create_codeact_workflow(
                             "- Return a concise result suitable for the parent agent to act on.\n"
                         ),
                     },
-                    "_limits": {"max_iterations": 10},
+                    "_limits": {"max_iterations": child_iterations},
                 }
+                # Substrate + sampling inheritance (fable5 A-F7/B-F6 2026-07-13;
+                # see react_runtime's delegate branch): the child inherits the
+                # parent's effective provider/model/temperature/seed explicitly.
+                for _k in (
+                    "provider",
+                    "model",
+                    "temperature",
+                    "seed",
+                    # Same per-run-behavior class (wave adversaries 2026-07-13):
+                    # a parent with thinking off / a capped output budget /
+                    # example-free tool prompts should not delegate a child
+                    # that silently reverts to provider defaults.
+                    "thinking",
+                    "max_output_tokens",
+                    "tool_prompt_examples",
+                ):
+                    _v = runtime_ns.get(_k)
+                    if _v is not None:
+                        sub_vars["_runtime"][_k] = _v
+
+                # Host-gated substrate palette (0030 promoted 2026-07-13): the
+                # `substrate` arg names a profile the HOST granted via
+                # `_runtime.delegate_substrates` = {name: {provider, model}}.
+                # Unknown/absent names fail as a TOOL error (the parent decides
+                # what to do; never a run failure) and raw provider/model
+                # strings are structurally impossible here — the model choosing
+                # its own substrate would be self-escalation. The palette does
+                # NOT propagate to grandchildren: each level needs its own grant.
+                substrate_name = str(args.get("substrate") or "").strip()
+                if substrate_name:
+                    palette = runtime_ns.get("delegate_substrates")
+                    profile = palette.get(substrate_name) if isinstance(palette, dict) else None
+                    prof_provider = str(profile.get("provider") or "").strip() if isinstance(profile, dict) else ""
+                    prof_model = str(profile.get("model") or "").strip() if isinstance(profile, dict) else ""
+                    if not (prof_provider and prof_model):
+                        available = sorted(str(k) for k in palette.keys()) if isinstance(palette, dict) else []
+                        # Malformed ≠ unknown (wave adversary P2: "Unknown
+                        # substrate 'x'. Available: x." declared a name unknown
+                        # and available in one sentence).
+                        if profile is not None:
+                            err = (
+                                f"Delegate substrate '{substrate_name}' is granted but malformed — "
+                                "a profile needs non-empty 'provider' and 'model'. Ask the host to fix the grant."
+                            )
+                        elif available:
+                            err = f"Unknown delegate substrate '{substrate_name}'. Available: " + ", ".join(available) + "."
+                        else:
+                            err = f"Unknown delegate substrate '{substrate_name}'. No substrate palette was granted for this run."
+                        temp["tool_results"] = {
+                            "results": [
+                                {
+                                    "call_id": str(tc.get("call_id") or ""),
+                                    "name": "delegate_agent",
+                                    "success": False,
+                                    "output": None,
+                                    "error": err,
+                                }
+                            ]
+                        }
+                        return StepPlan(node_id="act", next_node="observe")
+                    # Version-skew loudness (wave adversary P1): a grant carrying
+                    # keys this build does not understand is silently half-applied
+                    # otherwise — warn, never drop silently.
+                    unknown_keys = sorted(set(profile.keys()) - DELEGATE_SUBSTRATE_KEYS) if isinstance(profile, dict) else []
+                    if unknown_keys:
+                        emit(
+                            "delegate_agent_substrate_skew",
+                            {
+                                "substrate": substrate_name,
+                                "ignored_keys": unknown_keys,
+                                "warning": "#FALLBACK unrecognized substrate profile keys ignored (version skew?)",
+                            },
+                        )
+                    sub_vars["_runtime"]["provider"] = prof_provider
+                    sub_vars["_runtime"]["model"] = prof_model
+                    emit(
+                        "delegate_agent_substrate",
+                        {"substrate": substrate_name, "provider": prof_provider, "model": prof_model},
+                    )
 
                 payload = {
                     "workflow_id": str(getattr(run, "workflow_id", "") or "codeact_agent"),
@@ -873,18 +1114,27 @@ def create_codeact_workflow(
                 {"name": tc.get("name", ""), "arguments": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")}
             )
 
+        # Idempotency discriminator (fable5 P0 2026-07-13; see react_runtime's
+        # act_node): the runtime strips call_ids from the effect hash and scans
+        # the whole ledger, so a later byte-identical batch REPLAYED the stale
+        # prior result. The persisted monotonic counter keeps crash-replay
+        # dedup while giving each genuine issuance a fresh key.
+        scratchpad_ns = run.vars.get("scratchpad") if isinstance(run.vars.get("scratchpad"), dict) else {}
+        act_seq = int(scratchpad_ns.get("act_seq") or 0) + 1
+        scratchpad_ns["act_seq"] = act_seq
+
         return StepPlan(
             node_id="act",
             effect=Effect(
                 type=EffectType.TOOL_CALLS,
-                payload={"tool_calls": formatted_calls, "allowed_tools": list(allow)},
+                payload={"tool_calls": formatted_calls, "allowed_tools": list(allow), "act_seq": act_seq},
                 result_key="_temp.tool_results",
             ),
             next_node="observe",
         )
 
     def execute_code_node(run: RunState, ctx) -> StepPlan:
-        _, _, runtime_ns, temp, _ = ensure_codeact_vars(run)
+        _, scratchpad, runtime_ns, temp, _ = ensure_codeact_vars(run)
         code = temp.get("pending_code")
         if not isinstance(code, str) or not code.strip():
             return StepPlan(node_id="execute_code", next_node="reason")
@@ -892,6 +1142,12 @@ def create_codeact_workflow(
         temp.pop("pending_code", None)
         emit("act", {"tool": "execute_python", "args": {"code": "(inline)", "timeout_s": 10.0}})
         allow = _effective_allowlist(runtime_ns)
+
+        # Same P0 class, sharper here: re-running the SAME fenced code block is
+        # the point of CodeAct (re-check mutable state) — without the seq, the
+        # second run replayed the first run's ledger result.
+        act_seq = int(scratchpad.get("act_seq") or 0) + 1
+        scratchpad["act_seq"] = act_seq
 
         return StepPlan(
             node_id="execute_code",
@@ -906,6 +1162,7 @@ def create_codeact_workflow(
                         }
                     ],
                     "allowed_tools": list(allow),
+                    "act_seq": act_seq,
                 },
                 result_key="_temp.tool_results",
             ),
@@ -952,7 +1209,7 @@ def create_codeact_workflow(
             if len(preview) > 1000:
                 #[WARNING:TRUNCATION] bounded preview for observability payloads
                 preview = preview[:1000] + f"\n… (truncated, {len(rendered):,} chars total)"
-            emit("observe", {"tool": name, "success": success, "result": preview})
+            emit("observe", {"tool": name, "success": success, "result": preview, "call_id": str(r.get("call_id") or "")})
             context["messages"].append(
                 _new_message(
                     ctx,
@@ -973,7 +1230,7 @@ def create_codeact_workflow(
         return StepPlan(node_id="observe", next_node="reason")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp, _ = ensure_codeact_vars(run)
+        context, scratchpad, _, temp, _ = ensure_codeact_vars(run)
         user_response = temp.get("user_response", {})
         if not isinstance(user_response, dict):
             user_response = {}
@@ -982,6 +1239,11 @@ def create_codeact_workflow(
 
         context["messages"].append(_new_message(ctx, role="user", content=f"[User response]: {response_text}"))
         temp.pop("user_response", None)
+
+        # Per-turn report state resets at the turn boundary (wave-E P2-4
+        # symmetry with ReAct, 2026-07-14): stale prior-turn review skips must
+        # not pollute the next turn's output; ledger/emits keep the history.
+        scratchpad.pop("review_skipped", None)
 
         if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
@@ -1025,8 +1287,9 @@ def create_codeact_workflow(
             suffix = f"\n… (truncated, {len(s):,} chars total)"
             keep = max_chars - len(suffix)
             if keep < 200:
-                keep = max_chars
-                suffix = ""
+                # Never an unmarked slice (ADR-0026; 0029 #15).
+                keep = max(0, max_chars - 1)
+                suffix = "…"
             #[WARNING:TRUNCATION] bounded transcript blocks for prompt reconstruction
             return s[:keep].rstrip() + suffix
 
@@ -1172,9 +1435,19 @@ def create_codeact_workflow(
         media = extract_media_from_context(context)
         if media:
             payload["media"] = media
-        sys = _system_prompt(runtime_ns)
-        if sys is not None:
+        sys = _compose_system_prompt(runtime_ns, base="")
+        if sys:
             payload["system_prompt"] = sys
+
+        # Same per-run routing as reason (split-brain fix, 2026-07-13): with
+        # review defaulting ON, a review on a DIFFERENT (possibly unloaded)
+        # model than the override made every verifier round fail-and-absorb.
+        eff_provider = runtime_ns.get("provider")
+        eff_model = runtime_ns.get("model")
+        if isinstance(eff_provider, str) and eff_provider.strip():
+            payload["provider"] = eff_provider.strip()
+        if isinstance(eff_model, str) and eff_model.strip():
+            payload["model"] = eff_model.strip()
 
         return StepPlan(
             node_id="review",
@@ -1251,31 +1524,14 @@ def create_codeact_workflow(
             emit("review_tool_calls", {"count": len(next_tool_calls)})
             return StepPlan(node_id="review_parse", next_node="act")
 
-        # Behavioral validation: if incomplete but no tool calls, re-ask reviewer once with stricter rules.
-        if not complete and not next_tool_calls:
-            try:
-                retry_count = int(runtime_ns.get("review_retry_count") or 0)
-            except Exception:
-                retry_count = 0
-            if retry_count < 1:
-                runtime_ns["review_retry_count"] = retry_count + 1
-                inbox = runtime_ns.get("inbox")
-                if not isinstance(inbox, list):
-                    inbox = []
-                    runtime_ns["inbox"] = inbox
-                inbox.append(
-                    {
-                        "content": (
-                            "[Review] Your last review output was not actionable. "
-                            "If incomplete, you MUST return at least one `next_tool_call` "
-                            "(use `ask_user` if you need clarification). Return JSON only."
-                        )
-                    }
-                )
-                emit("review_retry_unactionable", {"retry": retry_count + 1})
-                return StepPlan(node_id="review_parse", next_node="review")
-
-        runtime_ns["review_retry_count"] = 0
+        # Incomplete but no actionable tool calls. The old "nudge then
+        # re-review" was DELETED (fable5 P1 2026-07-13, mirroring ReAct's
+        # earlier resolution): the re-review payload was byte-identical, so
+        # the runtime idempotency layer REPLAYED the first verdict — a
+        # guaranteed no-op — and the reviewer-directed nudge ("Return JSON
+        # only") then leaked into the MAIN model's durable guidance tail at
+        # the next reason drain, steering the agent toward emitting raw JSON.
+        runtime_ns.pop("review_retry_count", None)
         if next_prompt_text:
             inbox = runtime_ns.get("inbox")
             if not isinstance(inbox, list):
@@ -1287,7 +1543,7 @@ def create_codeact_workflow(
     def done_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, _, temp, limits = ensure_codeact_vars(run)
         answer = str(temp.get("final_answer") or "No answer provided")
-        emit("done", {"answer": answer})
+        emit("done", {"answer": answer, "outcome": "final_answer"})
 
         # Prefer _limits.current_iteration, fall back to scratchpad
         iterations = int(limits.get("current_iteration", 0) or scratchpad.get("iteration", 0) or 0)
@@ -1303,14 +1559,28 @@ def create_codeact_workflow(
                 messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer"}))
 
         _discard_hook_steering_at_terminal()
-        return StepPlan(
-            node_id="done",
-            complete_output={
-                "answer": answer,
-                "iterations": iterations,
-                "messages": list(context.get("messages") or []),
-            },
-        )
+        # Loudness parity with ReAct's report line (fable5 P2 2026-07-13): a
+        # skipped verifier round must be visible in the RUN OUTPUT, not only in
+        # the emit lane — CodeAct's output carried no report, so the #FALLBACK
+        # marker was invisible to output-only consumers.
+        skipped_reviews = scratchpad.get("review_skipped")
+        has_skips = isinstance(skipped_reviews, list) and bool(skipped_reviews)
+        complete_output: Dict[str, Any] = {
+            "answer": answer,
+            "iterations": iterations,
+            "messages": list(context.get("messages") or []),
+            # Machine-readable terminal outcome (canonical turn_end vocabulary,
+            # final_answer | iteration_budget — see react_runtime's done node).
+            "outcome": "final_answer",
+            # One shape across loops (wave adversary P1): review_skipped is an
+            # ALWAYS-PRESENT bool everywhere; the detail list rides a separate
+            # key (it was a present-only-when-truthy list here — a consumer
+            # coded to the documented bool got type instability).
+            "review_skipped": has_skips,
+        }
+        if has_skips:
+            complete_output["review_skipped_details"] = list(skipped_reviews)
+        return StepPlan(node_id="done", complete_output=complete_output)
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, _, _, limits = ensure_codeact_vars(run)
@@ -1319,17 +1589,41 @@ def create_codeact_workflow(
         max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
-        emit("max_iterations", {"iterations": max_iterations})
+        emit("max_iterations", {"iterations": max_iterations, "outcome": "iteration_budget"})
 
         messages = list(context.get("messages") or [])
-        last_content = messages[-1]["content"] if messages else "Max iterations reached"
+        # The answer is the agent's LAST WORDS, not the raw last message
+        # (0029 #10: the tail is often a tool observation or a recovery user
+        # note — reporting it as "answer" lied about what the agent said).
+        # Full conclusion-call parity with ReAct stays gated on 0021; this is
+        # the honesty half. `.get`, not [] (fable5 2026-07-13): content-less
+        # host-seeded messages raised KeyError at the terminal.
+        answer = ""
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                text = str(msg.get("content") or "")
+                if text.strip():
+                    answer = text
+                    break
+        if not answer:
+            answer = f"Reached the iteration budget ({max_iterations}) without producing an answer."
+        # Transcript ends with the agent's answer (final_answer marker parity
+        # with the done terminal) unless it already does.
+        last = messages[-1] if messages else None
+        if not (isinstance(last, dict) and last.get("role") == "assistant" and str(last.get("content") or "") == answer):
+            messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer", "budget_exhausted": True}))
+            context["messages"] = messages
         _discard_hook_steering_at_terminal()
         return StepPlan(
             node_id="max_iterations",
             complete_output={
-                "answer": last_content,
+                "answer": answer,
                 "iterations": max_iterations,
                 "messages": messages,
+                "outcome": "iteration_budget",
+                # Always-present at BOTH terminals (wave-F P3: the batch-3
+                # "always-present bool" claim was false at this one).
+                "review_skipped": bool(scratchpad.get("review_skipped")),
             },
         )
 

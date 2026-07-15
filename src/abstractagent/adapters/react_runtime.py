@@ -24,10 +24,20 @@ from abstractcore.tools import ToolCall
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 
-from .generation_params import resolve_max_iterations, runtime_llm_params
+from .generation_params import (
+    DELEGATE_SUBSTRATE_KEYS,
+    coerce_iterations,
+    compose_prompt_slots,
+    context_usage_warning,
+    is_side_effect_tool,
+    resolve_max_iterations,
+    runtime_llm_params,
+    tool_tags_map,
+)
 from .loop_hooks import LoopHooks
 from .media import extract_media_from_context
 from .tool_allowlist import note_pruned_grants
+from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
 from ..logic.react import ReActLogic
 
 
@@ -70,27 +80,8 @@ def _new_assistant_message_with_tool_calls(
     """Create an assistant message that preserves tool call metadata for OpenAI transcripts."""
 
     msg = _new_message(ctx, role="assistant", content=content, metadata=metadata)
-
-    tc_payload: list[dict[str, Any]] = []
-    for i, tc in enumerate(tool_calls):
-        if not isinstance(tc, ToolCall):
-            continue
-        name = str(tc.name or "").strip()
-        if not name:
-            continue
-        call_id = tc.call_id
-        call_id_str = str(call_id).strip() if call_id is not None else ""
-        if not call_id_str:
-            call_id_str = f"call_{i+1}"
-        args = tc.arguments if isinstance(tc.arguments, dict) else {}
-        tc_payload.append(
-            {
-                "type": "function",
-                "id": call_id_str,
-                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
-            }
-        )
-
+    # Shared shape (0011 extraction): one payload builder across the loops.
+    tc_payload = assistant_tool_calls_payload(tool_calls)
     if tc_payload:
         msg["tool_calls"] = tc_payload
     return msg
@@ -100,6 +91,18 @@ def ensure_react_vars(
     run: RunState,
 ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """Ensure namespaced vars exist and migrate legacy flat keys in-place."""
+
+    # Captured BEFORE ensure_limits materializes defaults (0029 #6): a raw
+    # `runtime.start(vars={"max_iterations": 100})` used to run capped at 20 —
+    # the materialized `_limits.max_iterations=20` beat the caller's explicit
+    # legacy value at the resolver (limits wins over scratchpad). Explicit
+    # values must win over defaults; the ruled 20 stays the no-value default.
+    _raw_limits = run.vars.get("_limits")
+    _caller_set_budget = isinstance(_raw_limits, dict) and _raw_limits.get("max_iterations") is not None
+    _raw_scratchpad = run.vars.get("scratchpad")
+    _legacy_budget = "max_iterations" in run.vars or (
+        isinstance(_raw_scratchpad, dict) and _raw_scratchpad.get("max_iterations") is not None
+    )
 
     ensure_namespaces(run.vars)
     limits = ensure_limits(run.vars)
@@ -148,6 +151,12 @@ def ensure_react_vars(
             scratchpad["max_iterations"] = 20
     if scratchpad["max_iterations"] < 1:
         scratchpad["max_iterations"] = 1
+
+    # 0029 #6: when the caller supplied an explicit legacy/flat budget and did
+    # NOT set `_limits.max_iterations` itself, seed limits from it — otherwise
+    # the materialized default (20) silently wins at the resolver.
+    if _legacy_budget and not _caller_set_budget:
+        limits["max_iterations"] = scratchpad["max_iterations"]
 
     used_tools = scratchpad.get("used_tools")
     if not isinstance(used_tools, bool):
@@ -434,7 +443,10 @@ def _looks_like_deferred_action(text: str) -> bool:
     if _FINALISH_RE.search(prose):
         return False
     # If the model already produced a structured answer (headings/sections), don't retry.
-    if re.search(r"(?m)^(#{1,6}\s+\\S|\\*\\*\\S)", prose):
+    # (fable5 P2 2026-07-13: the raw string carried double-escaped \\S — a
+    # literal backslash+S that never matched, so this guard was dead and
+    # heading-shaped final answers with intent verbs burned bounded retries.)
+    if re.search(r"(?m)^(#{1,6}\s+\S|\*\*\S)", prose):
         return False
     # Must contain first-person intent *and* an action-ish verb.
     if not _DEFERRED_ACTION_INTENT_RE.search(prose):
@@ -515,13 +527,25 @@ def _system_prompt_extra(runtime_ns: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _skills_block(runtime_ns: Dict[str, Any]) -> Optional[str]:
+    raw = runtime_ns.get("skills_block") if isinstance(runtime_ns, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
 def _compose_system_prompt(runtime_ns: Dict[str, Any], *, base: str) -> str:
+    """base/override + the shared named slots (skills_block, system_prompt_extra).
+
+    Slot ORDER and headers live in ONE place — `generation_params.PROMPT_SLOTS`
+    (all three adapters call the same composer; the hand-copied triplication
+    was the divergence class the system_prompt_extra fix had just paid for).
+    Cache contract: slot values must be byte-stable for the run; per-call
+    state rides the volatile tail instead. See docs/skills-attachment.md.
+    """
     override = _system_prompt_override(runtime_ns)
-    extra = _system_prompt_extra(runtime_ns)
     sys = override if override is not None else base
-    if extra:
-        sys = f"{sys.rstrip()}\n\nAdditional system instructions:\n{extra}"
-    return sys.strip()
+    return compose_prompt_slots(sys, runtime_ns)
 
 
 def _max_output_tokens(runtime_ns: Dict[str, Any], limits: Dict[str, Any]) -> Optional[int]:
@@ -712,6 +736,15 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
     if isinstance(scratchpad, dict):
         scratchpad["iteration"] = 0
         scratchpad["review_count"] = 0
+        # Per-TURN report state (wave-E adversary P1-1, live-reproduced on the
+        # visit lane 2026-07-14): THIS is the boundary where turns actually
+        # cycle in composition — without the pop, turn 2's report/output
+        # carried turn 1's stale #FALLBACK review_skipped. The emit/ledger
+        # history keeps the record; report/output reflect the current turn.
+        scratchpad.pop("review_skipped", None)
+        # used_tools is the same per-turn latch class (wave-F P4): a toolless
+        # turn 2 must not report turn 1's tool use.
+        scratchpad["used_tools"] = False
     limits = run_vars.get("_limits")
     if isinstance(limits, dict):
         limits["current_iteration"] = 0
@@ -727,6 +760,10 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
             "review_llm_response",
             "max_iterations_llm_response",
             "max_iterations_conclude_retries",
+            # Wave-E P1-1: without this pop, the second budget-exhausted turn
+            # in a composed run announced ZERO times (the once-per-turn latch
+            # never re-armed).
+            "max_iterations_announced",
             "turn_captures",
         ):
             temp.pop(key, None)
@@ -941,129 +978,10 @@ def create_react_workflow(
         return out
 
     def _sanitize_llm_messages(messages: Any) -> List[Dict[str, Any]]:
-        if not isinstance(messages, list) or not messages:
-            return []
-        out: List[Dict[str, Any]] = []
-
-        def _sanitize_tool_calls(raw: Any) -> Optional[list[dict[str, Any]]]:
-            if not isinstance(raw, list) or not raw:
-                return None
-            cleaned: list[dict[str, Any]] = []
-            for i, tc in enumerate(raw):
-                if not isinstance(tc, dict):
-                    continue
-                tc_type = str(tc.get("type") or "function")
-                if tc_type != "function":
-                    continue
-                call_id = tc.get("id")
-                call_id_str = str(call_id).strip() if call_id is not None else ""
-                if not call_id_str:
-                    call_id_str = f"call_{i+1}"
-                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-                name = str(fn.get("name") or "").strip()
-                if not name:
-                    continue
-                args = fn.get("arguments")
-                if isinstance(args, dict):
-                    args_str = json.dumps(args, ensure_ascii=False)
-                else:
-                    args_str = "" if args is None else str(args)
-                cleaned.append({"type": "function", "id": call_id_str, "function": {"name": name, "arguments": args_str}})
-            return cleaned or None
-
-        for m in messages:
-            if not isinstance(m, dict):
-                continue
-            role = str(m.get("role") or "").strip()
-            if not role:
-                continue
-            content = m.get("content")
-            content_str = "" if content is None else str(content)
-            tool_calls_raw = m.get("tool_calls")
-            tool_calls = _sanitize_tool_calls(tool_calls_raw)
-
-            # Assistant tool-calls messages may legitimately have empty content, but must still be included.
-            if not content_str.strip() and not (role == "assistant" and tool_calls):
-                continue
-
-            entry: Dict[str, Any] = {"role": role, "content": content_str}
-            if role == "tool":
-                meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
-                call_id = meta.get("call_id") if isinstance(meta, dict) else None
-                if call_id is not None and str(call_id).strip():
-                    entry["tool_call_id"] = str(call_id).strip()
-            elif role == "assistant" and tool_calls:
-                entry["tool_calls"] = tool_calls
-            out.append(entry)
-
-        # Orphan repair (multi-turn correctness on strict providers): an assistant `tool_calls`
-        # message whose ids are not answered by immediately-following tool messages makes native
-        # OpenAI reject the WHOLE request ("must be followed by tool messages responding to each
-        # tool_call_id" -> 400, run fails). The durable history legitimately produces this shape
-        # for interactive builtins (ask_user resolves via an ASK_USER wait + a user message, never
-        # a tool message). Pre-existing at git HEAD; repaired here at the payload boundary:
-        # synthesize a deterministic tool result right after the assistant turn (adjacency is part
-        # of the provider contract). Durable history is untouched; the synthetic text is stable so
-        # the cached prefix stays byte-identical across iterations (0212).
-        # Interactive builtins resolve through waits + user messages BY DESIGN; only their
-        # unanswered ids may honestly be labeled "handled interactively". Anything else
-        # unanswered is a genuinely lost result and must SAY so (Critic-3: a repair that
-        # papers over real loss with a false claim actively misleads the model).
-        _interactive_builtin_names = {"ask_user"}
-
-        repaired: List[Dict[str, Any]] = []
-        i = 0
-        while i < len(out):
-            entry = out[i]
-            if entry.get("role") == "tool":
-                # Orphan TOOL message (no immediately-preceding assistant tool_calls run —
-                # e.g. a compaction/trim cut): strict providers 400 on it. Fold it into an
-                # inert user-visible note instead (mirrors native-OpenAI's missing-id fold).
-                repaired.append({
-                    "role": "user",
-                    "content": f"[unpaired tool result]: {str(entry.get('content') or '')}",
-                })
-                i += 1
-                continue
-            repaired.append(entry)
-            i += 1
-            if entry.get("role") != "assistant" or not entry.get("tool_calls"):
-                continue
-            want: Dict[str, str] = {}
-            for tc in entry.get("tool_calls") or []:
-                tid = str(tc.get("id") or "")
-                if tid:
-                    want[tid] = str(((tc.get("function") or {}).get("name")) or "")
-            answered: set[str] = set()
-            while i < len(out) and out[i].get("role") == "tool":
-                tid = str(out[i].get("tool_call_id") or "")
-                if tid:
-                    answered.add(tid)
-                repaired.append(out[i])
-                i += 1
-            for tid, name in want.items():
-                if tid in answered:
-                    continue
-                if name in _interactive_builtin_names:
-                    content = "[handled interactively; see the following conversation messages]"
-                else:
-                    content = f"[tool result missing (host error): {name or 'unknown tool'}]"
-                repaired.append({"role": "tool", "tool_call_id": tid, "content": content})
-
-        # Adjacent USER turns (operator guidance drained before the first assistant reply, or
-        # across parse-retry cycles) are legal in durable history but 400 on alternation-strict
-        # chat templates (Mistral/Gemma-class). Payload-boundary repair only: join them with a
-        # blank line; the durable records stay distinct. User entries never carry tool_calls,
-        # so a plain content merge is lossless.
-        merged: List[Dict[str, Any]] = []
-        for entry in repaired:
-            if merged and entry.get("role") == "user" and merged[-1].get("role") == "user":
-                prev = dict(merged[-1])
-                prev["content"] = f"{str(prev.get('content') or '').rstrip()}\n\n{str(entry.get('content') or '')}"
-                merged[-1] = prev
-                continue
-            merged.append(entry)
-        return merged
+        # Shared extraction (0011): the proven ReAct pipeline lives in
+        # adapters/transcripts.py and serves all three loops. ReAct passes no
+        # truncate hook (it never bounded messages at this boundary).
+        return sanitize_transcript_messages(messages)
 
     builtin_effect_tools = {
         "ask_user",
@@ -1186,6 +1104,10 @@ def create_react_workflow(
         )
 
         emit("reason", {"iteration": iteration, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
+        ctx_warn = context_usage_warning(limits, scratchpad)
+        if ctx_warn:
+            emit("context_warning", ctx_warn)
+
 
         payload: Dict[str, Any] = {"prompt": ""}
         sanitized_messages = _sanitize_llm_messages(messages_view)
@@ -1327,7 +1249,16 @@ def create_react_workflow(
             {
                 "iteration": cycle_i,
                 "max_iterations": max_iterations,
+                # COMMON CORE across all three loops (0028 contract wave,
+                # 2026-07-14): has_tool_calls + tool_calls + content_preview
+                # are guaranteed keys in every adapter's parse payload;
+                # loop-specific extras (full content/reasoning here) are
+                # additive on top. Consumers key on the core.
                 "has_tool_calls": bool(tool_calls),
+                "tool_calls": [
+                    {"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls
+                ],
+                "content_preview": (str(content or "")[:200] if content else "(no content)"),
                 "content": str(content or ""),
                 "reasoning": reasoning_text,
             },
@@ -1346,18 +1277,15 @@ def create_react_workflow(
             # even after receiving successful observations. Skip executing duplicates to avoid
             # repeatedly overwriting files or re-running commands.
             try:
-                side_effect_tools = {
-                    "write_file",
-                    "edit_file",
-                    "execute_command",
-                    # Comms tools (side-effectful; avoid duplicate sends).
-                    "send_email",
-                    "send_whatsapp_message",
-                    "send_telegram_message",
-                    "send_telegram_artifact",
-                }
+                # Shared classifier (generation_params.is_side_effect_tool,
+                # 0030 promoted 2026-07-14): curated names + the mcp:: prefix
+                # + ToolDefinition.tags (origin-ready — lights up when core
+                # tags MCP/mutating tools at registration). Deny-safe: the
+                # guard only SKIPS re-executing an already-succeeded identical
+                # batch, so misclassifying a read-only tool costs nothing.
+                _tags_map = tool_tags_map(getattr(logic, "tools", None))
                 has_side_effect = any(
-                    isinstance(getattr(tc, "name", None), str) and str(getattr(tc, "name") or "").strip() in side_effect_tools
+                    is_side_effect_tool(getattr(tc, "name", None), tool_tags=_tags_map)
                     for tc in tool_calls
                 )
 
@@ -1367,6 +1295,14 @@ def create_react_workflow(
                     if isinstance(cycles_list, list) and len(cycles_list) >= 2:
                         for c in reversed(cycles_list[:-1]):
                             if not isinstance(c, dict):
+                                continue
+                            # Skipped cycles are NOT "the previous tool cycle"
+                            # (0029 #7): they record the PROPOSED batch but no
+                            # observations, so comparing against them made the
+                            # guard disengage on the very next repeat — the
+                            # protection alternated skip/execute/skip. Scan
+                            # past them to the cycle that actually executed.
+                            if c.get("repeat_skipped") is True:
                                 continue
                             prev_tcs = c.get("tool_calls")
                             if isinstance(prev_tcs, list) and prev_tcs:
@@ -1406,6 +1342,12 @@ def create_react_workflow(
                                 "Instead, use the existing tool outputs and provide the final answer with NO tool calls.",
                             )
                             emit("parse_repeat_tool_calls", {"cycle": cycle_i, "count": len(tool_calls)})
+                            # Synthetic skip marker (0029 #7): this cycle
+                            # recorded the proposed batch but executed nothing
+                            # — mark it so the NEXT identical batch's scan
+                            # skips it and still judges against the cycle
+                            # whose observations are real.
+                            cycle["repeat_skipped"] = True
                             temp["pending_tool_calls"] = []
                             return StepPlan(node_id="parse", next_node="reason")
             except Exception:
@@ -1463,8 +1405,9 @@ def create_react_workflow(
 
         # Final answer candidate. Before stopping, optionally run a verification pass (0217):
         # a strict self-critique that can send the loop back to `act` with concrete next steps if
-        # the task is not actually complete. Gated on `_runtime.review_mode` (default off at the
-        # workflow level; ReactAgent enables it by default via _runtime).
+        # the task is not actually complete. Gated on `_runtime.review_mode` — default off at the
+        # WORKFLOW level (raw factory users opt in); the ReactAgent facade defaults it ON via
+        # _runtime since 2026-07-13 (0027 containment shipped; see agents/react.py).
         answer = str(content).strip()
         temp["final_answer"] = answer
         emit("parse_final", {"cycle": cycle_i})
@@ -1671,13 +1614,25 @@ def create_react_workflow(
                 # inherits the PARENT's budget (a sub-agent is not a lesser agent), with
                 # the ruled 20 as the floor guard against a parent that was itself
                 # narrowed below the ruling. An explicit `max_iterations` tool arg wins.
-                child_iterations: int
+                # Arg-coercion tolerance: budgets can arrive as strings/floats
+                # ("8.5" raised in int() and silently WIDENED an explicit narrow
+                # budget to the >=20 inheritance — the fable5 P1 find 2026-07-13).
                 raw_child_iters = args.get("max_iterations")
-                try:
-                    child_iterations = int(raw_child_iters) if raw_child_iters is not None else 0
-                except Exception:
-                    child_iterations = 0
-                if child_iterations < 1:
+                child_val = coerce_iterations(raw_child_iters) if raw_child_iters is not None else None
+                if raw_child_iters is not None and child_val is None:
+                    emit(
+                        "delegate_agent_budget_fallback",
+                        {"raw": str(raw_child_iters), "warning": "#FALLBACK unparseable max_iterations; inheriting parent"},
+                    )
+                if isinstance(child_val, int):
+                    # Explicit values are honored even when falsy (0029 #15,
+                    # resolver-contract parity): explicit <=0 clamps to the
+                    # loop floor of 1 — it must never silently WIDEN to the
+                    # inheritance default.
+                    child_iterations = child_val if child_val >= 1 else 1
+                else:
+                    # Absent or unparseable: inherit the parent's budget with
+                    # the ruled 20 as the floor guard.
                     child_iterations = max(int(max_iterations or 0), 20)
 
                 sub_vars: Dict[str, Any] = {
@@ -1694,6 +1649,89 @@ def create_react_workflow(
                     },
                     "_limits": {"max_iterations": child_iterations},
                 }
+                # Substrate + sampling inheritance (fable5 A-F7/B-F6 2026-07-13):
+                # runtime.start() seeds child `_runtime.provider/model` from the
+                # RUNTIME CONFIG via setdefault — so a parent run whose host set a
+                # per-run substrate override delegated onto a silently DIFFERENT
+                # model, and temperature/seed reverted to defaults mid-tree. The
+                # child inherits the parent's effective values explicitly (a
+                # sub-agent is not a different mind unless the host says so).
+                for _k in (
+                    "provider",
+                    "model",
+                    "temperature",
+                    "seed",
+                    # Same per-run-behavior class (wave adversaries 2026-07-13):
+                    # a parent with thinking off / a capped output budget /
+                    # example-free tool prompts should not delegate a child
+                    # that silently reverts to provider defaults.
+                    "thinking",
+                    "max_output_tokens",
+                    "tool_prompt_examples",
+                ):
+                    _v = runtime_ns.get(_k)
+                    if _v is not None:
+                        sub_vars["_runtime"][_k] = _v
+
+                # Host-gated substrate palette (0030 promoted 2026-07-13): the
+                # `substrate` arg names a profile the HOST granted via
+                # `_runtime.delegate_substrates` = {name: {provider, model}}.
+                # Unknown/absent names fail as a TOOL error (the parent decides
+                # what to do; never a run failure) and raw provider/model
+                # strings are structurally impossible here — the model choosing
+                # its own substrate would be self-escalation. The palette does
+                # NOT propagate to grandchildren: each level needs its own grant.
+                substrate_name = str(args.get("substrate") or "").strip()
+                if substrate_name:
+                    palette = runtime_ns.get("delegate_substrates")
+                    profile = palette.get(substrate_name) if isinstance(palette, dict) else None
+                    prof_provider = str(profile.get("provider") or "").strip() if isinstance(profile, dict) else ""
+                    prof_model = str(profile.get("model") or "").strip() if isinstance(profile, dict) else ""
+                    if not (prof_provider and prof_model):
+                        available = sorted(str(k) for k in palette.keys()) if isinstance(palette, dict) else []
+                        # Malformed ≠ unknown (wave adversary P2: "Unknown
+                        # substrate 'x'. Available: x." declared a name unknown
+                        # and available in one sentence).
+                        if profile is not None:
+                            err = (
+                                f"Delegate substrate '{substrate_name}' is granted but malformed — "
+                                "a profile needs non-empty 'provider' and 'model'. Ask the host to fix the grant."
+                            )
+                        elif available:
+                            err = f"Unknown delegate substrate '{substrate_name}'. Available: " + ", ".join(available) + "."
+                        else:
+                            err = f"Unknown delegate substrate '{substrate_name}'. No substrate palette was granted for this run."
+                        temp["tool_results"] = {
+                            "results": [
+                                {
+                                    "call_id": str(tc.get("call_id") or ""),
+                                    "name": "delegate_agent",
+                                    "success": False,
+                                    "output": None,
+                                    "error": err,
+                                }
+                            ]
+                        }
+                        return StepPlan(node_id="act", next_node="observe")
+                    # Version-skew loudness (wave adversary P1): a grant carrying
+                    # keys this build does not understand is silently half-applied
+                    # otherwise — warn, never drop silently.
+                    unknown_keys = sorted(set(profile.keys()) - DELEGATE_SUBSTRATE_KEYS) if isinstance(profile, dict) else []
+                    if unknown_keys:
+                        emit(
+                            "delegate_agent_substrate_skew",
+                            {
+                                "substrate": substrate_name,
+                                "ignored_keys": unknown_keys,
+                                "warning": "#FALLBACK unrecognized substrate profile keys ignored (version skew?)",
+                            },
+                        )
+                    sub_vars["_runtime"]["provider"] = prof_provider
+                    sub_vars["_runtime"]["model"] = prof_model
+                    emit(
+                        "delegate_agent_substrate",
+                        {"substrate": substrate_name, "provider": prof_provider, "model": prof_model},
+                    )
 
                 payload = {
                     "workflow_id": str(getattr(run, "workflow_id", "") or "react_agent"),
@@ -1740,9 +1778,26 @@ def create_react_workflow(
                 {"name": tc.get("name", ""), "arguments": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")}
             )
 
+        # Idempotency discriminator (fable5 P0 2026-07-13): the runtime keys
+        # effects on (run_id, node_id, payload) with call_ids STRIPPED from the
+        # hash and scans the WHOLE ledger for prior results — so a repeated
+        # identical batch later in the run (re-read a file after editing it,
+        # re-run the test suite after a fix) silently REPLAYED the stale prior
+        # result instead of executing. A monotonic per-issuance counter makes
+        # each batch's payload unique while staying crash-replay safe: the
+        # increment persists in the SAME save as the effect's ledger record,
+        # so a crash-resume re-derives the same seq (dedup holds), while a
+        # genuinely later identical batch gets a fresh seq (re-executes).
+        act_seq = int(scratchpad.get("act_seq") or 0) + 1
+        scratchpad["act_seq"] = act_seq
+
         return StepPlan(
             node_id="act",
-            effect=Effect(type=EffectType.TOOL_CALLS, payload={"tool_calls": formatted_calls, "allowed_tools": list(allow)}, result_key="_temp.tool_results"),
+            effect=Effect(
+                type=EffectType.TOOL_CALLS,
+                payload={"tool_calls": formatted_calls, "allowed_tools": list(allow), "act_seq": act_seq},
+                result_key="_temp.tool_results",
+            ),
             next_node="observe",
         )
 
@@ -1821,7 +1876,7 @@ def create_react_workflow(
                     rendered = _act_only_ref_content(frame)
                 else:
                     rendered = _act_only_record_content(frame)
-                emit("observe", {"tool": name, "success": success, "result": rendered})
+                emit("observe", {"tool": name, "success": success, "result": rendered, "call_id": str(r.get("call_id") or "")})
                 context["messages"].append(
                     _new_message(
                         ctx,
@@ -1846,7 +1901,7 @@ def create_react_workflow(
             if not success:
                 display = _display(output) if isinstance(output, dict) else str(error or output)
             rendered = logic.format_observation(name=name, output=display, success=success)
-            emit("observe", {"tool": name, "success": success, "result": rendered})
+            emit("observe", {"tool": name, "success": success, "result": rendered, "call_id": str(r.get("call_id") or "")})
 
             context["messages"].append(
                 _new_message(
@@ -1869,7 +1924,17 @@ def create_react_workflow(
             )
 
         if last_cycle is not None:
-            last_cycle["observations"] = obs_list
+            # EXTEND, never assign (fable5 P1 2026-07-13): observe runs
+            # multiple times per iteration whenever the queue splits (builtins
+            # interleaved between externals) — assignment kept only the LAST
+            # batch's observations in the durable cycle record, silently
+            # thinning the report/conclusion channels and the repeat-guard's
+            # evidence. The LLM transcript was unaffected; the record was.
+            existing = last_cycle.get("observations")
+            if isinstance(existing, list):
+                existing.extend(obs_list)
+            else:
+                last_cycle["observations"] = obs_list
 
         temp.pop("tool_results", None)
         pending = temp.get("pending_tool_calls", [])
@@ -1879,7 +1944,7 @@ def create_react_workflow(
         return StepPlan(node_id="observe", next_node="reason")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp, _ = ensure_react_vars(run)
+        context, scratchpad, _, temp, _ = ensure_react_vars(run)
         user_response = temp.get("user_response", {})
         if not isinstance(user_response, dict):
             user_response = {}
@@ -1888,6 +1953,15 @@ def create_react_workflow(
 
         context["messages"].append(_new_message(ctx, role="user", content=f"[User response]: {response_text}"))
         temp.pop("user_response", None)
+
+        # Per-TURN report state resets at the turn boundary (0028, 2026-07-14):
+        # `review_skipped` entries from a previous turn polluted the next
+        # turn's report line and complete_output flag in multi-turn (ask_user)
+        # runs — a turn that reviewed cleanly reported a stale #FALLBACK. The
+        # emit/ledger history keeps the record; report/output reflect THIS
+        # turn. Same for the announced-latch of the budget terminal.
+        scratchpad.pop("review_skipped", None)
+        temp.pop("max_iterations_announced", None)
 
         if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
@@ -1985,11 +2059,19 @@ def create_react_workflow(
         }
 
         emit("review_request", {"tool_messages": len(tool_msgs)})
+        # The explicit output cap covers the verifier too (regression adversary
+        # P1-2, 2026-07-13): review is on the default path now, and it was the
+        # ONE unbounded call type when ReactAgent(max_output_tokens=...) was set
+        # (init nulls _limits; the surviving _runtime channel wasn't read here).
+        review_params: Dict[str, Any] = {}
+        max_out = _max_output_tokens(runtime_ns, limits)
+        if isinstance(max_out, int) and max_out > 0:
+            review_params["max_tokens"] = max_out
         payload: Dict[str, Any] = {
             "prompt": prompt,
             "response_schema": schema,
             "response_schema_name": "ReActVerifier",
-            "params": runtime_llm_params(runtime_ns, extra={}, default_temperature=0.2),
+            "params": runtime_llm_params(runtime_ns, extra=review_params, default_temperature=0.2),
             # Review-failure containment (backlog 0027, c1128 incident class): the
             # verifier is a verification AID — a failed verifier call (structured
             # validation, provider error, anything) must never kill a run whose
@@ -2121,7 +2203,7 @@ def create_react_workflow(
         # `handed_off` disambiguates composition (visit turns: the RUN continues
         # past this turn's final answer) from true run completion for hook
         # consumers reading turn_end/final_answer as terminal.
-        emit("done", {"answer": answer, "handed_off": bool(final_next_node)})
+        emit("done", {"answer": answer, "handed_off": bool(final_next_node), "outcome": "final_answer"})
 
         messages = context.get("messages")
         if isinstance(messages, list):
@@ -2140,6 +2222,16 @@ def create_react_workflow(
             "iterations": iterations,
             "messages": list(context.get("messages") or []),
             "scratchpad": dict(scratchpad),
+            # Machine-readable terminal outcome (fable5 A-F8 2026-07-13): done
+            # and max_iterations produced shape-identical outputs — a work door
+            # deciding complete-vs-reschedule had to parse prose. Additive.
+            # VOCABULARY = the canonical turn_end one (final_answer |
+            # iteration_budget, loop_hooks._TURN_END_OUTCOME) — the wave
+            # adversary caught the same enum spelled two ways (node names vs
+            # semantic names) with zero consumers to migrate; one vocabulary,
+            # stream and output.
+            "outcome": "final_answer",
+            "review_skipped": bool(scratchpad.get("review_skipped")),
         }
         if final_next_node:
             # Composition handoff (visit TURN chain): the turn is finished but the RUN
@@ -2154,7 +2246,17 @@ def create_react_workflow(
         max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
-        emit("max_iterations", {"iterations": max_iterations})
+        # turn_end multi-emit fix (0028, 2026-07-14): this node RE-ENTERS
+        # (conclusion LLM dispatch -> parse -> possible retry), and the old
+        # top-of-node emit fired `max_iterations` (canonical turn_end) on
+        # every entry — a turn "ended" 2-3 times per budget exhaustion. Split:
+        # `max_iterations_reached` announces ONCE at first entry (listeners
+        # learn the budget is gone before the conclusion call's latency);
+        # `max_iterations` (-> turn_end) fires ONCE at the completion branch,
+        # where the turn actually ends.
+        if not temp.get("max_iterations_announced"):
+            temp["max_iterations_announced"] = True
+            emit("max_iterations_reached", {"iterations": max_iterations})
 
         # Deterministic conclusion: when we hit the iteration cap, run one tool-free LLM call
         # to synthesize a final report + next steps while the scratchpad is still in context.
@@ -2162,6 +2264,12 @@ def create_react_workflow(
         if not isinstance(resp, dict):
             _fold_hook_steering(runtime_ns)
             drained_guidance = _drain_inbox(runtime_ns)
+            if drained_guidance:
+                # message_drained contract parity (fable5 P2 2026-07-13):
+                # guidance consumed at the CONCLUSION boundary must fire the
+                # same listen point as the reason-boundary drain — a capture
+                # host waiting for consumption confirmation never saw these.
+                emit("inbox_drained", {"chars": len(drained_guidance), "iteration": max_iterations})
             conclude_directive = (
                 "You have reached the maximum allowed ReAct iterations.\n"
                 "You MUST stop using tools now and provide a best-effort conclusion.\n\n"
@@ -2204,16 +2312,36 @@ def create_react_workflow(
 
             sys_base = str(req.system_prompt or "").strip()
             sys = _compose_system_prompt(runtime_ns, base=sys_base)
+            if sys:
+                payload["system_prompt"] = sys
+
+            # Conclusion state rides a TRAILING volatile message, never the
+            # system prompt (fable5 B-F7 2026-07-13): appending the directive +
+            # rendered scratchpad to the SYSTEM prompt under the same
+            # prompt_cache_key as the main loop forced one guaranteed full
+            # re-prefill at the end of every budget-exhausted run. Same pattern
+            # as the reason node's loop tail (adjacency guard included).
             block_parts: list[str] = []
             if drained_guidance:
                 block_parts.append(f"Host guidance:\n{drained_guidance}")
             block_parts.append(conclude_directive)
-            sys = (f"{sys.rstrip()}\n\n## Max iterations reached\n" + "\n\n".join(block_parts)).strip()
             scratch_txt = _render_cycles_for_conclusion_prompt(scratchpad)
             if scratch_txt:
-                sys = f"{sys.rstrip()}\n\n## Scratchpad (ReAct cycles so far)\n{scratch_txt}".strip()
-            if sys:
-                payload["system_prompt"] = sys
+                block_parts.append(f"## Scratchpad (ReAct cycles so far)\n{scratch_txt}")
+            tail_text = ("## Max iterations reached\n" + "\n\n".join(block_parts)).strip()
+            if isinstance(payload.get("messages"), list):
+                msgs_out = list(payload["messages"])
+                if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
+                    last = dict(msgs_out[-1])
+                    last["content"] = f"{str(last.get('content') or '').rstrip()}\n\n{tail_text}"
+                    msgs_out[-1] = last
+                else:
+                    msgs_out.append({"role": "user", "content": tail_text, "volatile": True})
+                payload["messages"] = msgs_out
+            elif str(payload.get("prompt") or "").strip():
+                payload["prompt"] = f"{payload['prompt'].rstrip()}\n\n{tail_text}"
+            else:
+                payload["prompt"] = tail_text
 
             eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
             eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
@@ -2292,7 +2420,12 @@ def create_react_workflow(
             "iterations": iterations,
             "messages": list(context.get("messages") or []),
             "scratchpad": dict(scratchpad),
+            # Machine-readable terminal outcome (canonical turn_end vocabulary).
+            "outcome": "iteration_budget",
+            "review_skipped": bool(scratchpad.get("review_skipped")),
         }
+        # The turn ends HERE (0028 multi-emit fix): one turn_end per turn.
+        emit("max_iterations", {"iterations": max_iterations, "outcome": "iteration_budget"})
         if final_next_node:
             # Composition handoff: budget exhaustion also ends the TURN, not the run —
             # the seam node decides what an out-of-budget visit turn does next.

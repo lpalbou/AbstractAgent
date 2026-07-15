@@ -11,7 +11,7 @@ def read_file(path: str) -> str:
 
 
 def test_build_request_includes_history_and_memory_instruction() -> None:
-    logic = ReActLogic(tools=[read_file._tool_definition], max_history_messages=-1, max_tokens=321)
+    logic = ReActLogic(tools=[read_file._tool_definition])
     req = logic.build_request(
         task="Do something",
         messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
@@ -41,7 +41,7 @@ def test_build_request_includes_history_and_memory_instruction() -> None:
 
 
 def test_build_request_does_not_slice_history() -> None:
-    logic = ReActLogic(tools=[read_file._tool_definition], max_history_messages=-1)
+    logic = ReActLogic(tools=[read_file._tool_definition])
     messages = [
         {"role": "user", "content": "m1"},
         {"role": "assistant", "content": "m2"},

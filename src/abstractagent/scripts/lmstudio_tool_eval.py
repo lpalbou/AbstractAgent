@@ -335,6 +335,10 @@ def _run_scenarios(*, scenarios: List[Scenario]) -> int:
                 llm_kwargs=llm_kwargs,
                 max_iterations=20,
                 max_tokens=8192,
+                # Pin: the eval measures the BARE loop's tool behavior; the
+                # 2026-07-13 review default flip must not add verifier rounds
+                # to the measurement (results stay comparable with history).
+                review_mode=False,
             )
 
             agent.start(s.prompt(ctx))

@@ -35,8 +35,8 @@ flowchart LR
 ## What you get
 
 - **ReAct**: tool-first Reason → Act → Observe loop
-- **CodeAct**: executes Python (tool call or fenced ` ```python``` ` blocks)
-- **MemAct**: memory-enhanced agent using runtime-owned Active Memory
+- **CodeAct**: executes Python (tool calls; on prompted-tools models also fenced ` ```python``` ` blocks)
+- **MemAct** (experimental): memory-enhanced agent using runtime-owned Active Memory — distinct architecture, less production mileage; import from `abstractagent.agents.memact` (deliberately not top-level)
 - **Durable runs**: pause/resume via `run_id` + runtime stores
 - **Tool control**: explicit tool bundles + per-run allowlists (unresolvable
   grant names are recorded loudly, never dropped silently)
@@ -92,11 +92,21 @@ python -c "import importlib.metadata as md; print(md.version('abstractagent'))"
 ```python
 from abstractagent import create_react_agent
 
-agent = create_react_agent(provider="ollama", model="qwen3:1.7b-q4_K_M")
+# provider/model resolve from your AbstractCore config defaults
+# (`abstractcore --config`) when omitted; pass them explicitly to pin.
+agent = create_react_agent(provider="ollama", model="qwen3:4b")
 agent.start("List the files in the current directory")
 state = agent.run_to_completion()
 print(state.output["answer"])
 ```
+
+Tip: these loops send the full transcript plus ~19 tool schemas every cycle —
+prefer a tool-capable model. On Ollama, raise the context window to the model's
+maximum available context or the server silently truncates from the oldest
+content first: per-call `llm_kwargs={"num_ctx": <model max>}` (forwarded since
+2026-07-13) or server-side `OLLAMA_CONTEXT_LENGTH=<model max> ollama serve`.
+House rule: maximum available context unless you explicitly choose otherwise —
+a fixed lower number is a hidden ceiling (see [`docs/faq.md`](docs/faq.md)).
 
 ## Persistence (resume across restarts)
 

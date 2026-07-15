@@ -141,6 +141,78 @@ def test_react_review_success_path_unchanged() -> None:
     assert "review: #FALLBACK skipped" not in str((final.output or {}).get("report") or "")
 
 
+def test_memact_finalize_failure_keeps_the_draft_answer() -> None:
+    """MemAct's MANDATORY finalize path carries the same c1128 incident class
+    (fable5 P1 2026-07-13): a terminally failed structured finalize call must
+    never destroy `_temp.draft_answer` — the model's real, already-produced
+    answer. The finalize effect opts into `_absorb_failure`; finalize_parse
+    falls back to the draft with a loud #FALLBACK marker."""
+    from abstractagent.adapters.memact_runtime import create_memact_workflow
+    from abstractagent.logic.memact import MemActLogic
+
+    class _Ctx:
+        @staticmethod
+        def now_iso() -> str:
+            return "2025-01-01T00:00:00+00:00"
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    wf = create_memact_workflow(
+        logic=MemActLogic(tools=[ToolDefinition(name="edit_file", description="edit", parameters={})]),
+        on_step=lambda step, data: events.append((step, dict(data))),
+    )
+
+    # The finalize effect declares absorption on the wire.
+    run_req = RunState(
+        run_id="r-fin-req",
+        workflow_id="memact_agent",
+        status=RunStatus.RUNNING,
+        current_node="finalize",
+        vars={
+            "context": {"task": "t", "messages": []},
+            "scratchpad": {"iteration": 1},
+            "_runtime": {"inbox": []},
+            "_temp": {"draft_answer": "The real answer."},
+            "_limits": {"max_history_messages": -1, "max_tokens": 32768},
+        },
+    )
+    plan = wf.get_node("finalize")(run_req, _Ctx())
+    assert plan.effect is not None
+    assert (plan.effect.payload or {}).get("_absorb_failure") is True
+
+    # The absorbed record keeps the draft and completes, loudly.
+    run = RunState(
+        run_id="r-fin",
+        workflow_id="memact_agent",
+        status=RunStatus.RUNNING,
+        current_node="finalize_parse",
+        vars={
+            "context": {"task": "t", "messages": []},
+            "scratchpad": {"iteration": 1},
+            "_runtime": {"inbox": []},
+            "_temp": {
+                "draft_answer": "The real answer.",
+                "finalize_llm_response": {"ok": False, "absorbed_failure": "validation error"},
+            },
+            "_limits": {"max_history_messages": -1, "max_tokens": 32768},
+        },
+    )
+    plan2 = wf.get_node("finalize_parse")(run, _Ctx())
+    assert plan2.next_node == "done"
+    assert run.vars["_temp"]["final_answer"] == "The real answer."
+    skipped = run.vars["scratchpad"].get("finalize_skipped")
+    assert isinstance(skipped, list) and skipped[0]["warning"] == "#FALLBACK"
+    assert any(s == "finalize_skipped" for s, _ in events)
+
+    # Non-JSON finalize output (no absorption) also keeps the draft.
+    run.vars["_temp"] = {
+        "draft_answer": "Draft survives.",
+        "finalize_llm_response": {"content": "not json at all"},
+    }
+    plan3 = wf.get_node("finalize_parse")(run, _Ctx())
+    assert plan3.next_node == "done"
+    assert run.vars["_temp"]["final_answer"] == "Draft survives."
+
+
 def test_codeact_review_parse_contains_absorbed_failure() -> None:
     """CodeAct carries the same verifier fork (pre-C5/0021): the absorbed record
     must route to done — NOT fall through into the unactionable-retry path,

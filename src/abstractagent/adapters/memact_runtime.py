@@ -11,8 +11,16 @@ from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
 
-from .generation_params import resolve_max_iterations, runtime_llm_params
+from .generation_params import (
+    DELEGATE_SUBSTRATE_KEYS,
+    coerce_iterations,
+    compose_prompt_slots,
+    context_usage_warning,
+    resolve_max_iterations,
+    runtime_llm_params,
+)
 from .media import extract_media_from_context
+from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
 from .loop_hooks import LoopHooks
 from .tool_allowlist import note_pruned_grants
 from ..logic.memact import MemActLogic
@@ -47,7 +55,30 @@ def _new_message(
     }
 
 
+
+def _new_assistant_message_with_tool_calls(
+    ctx: Any,
+    *,
+    content: str,
+    tool_calls: List[Any],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Assistant message preserving tool_calls metadata (0011 shared shape)."""
+    msg = _new_message(ctx, role="assistant", content=content, metadata=metadata)
+    tc_payload = assistant_tool_calls_payload(tool_calls)
+    if tc_payload:
+        msg["tool_calls"] = tc_payload
+    return msg
+
 def ensure_memact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    # Captured BEFORE ensure_limits materializes defaults (0029 #6).
+    _raw_limits = run.vars.get("_limits")
+    _caller_set_budget = isinstance(_raw_limits, dict) and _raw_limits.get("max_iterations") is not None
+    _raw_scratchpad = run.vars.get("scratchpad")
+    _legacy_budget = "max_iterations" in run.vars or (
+        isinstance(_raw_scratchpad, dict) and _raw_scratchpad.get("max_iterations") is not None
+    )
+
     ensure_namespaces(run.vars)
     limits = ensure_limits(run.vars)
     context = run.vars["context"]
@@ -59,6 +90,13 @@ def ensure_memact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], D
         context["task"] = run.vars.pop("task")
     if "messages" in run.vars and "messages" not in context:
         context["messages"] = run.vars.pop("messages")
+    # Legacy flat-key migration parity (0029 #6 sharpened here: MemAct never
+    # migrated the flat budget at all — a raw vars={"max_iterations": N}
+    # was ignored entirely, not just out-prioritized).
+    if "iteration" in run.vars and "iteration" not in scratchpad:
+        scratchpad["iteration"] = run.vars.pop("iteration")
+    if "max_iterations" in run.vars and "max_iterations" not in scratchpad:
+        scratchpad["max_iterations"] = run.vars.pop("max_iterations")
 
     if not isinstance(context.get("messages"), list):
         context["messages"] = []
@@ -79,6 +117,10 @@ def ensure_memact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], D
             scratchpad["max_iterations"] = 20
     if scratchpad["max_iterations"] < 1:
         scratchpad["max_iterations"] = 1
+
+    # 0029 #6: explicit legacy budget seeds _limits unless the caller set it.
+    if _legacy_budget and not _caller_set_budget:
+        limits["max_iterations"] = scratchpad["max_iterations"]
 
     used_tools = scratchpad.get("used_tools")
     if not isinstance(used_tools, bool):
@@ -232,46 +274,27 @@ def create_memact_workflow(
                 out.append(tool)
         return out
 
+    def _compose_system_prompt_extra(runtime_ns: Dict[str, Any], *, base: str) -> str:
+        """Append the SHARED named slots at fixed post-base positions (fable5
+        A-F1 2026-07-13): this adapter wrote the sub-agent directive into
+        delegated children's system_prompt_extra but never read the key — the
+        directive was silently dropped. Slot order/headers live in ONE place
+        (`generation_params.PROMPT_SLOTS`, all three adapters); values must be
+        byte-stable for the run (cache contract; docs/skills-attachment.md)."""
+        return compose_prompt_slots(str(base or ""), runtime_ns)
+
     def _system_prompt_override(runtime_ns: Dict[str, Any]) -> Optional[str]:
         raw = runtime_ns.get("system_prompt") if isinstance(runtime_ns, dict) else None
         if isinstance(raw, str) and raw.strip():
             return raw
         return None
 
-    def _sanitize_llm_messages(messages: Any) -> List[Dict[str, str]]:
-        if not isinstance(messages, list) or not messages:
-            return []
-        out: List[Dict[str, str]] = []
-        for m in messages:
-            if not isinstance(m, dict):
-                continue
-            role = str(m.get("role") or "").strip()
-            content = m.get("content")
-            if not role or content is None:
-                continue
-            content_str = str(content)
-            if not content_str.strip():
-                continue
-            entry: Dict[str, str] = {"role": role, "content": content_str}
-            if role == "tool":
-                meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
-                call_id = meta.get("call_id") if isinstance(meta, dict) else None
-                if call_id is not None and str(call_id).strip():
-                    entry["tool_call_id"] = str(call_id).strip()
-            out.append(entry)
-
-        # Adjacent USER turns (operator guidance drained before the first assistant reply) are
-        # legal in durable history but 400 on alternation-strict chat templates (Mistral/Gemma-
-        # class). Payload-boundary repair only: join them; the durable records stay distinct.
-        merged: List[Dict[str, str]] = []
-        for entry in out:
-            if merged and entry.get("role") == "user" and merged[-1].get("role") == "user":
-                prev = dict(merged[-1])
-                prev["content"] = f"{str(prev.get('content') or '').rstrip()}\n\n{str(entry.get('content') or '')}"
-                merged[-1] = prev
-                continue
-            merged.append(entry)
-        return merged
+    def _sanitize_llm_messages(messages: Any) -> List[Dict[str, Any]]:
+        """Shared extraction (backlog 0011): assistant `tool_calls` metadata
+        survives to the wire and orphaned tool messages are repaired — multi-
+        iteration tool use no longer 400s on strict providers. MemAct bounds
+        no message sizes at this boundary (no truncate hook)."""
+        return sanitize_transcript_messages(messages)
 
     def init_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, _, limits = ensure_memact_vars(run)
@@ -378,6 +401,25 @@ def create_memact_workflow(
             return StepPlan(node_id="compose", next_node="reason")
 
         kg_result = bucket.get("kg_result")
+        # Present-but-NON-DICT = a FAILED compose, never a missing one (0029
+        # #12): a custom host handler returning a string/list used to fall
+        # through to "schedule KG query", and idempotency replayed the
+        # identical effect instantly — compose spun forever, consuming no
+        # iteration budget. Fail the compose loudly and continue to reason.
+        if "kg_result" in bucket and not isinstance(kg_result, dict):
+            bucket.pop("kg_result", None)
+            bucket["applied_key"] = compose_key
+            emit(
+                "compose",
+                {
+                    "ok": False,
+                    "stimulus": stimulus,
+                    "recall_level": recall_level,
+                    "scope": scope,
+                    "error": f"#FALLBACK KG handler returned {type(kg_result).__name__}, expected dict — composition skipped",
+                },
+            )
+            return StepPlan(node_id="compose", next_node="reason")
         if isinstance(kg_result, dict):
             try:
                 from abstractruntime.memory.memact_composer import compose_memact_current_context_from_kg_result
@@ -523,9 +565,15 @@ def create_memact_workflow(
 
         memory_prompt = render_memact_system_prompt(run.vars)
         base_sys = _system_prompt_override(runtime_ns) or req.system_prompt
-        system_prompt = (memory_prompt + "\n\n" + str(base_sys or "")).strip()
+        system_prompt = _compose_system_prompt_extra(
+            runtime_ns, base=(memory_prompt + "\n\n" + str(base_sys or "")).strip()
+        )
 
         emit("reason", {"iteration": iteration + 1, "max_iterations": max_iterations, "has_guidance": bool(guidance)})
+        ctx_warn = context_usage_warning(limits, scratchpad)
+        if ctx_warn:
+            emit("context_warning", ctx_warn)
+
 
         payload: Dict[str, Any] = {"prompt": ""}
         sanitized_messages = _sanitize_llm_messages(messages_view)
@@ -544,6 +592,21 @@ def create_memact_workflow(
             payload["tools"] = list(tool_specs)
         if system_prompt:
             payload["system_prompt"] = system_prompt
+
+        # Volatile loop position rides a trailing ephemeral message, never the
+        # system prompt (0212 propagated, fable5 2026-07-13 — the head counter
+        # busted the prefix cache every cycle). Adjacency guard mirrors ReAct.
+        tail_text = f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}."
+        if isinstance(payload.get("messages"), list):
+            msgs_out = list(payload["messages"])
+            if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
+                last = dict(msgs_out[-1])
+                last["content"] = f"{str(last.get('content') or '').rstrip()}\n\n{tail_text}"
+                msgs_out[-1] = last
+            else:
+                msgs_out.append({"role": "user", "content": tail_text, "volatile": True})
+            payload["messages"] = msgs_out
+
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
         eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
         if isinstance(eff_provider, str) and eff_provider.strip():
@@ -568,19 +631,30 @@ def create_memact_workflow(
         content, tool_calls = logic.parse_response(response)
         temp.pop("llm_response", None)
 
+        # COMMON CORE parse payload (0028 contract wave, 2026-07-14): every
+        # loop guarantees has_tool_calls + tool_calls + content_preview.
         emit(
             "parse",
             {
                 "has_tool_calls": bool(tool_calls),
-                "tool_calls": [{"name": tc.name, "arguments": tc.arguments, "call_id": tc.call_id} for tc in tool_calls],
+                "tool_calls": [{"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls],
+                "content_preview": (str(content or "")[:200] if content else "(no content)"),
             },
         )
 
         if tool_calls:
-            # Keep any user-facing prelude content (optional) in history.
-            clean = str(content or "").strip()
-            if clean:
-                context["messages"].append(_new_message(ctx, role="assistant", content=clean))
+            # Durable tool_calls preservation (0011): the assistant turn that
+            # PROPOSED the batch must announce the ids its tool results answer
+            # — content-only appends orphaned every tool message on strict
+            # providers (native OpenAI 400s the request at iteration 2).
+            context["messages"].append(
+                _new_assistant_message_with_tool_calls(
+                    ctx,
+                    content=str(content or "").strip(),
+                    tool_calls=tool_calls,
+                    metadata={"kind": "tool_calls"},
+                )
+            )
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
             return StepPlan(node_id="parse", next_node="act")
 
@@ -708,6 +782,35 @@ def create_memact_workflow(
                 if delegated_context:
                     combined_task = f"{delegated_task}\n\nContext:\n{delegated_context}"
 
+                # Child iteration budget (backlog 0012 / C3 — ReAct's ruled resolution
+                # applied to this sibling; the shared DELEGATE_AGENT_TOOL schema already
+                # documents it): an explicit `max_iterations` tool arg wins; otherwise
+                # the child inherits the PARENT's budget with the ruled 20 as floor.
+                # The old hardcoded 10 made the shared schema lie for this loop.
+                parent_iterations = resolve_max_iterations(
+                    run.vars.get("_limits") if isinstance(run.vars.get("_limits"), dict) else {},
+                    run.vars.get("scratchpad") if isinstance(run.vars.get("scratchpad"), dict) else {},
+                )
+                # Arg-coercion tolerance (fable5 P1 2026-07-13): string-float
+                # budgets ("8.5") raised in int() and silently widened.
+                raw_child_iters = args.get("max_iterations")
+                child_val = coerce_iterations(raw_child_iters) if raw_child_iters is not None else None
+                if raw_child_iters is not None and child_val is None:
+                    emit(
+                        "delegate_agent_budget_fallback",
+                        {"raw": str(raw_child_iters), "warning": "#FALLBACK unparseable max_iterations; inheriting parent"},
+                    )
+                if isinstance(child_val, int):
+                    # Explicit values are honored even when falsy (0029 #15,
+                    # resolver-contract parity): explicit <=0 clamps to the
+                    # loop floor of 1 — it must never silently WIDEN to the
+                    # inheritance default.
+                    child_iterations = child_val if child_val >= 1 else 1
+                else:
+                    # Absent or unparseable: inherit the parent's budget with
+                    # the ruled 20 as the floor guard.
+                    child_iterations = max(int(parent_iterations or 0), 20)
+
                 sub_vars: Dict[str, Any] = {
                     "context": {"task": combined_task, "messages": []},
                     "_runtime": {
@@ -720,8 +823,87 @@ def create_memact_workflow(
                             "- Return a concise result suitable for the parent agent to act on.\n"
                         ),
                     },
-                    "_limits": {"max_iterations": 10},
+                    "_limits": {"max_iterations": child_iterations},
                 }
+                # Substrate + sampling inheritance (fable5 A-F7/B-F6 2026-07-13;
+                # see react_runtime's delegate branch): the child inherits the
+                # parent's effective provider/model/temperature/seed explicitly.
+                for _k in (
+                    "provider",
+                    "model",
+                    "temperature",
+                    "seed",
+                    # Same per-run-behavior class (wave adversaries 2026-07-13):
+                    # a parent with thinking off / a capped output budget /
+                    # example-free tool prompts should not delegate a child
+                    # that silently reverts to provider defaults.
+                    "thinking",
+                    "max_output_tokens",
+                    "tool_prompt_examples",
+                ):
+                    _v = runtime_ns.get(_k)
+                    if _v is not None:
+                        sub_vars["_runtime"][_k] = _v
+
+                # Host-gated substrate palette (0030 promoted 2026-07-13): the
+                # `substrate` arg names a profile the HOST granted via
+                # `_runtime.delegate_substrates` = {name: {provider, model}}.
+                # Unknown/absent names fail as a TOOL error (the parent decides
+                # what to do; never a run failure) and raw provider/model
+                # strings are structurally impossible here — the model choosing
+                # its own substrate would be self-escalation. The palette does
+                # NOT propagate to grandchildren: each level needs its own grant.
+                substrate_name = str(args.get("substrate") or "").strip()
+                if substrate_name:
+                    palette = runtime_ns.get("delegate_substrates")
+                    profile = palette.get(substrate_name) if isinstance(palette, dict) else None
+                    prof_provider = str(profile.get("provider") or "").strip() if isinstance(profile, dict) else ""
+                    prof_model = str(profile.get("model") or "").strip() if isinstance(profile, dict) else ""
+                    if not (prof_provider and prof_model):
+                        available = sorted(str(k) for k in palette.keys()) if isinstance(palette, dict) else []
+                        # Malformed ≠ unknown (wave adversary P2: "Unknown
+                        # substrate 'x'. Available: x." declared a name unknown
+                        # and available in one sentence).
+                        if profile is not None:
+                            err = (
+                                f"Delegate substrate '{substrate_name}' is granted but malformed — "
+                                "a profile needs non-empty 'provider' and 'model'. Ask the host to fix the grant."
+                            )
+                        elif available:
+                            err = f"Unknown delegate substrate '{substrate_name}'. Available: " + ", ".join(available) + "."
+                        else:
+                            err = f"Unknown delegate substrate '{substrate_name}'. No substrate palette was granted for this run."
+                        temp["tool_results"] = {
+                            "results": [
+                                {
+                                    "call_id": str(tc.get("call_id") or ""),
+                                    "name": "delegate_agent",
+                                    "success": False,
+                                    "output": None,
+                                    "error": err,
+                                }
+                            ]
+                        }
+                        return StepPlan(node_id="act", next_node="observe")
+                    # Version-skew loudness (wave adversary P1): a grant carrying
+                    # keys this build does not understand is silently half-applied
+                    # otherwise — warn, never drop silently.
+                    unknown_keys = sorted(set(profile.keys()) - DELEGATE_SUBSTRATE_KEYS) if isinstance(profile, dict) else []
+                    if unknown_keys:
+                        emit(
+                            "delegate_agent_substrate_skew",
+                            {
+                                "substrate": substrate_name,
+                                "ignored_keys": unknown_keys,
+                                "warning": "#FALLBACK unrecognized substrate profile keys ignored (version skew?)",
+                            },
+                        )
+                    sub_vars["_runtime"]["provider"] = prof_provider
+                    sub_vars["_runtime"]["model"] = prof_model
+                    emit(
+                        "delegate_agent_substrate",
+                        {"substrate": substrate_name, "provider": prof_provider, "model": prof_model},
+                    )
 
                 payload = {
                     "workflow_id": str(getattr(run, "workflow_id", "") or "memact_agent"),
@@ -824,11 +1006,18 @@ def create_memact_workflow(
                 {"name": tc.get("name", ""), "arguments": tc.get("arguments", {}), "call_id": str(tc.get("call_id") or "")}
             )
 
+        # Idempotency discriminator (fable5 P0 2026-07-13; see react_runtime's
+        # act_node): a later byte-identical batch replayed the stale ledger
+        # result. Persisted counter = crash-safe dedup + fresh key per issuance.
+        scratchpad_ns = run.vars.get("scratchpad") if isinstance(run.vars.get("scratchpad"), dict) else {}
+        act_seq = int(scratchpad_ns.get("act_seq") or 0) + 1
+        scratchpad_ns["act_seq"] = act_seq
+
         return StepPlan(
             node_id="act",
             effect=Effect(
                 type=EffectType.TOOL_CALLS,
-                payload={"tool_calls": formatted_calls, "allowed_tools": list(allow)},
+                payload={"tool_calls": formatted_calls, "allowed_tools": list(allow), "act_seq": act_seq},
                 result_key="_temp.tool_results",
             ),
             next_node="observe",
@@ -864,7 +1053,7 @@ def create_memact_workflow(
             if not success:
                 display = _display(output) if isinstance(output, dict) else str(error or output)
             rendered = logic.format_observation(name=name, output=display, success=success)
-            emit("observe", {"tool": name, "success": success, "result": rendered})
+            emit("observe", {"tool": name, "success": success, "result": rendered, "call_id": str(r.get("call_id") or "")})
 
             context["messages"].append(
                 _new_message(
@@ -883,7 +1072,7 @@ def create_memact_workflow(
         return StepPlan(node_id="observe", next_node="compose")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
-        context, _, _, temp, _ = ensure_memact_vars(run)
+        context, scratchpad, _, temp, _ = ensure_memact_vars(run)
         user_response = temp.get("user_response", {})
         if not isinstance(user_response, dict):
             user_response = {}
@@ -892,6 +1081,10 @@ def create_memact_workflow(
 
         context["messages"].append(_new_message(ctx, role="user", content=f"[User response]: {response_text}"))
         temp.pop("user_response", None)
+
+        # Per-turn report state resets at the turn boundary (wave-E P2-4
+        # symmetry, 2026-07-14): finalize_skipped is per-turn report state.
+        scratchpad.pop("finalize_skipped", None)
 
         if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
@@ -924,7 +1117,9 @@ def create_memact_workflow(
             "- If you have no changes for a module, use empty lists.\n"
         )
 
-        system_prompt = (memory_prompt + "\n\n" + str(base_sys or "")).strip()
+        system_prompt = _compose_system_prompt_extra(
+            runtime_ns, base=(memory_prompt + "\n\n" + str(base_sys or "")).strip()
+        )
         prompt = (
             "Finalize now.\n\n"
             f"User request:\n{task}\n\n"
@@ -940,6 +1135,12 @@ def create_memact_workflow(
             "response_schema": MEMACT_ENVELOPE_SCHEMA_V1,
             "response_schema_name": "MemActEnvelopeV1",
             "params": runtime_llm_params(runtime_ns, extra={"temperature": 0.2}),
+            # Finalize-failure containment (fable5 P1 2026-07-13 — the c1128
+            # incident class, unpatched in MemAct's MANDATORY finalize path): a
+            # terminally failed structured finalize call must never kill a run
+            # whose _temp.draft_answer already holds the model's real answer.
+            # finalize_parse falls back to the draft on the absorbed record.
+            "_absorb_failure": True,
         }
 
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
@@ -963,6 +1164,27 @@ def create_memact_workflow(
         if not isinstance(resp, dict):
             resp = {}
 
+        draft = str(temp.get("draft_answer") or "").strip()
+
+        absorbed = resp.get("absorbed_failure")
+        if absorbed is not None:
+            # The finalize call failed terminally (runtime `_absorb_failure`
+            # shape). A finalize aid must never destroy a held answer: the
+            # draft the model already produced IS the answer; the envelope
+            # application is skipped (memory updates lost for this turn — the
+            # loud marker says so).
+            reason = str(absorbed or "").strip() or "unknown error"
+            skipped = scratchpad.get("finalize_skipped")
+            if not isinstance(skipped, list):
+                skipped = []
+                scratchpad["finalize_skipped"] = skipped
+            skipped.append({"reason": reason, "warning": "#FALLBACK"})
+            emit("finalize_skipped", {"reason": reason, "warning": "#FALLBACK", "used_draft_answer": bool(draft)})
+            temp.pop("finalize_llm_response", None)
+            temp.pop("draft_answer", None)
+            temp["final_answer"] = draft or "No answer provided"
+            return StepPlan(node_id="finalize_parse", next_node="done")
+
         data = resp.get("data")
         if data is None and isinstance(resp.get("content"), str):
             try:
@@ -974,6 +1196,11 @@ def create_memact_workflow(
 
         content = data.get("content")
         final_answer = str(content or "").strip()
+        if not final_answer and draft:
+            # Non-JSON / empty-content finalize output: the draft is the real
+            # answer — never discard it for "No answer provided" (fable5 P1).
+            emit("finalize_used_draft", {"warning": "#FALLBACK finalize envelope unparseable; draft answer kept"})
+            final_answer = draft
 
         from abstractruntime.memory.active_memory import apply_memact_envelope
 
@@ -990,7 +1217,7 @@ def create_memact_workflow(
     def done_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, _, temp, limits = ensure_memact_vars(run)
         answer = str(temp.get("final_answer") or "No answer provided")
-        emit("done", {"answer": answer})
+        emit("done", {"answer": answer, "outcome": "final_answer"})
 
         iterations = int(limits.get("current_iteration", 0) or scratchpad.get("iteration", 0) or 0)
 
@@ -1005,7 +1232,16 @@ def create_memact_workflow(
         _discard_hook_steering_at_terminal()
         return StepPlan(
             node_id="done",
-            complete_output={"answer": answer, "iterations": iterations, "messages": list(context.get("messages") or [])},
+            complete_output={
+                "answer": answer,
+                "iterations": iterations,
+                "messages": list(context.get("messages") or []),
+                # Canonical turn_end vocabulary (final_answer | iteration_budget).
+                "outcome": "final_answer",
+                # Loudness parity (fable5 2026-07-13): a skipped finalize must
+                # be visible in the run OUTPUT, not only the emit lane.
+                "finalize_skipped": bool(scratchpad.get("finalize_skipped")),
+            },
         )
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
@@ -1013,14 +1249,39 @@ def create_memact_workflow(
         max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
-        emit("max_iterations", {"iterations": max_iterations})
+        emit("max_iterations", {"iterations": max_iterations, "outcome": "iteration_budget"})
 
         messages = list(context.get("messages") or [])
-        last_content = messages[-1]["content"] if messages else "Max iterations reached"
+        # The answer is the agent's LAST WORDS, not the raw last message
+        # (0029 #10; MemAct also prefers the held draft — the answer the
+        # finalize path would have polished). `.get`, not [] (fable5
+        # 2026-07-13): content-less messages raised here.
+        temp_ns = run.vars.get("_temp") if isinstance(run.vars.get("_temp"), dict) else {}
+        answer = str(temp_ns.get("draft_answer") or "").strip()
+        if not answer:
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    text = str(msg.get("content") or "")
+                    if text.strip():
+                        answer = text
+                        break
+        if not answer:
+            answer = f"Reached the iteration budget ({max_iterations}) without producing an answer."
+        last = messages[-1] if messages else None
+        if not (isinstance(last, dict) and last.get("role") == "assistant" and str(last.get("content") or "") == answer):
+            messages.append(_new_message(ctx, role="assistant", content=answer, metadata={"kind": "final_answer", "budget_exhausted": True}))
+            context["messages"] = messages
         _discard_hook_steering_at_terminal()
         return StepPlan(
             node_id="max_iterations",
-            complete_output={"answer": last_content, "iterations": max_iterations, "messages": messages},
+            complete_output={
+                "answer": answer,
+                "iterations": max_iterations,
+                "messages": messages,
+                "outcome": "iteration_budget",
+                # Always-present at BOTH terminals (wave-F P3 shape parity).
+                "finalize_skipped": bool(scratchpad.get("finalize_skipped")),
+            },
         )
 
     return WorkflowSpec(

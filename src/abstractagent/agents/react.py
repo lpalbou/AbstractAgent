@@ -66,15 +66,21 @@ class ReactAgent(BaseAgent):
         hooks: Optional[LoopHooks] = None,
         max_iterations: int = 20,
         max_history_messages: int = -1,
+        # In ReAct, max_tokens IS the output-token cap (kept for compat);
+        # max_output_tokens is the honest spelling of the same knob — when both
+        # are given, max_output_tokens wins (fable5 B-F9, 2026-07-13).
         max_tokens: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
         plan_mode: bool = False,
-        # OPT-IN (flipped from default-on 2026-07-09, Critic-3 audit): the verifier works —
-        # live-proven catching real violations — but its failure mode is uncontained: a
-        # verifier-side deterministic 400 (e.g. response_format unsupported) FAILS a run that
-        # already holds a valid final answer, and verifier-forced tool calls bypass the
-        # duplicate-side-effect guard. Re-default to on once review failures degrade to
-        # accept-with-#FALLBACK instead of killing the run.
-        review_mode: bool = False,
+        # DEFAULT ON (re-flipped 2026-07-13): the 2026-07-09 opt-in flip named its own
+        # re-flip condition — "re-default to on once review failures degrade to
+        # accept-with-#FALLBACK instead of killing the run" — and backlog 0027 shipped
+        # exactly that containment (a failed verifier call accepts the held answer with
+        # a loud #FALLBACK marker; never a dead run). CodeAct already defaulted True;
+        # abstractcode re-flipped its CLI default on the same condition (c1207). Price:
+        # one verifier call per candidate final answer (~seconds local / ~half a cent
+        # API). Pass review_mode=False to opt out.
+        review_mode: bool = True,
         review_max_rounds: int = 3,
         actor_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -87,7 +93,7 @@ class ReactAgent(BaseAgent):
         # -1 means unlimited (send all messages), otherwise must be >= 1
         if self._max_history_messages != -1 and self._max_history_messages < 1:
             self._max_history_messages = 1
-        self._max_tokens = max_tokens
+        self._max_tokens = max_output_tokens if max_output_tokens is not None else max_tokens
         self._plan_mode = bool(plan_mode)
         self._review_mode = bool(review_mode)
         self._review_max_rounds = int(review_max_rounds)
@@ -119,11 +125,7 @@ class ReactAgent(BaseAgent):
             *tool_defs,
         ]
 
-        logic = ReActLogic(
-            tools=tool_defs,
-            max_history_messages=self._max_history_messages,
-            max_tokens=self._max_tokens,
-        )
+        logic = ReActLogic(tools=tool_defs)
         self.logic = logic
         return create_react_workflow(logic=logic, on_step=self.on_step, hooks=self.hooks)
 
@@ -138,6 +140,11 @@ class ReactAgent(BaseAgent):
         temperature: Optional[float] = None,
         seed: Optional[int] = None,
         attachments: Optional[List[Any]] = None,
+        # Named system-prompt slots (docs/skills-attachment.md): reachable from
+        # the facade so README users don't need raw run vars (design adversary
+        # P1 2026-07-13). Both must be byte-stable for the run (cache prefix).
+        skills_block: Optional[str] = None,
+        system_prompt_extra: Optional[str] = None,
     ) -> str:
         task = str(task or "").strip()
         if not task:
@@ -179,15 +186,28 @@ class ReactAgent(BaseAgent):
         else:
             limits.setdefault("max_output_tokens", None)
 
+        runtime_ns: Dict[str, Any] = {
+            "inbox": [],
+            "plan_mode": eff_plan_mode,
+            "review_mode": eff_review_mode,
+            "review_max_rounds": eff_review_max_rounds,
+        }
+        if isinstance(skills_block, str) and skills_block.strip():
+            runtime_ns["skills_block"] = skills_block
+        if isinstance(system_prompt_extra, str) and system_prompt_extra.strip():
+            runtime_ns["system_prompt_extra"] = system_prompt_extra
+        # Explicit output caps must SURVIVE the adapter's init_node, which
+        # deliberately nulls config-derived _limits caps (full-context policy).
+        # `_runtime.max_output_tokens` is the surviving channel the adapter's
+        # `_max_output_tokens` helper reads as fallback (fable5 B-F9/0029 #9,
+        # 2026-07-13: `ReactAgent(max_tokens=4096)` was silently dropped).
+        if isinstance(max_output_tokens_override, int) and max_output_tokens_override > 0:
+            runtime_ns["max_output_tokens"] = max_output_tokens_override
+
         vars: Dict[str, Any] = {
             "context": {"task": task, "messages": _copy_messages(self.session_messages)},
             "scratchpad": {"iteration": 0, "max_iterations": int(self._max_iterations)},
-            "_runtime": {
-                "inbox": [],
-                "plan_mode": eff_plan_mode,
-                "review_mode": eff_review_mode,
-                "review_max_rounds": eff_review_max_rounds,
-            },
+            "_runtime": runtime_ns,
             "_temp": {},
             # Canonical _limits namespace for runtime awareness
             "_limits": limits,
@@ -252,8 +272,17 @@ class ReactAgent(BaseAgent):
         """Update limits mid-session.
 
         Only allowed limit keys are updated; unknown keys are ignored.
-        Allowed keys: max_iterations, max_tokens, max_output_tokens,
-        max_history_messages, warn_iterations_pct, warn_tokens_pct.
+        Allowed keys (runtime contract, fable5 B-F11 2026-07-13): max_iterations,
+        max_tokens, max_output_tokens, max_input_tokens, max_history_messages,
+        warn_iterations_pct, warn_tokens_pct, estimated_tokens_used,
+        current_iteration.
+
+        Honesty note: ReAct sends the full transcript every cycle by policy,
+        so updating max_history_messages mid-run has no effect on this loop.
+        Naming trap (B-F9): in THIS method `max_tokens` is the runtime's
+        context ACCOUNTING ceiling (`_limits.max_tokens`) — not the output cap
+        the constructor's `max_tokens` parameter maps to; use
+        `max_output_tokens` here for output capping.
 
         Args:
             **updates: Limit key-value pairs to update
@@ -276,15 +305,19 @@ class ReactAgent(BaseAgent):
 
 def create_react_agent(
     *,
-    provider: str = "ollama",
-    model: str = "qwen3:1.7b-q4_K_M",
+    # None = resolve from AbstractCore config global defaults (set via
+    # `abstractcore --config`); packaged fallback pair applies with a loud
+    # #FALLBACK warning when nothing is configured (B-F8, 2026-07-13).
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
     tools: Optional[List[Callable[..., Any]]] = None,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     max_iterations: int = 20,
     max_history_messages: int = -1,
     max_tokens: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
     plan_mode: bool = False,
-    review_mode: bool = False,  # opt-in; see ReactAgent.__init__ (uncontained failure mode)
+    review_mode: bool = True,  # default on since 2026-07-13; see ReactAgent.__init__ (0027 containment shipped)
     review_max_rounds: int = 3,
     llm_kwargs: Optional[Dict[str, Any]] = None,
     run_store: Optional[Any] = None,
@@ -300,6 +333,10 @@ def create_react_agent(
         from ..tools import ALL_TOOLS as _DEFAULT_TOOLS
 
         tools = list(_DEFAULT_TOOLS)
+
+    from .defaults import resolve_provider_model
+
+    provider, model = resolve_provider_model(provider, model)
 
     runtime = create_local_runtime(
         provider=provider,
@@ -317,6 +354,7 @@ def create_react_agent(
         max_iterations=max_iterations,
         max_history_messages=max_history_messages,
         max_tokens=max_tokens,
+        max_output_tokens=max_output_tokens,
         plan_mode=plan_mode,
         review_mode=review_mode,
         review_max_rounds=review_max_rounds,

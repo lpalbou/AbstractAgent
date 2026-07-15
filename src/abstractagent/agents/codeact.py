@@ -55,7 +55,11 @@ class CodeActAgent(BaseAgent):
         hooks: Optional[LoopHooks] = None,
         max_iterations: int = 20,
         max_history_messages: int = -1,
+        # max_tokens = the context ACCOUNTING ceiling (drives warn_tokens_pct /
+        # context_warning), NOT an output cap. For an output-token cap use
+        # max_output_tokens (fable5 B-F9 honesty split, 2026-07-13).
         max_tokens: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
         plan_mode: bool = False,
         review_mode: bool = True,
         review_max_rounds: int = 3,
@@ -71,6 +75,7 @@ class CodeActAgent(BaseAgent):
         if self._max_history_messages != -1 and self._max_history_messages < 1:
             self._max_history_messages = 1
         self._max_tokens = max_tokens
+        self._max_output_tokens = max_output_tokens
         self._plan_mode = bool(plan_mode)
         self._review_mode = bool(review_mode)
         self._review_max_rounds = int(review_max_rounds)
@@ -99,11 +104,7 @@ class CodeActAgent(BaseAgent):
             DELEGATE_AGENT_TOOL,
             *tool_defs,
         ]
-        logic = CodeActLogic(
-            tools=tool_defs,
-            max_history_messages=self._max_history_messages,
-            max_tokens=self._max_tokens,
-        )
+        logic = CodeActLogic(tools=tool_defs)
         self.logic = logic
         return create_codeact_workflow(logic=logic, on_step=self.on_step, hooks=self.hooks)
 
@@ -118,6 +119,10 @@ class CodeActAgent(BaseAgent):
         temperature: Optional[float] = None,
         seed: Optional[int] = None,
         attachments: Optional[List[Any]] = None,
+        # Named system-prompt slots (docs/skills-attachment.md); byte-stable
+        # for the run (cache prefix).
+        skills_block: Optional[str] = None,
+        system_prompt_extra: Optional[str] = None,
     ) -> str:
         task = str(task or "").strip()
         if not task:
@@ -152,22 +157,58 @@ class CodeActAgent(BaseAgent):
             max_tokens_override = None
         if isinstance(max_tokens_override, int) and max_tokens_override > 0:
             limits["max_tokens"] = max_tokens_override
-        if not isinstance(limits.get("max_tokens"), int) or int(limits.get("max_tokens") or 0) <= 0:
-            limits["max_tokens"] = 32768
+        # No facade-level ceiling fallback (operator ruling 2026-07-13,
+        # "overengineering"): the accounting ceiling is the RUNTIME'S to
+        # default (config -> model registry -> DEFAULT_MAX_TOKENS inside
+        # to_limits_dict, and again at its own read sites). A facade literal
+        # was a third copy that fired only when the runtime lookup failed —
+        # fabricating a warning threshold unrelated to any real window in
+        # exactly the case where nothing is known. Missing ceiling = the
+        # context_warning stays silent, which is the honest signal.
+        # Output cap: the honest name (max_tokens above is accounting-only).
+        try:
+            out_cap = int(self._max_output_tokens) if self._max_output_tokens is not None else None
+        except Exception:
+            out_cap = None
+        if isinstance(out_cap, int) and out_cap > 0:
+            limits["max_output_tokens"] = out_cap
 
         vars: Dict[str, Any] = {
             "context": {"task": task, "messages": _copy_messages(self.session_messages)},
             "scratchpad": {"iteration": 0, "max_iterations": int(self._max_iterations)},
-            "_runtime": {
-                "inbox": [],
-                "plan_mode": eff_plan_mode,
-                "review_mode": eff_review_mode,
-                "review_max_rounds": eff_review_max_rounds,
-            },
+            "_runtime": dict(
+                {
+                    "inbox": [],
+                    "plan_mode": eff_plan_mode,
+                    "review_mode": eff_review_mode,
+                    "review_max_rounds": eff_review_max_rounds,
+                },
+                **(
+                    {"skills_block": skills_block}
+                    if isinstance(skills_block, str) and skills_block.strip()
+                    else {}
+                ),
+                **(
+                    {"system_prompt_extra": system_prompt_extra}
+                    if isinstance(system_prompt_extra, str) and system_prompt_extra.strip()
+                    else {}
+                ),
+            ),
             "_temp": {},
             # Canonical _limits namespace for runtime awareness
             "_limits": limits,
         }
+        # Stamp the model the capability seeding DESCRIBES (wave-F P1): the
+        # runtime seeds `supports_native_tools` from config.model_capabilities
+        # — capabilities of the facade's configured model. The fence resolver
+        # distrusts the bit (fails toward fence ON) when a per-run
+        # `_runtime.model` override differs from this stamp.
+        try:
+            cfg_model = str(getattr(self.runtime.config, "model", "") or "").strip()
+            if cfg_model:
+                vars["_runtime"]["tool_support_model"] = cfg_model
+        except Exception:
+            pass
         if temperature is not None:
             try:
                 vars["_runtime"]["temperature"] = float(temperature)
@@ -228,8 +269,10 @@ class CodeActAgent(BaseAgent):
         """Update limits mid-session.
 
         Only allowed limit keys are updated; unknown keys are ignored.
-        Allowed keys: max_iterations, max_tokens, max_output_tokens,
-        max_history_messages, warn_iterations_pct, warn_tokens_pct.
+        Allowed keys (runtime contract, fable5 B-F11 2026-07-13): max_iterations,
+        max_tokens, max_output_tokens, max_input_tokens, max_history_messages,
+        warn_iterations_pct, warn_tokens_pct, estimated_tokens_used,
+        current_iteration.
 
         Args:
             **updates: Limit key-value pairs to update
@@ -252,13 +295,17 @@ class CodeActAgent(BaseAgent):
 
 def create_codeact_agent(
     *,
-    provider: str = "ollama",
-    model: str = "qwen3:1.7b-q4_K_M",
+    # None = resolve from AbstractCore config global defaults (set via
+    # `abstractcore --config`); packaged fallback pair applies with a loud
+    # #FALLBACK warning when nothing is configured (B-F8, 2026-07-13).
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
     tools: Optional[List[Callable[..., Any]]] = None,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     max_iterations: int = 20,
     max_history_messages: int = -1,
     max_tokens: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
     plan_mode: bool = False,
     review_mode: bool = True,
     review_max_rounds: int = 3,
@@ -277,6 +324,10 @@ def create_codeact_agent(
 
         tools = [execute_python]
 
+    from .defaults import resolve_provider_model
+
+    provider, model = resolve_provider_model(provider, model)
+
     runtime = create_local_runtime(
         provider=provider,
         model=model,
@@ -293,6 +344,7 @@ def create_codeact_agent(
         max_iterations=max_iterations,
         max_history_messages=max_history_messages,
         max_tokens=max_tokens,
+        max_output_tokens=max_output_tokens,
         plan_mode=plan_mode,
         review_mode=review_mode,
         review_max_rounds=review_max_rounds,

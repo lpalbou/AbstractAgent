@@ -117,6 +117,10 @@ class LoopHooks:
     # bug, not containable without thread abandonment).
     slow_budget_s: float = 1.0
     max_slow_strikes: int = 3
+    # Leak backstop (0029 #14): max distinct runs with queued steering; the
+    # oldest run's queue evicts loudly past this. Dict insertion order makes
+    # the eviction FIFO by first-steer time.
+    max_pending_runs: int = 64
     _pending: Dict[str, List[str]] = field(init=False, default_factory=dict)
     _strikes: Dict[int, int] = field(init=False, default_factory=dict)
     _disabled: set = field(init=False, default_factory=set)
@@ -246,6 +250,25 @@ class LoopHooks:
                         follow_ups.append(
                             ("hook_steer", {"event": name, "run_id": run_id, "chars": len(injection)})
                         )
+                        # Structural leak backstop (0029 #14): terminal NODES
+                        # discard their run's queue, and the facades discard on
+                        # FAILED/CANCELLED — but a host driving the runtime
+                        # directly never calls either for a failed run, and its
+                        # queue would rot here forever. Cap the number of runs
+                        # tracked; evict the OLDEST run's queue loudly. Live
+                        # runs drain at every reason boundary, so under any
+                        # sane concurrency the evicted queue belongs to a dead
+                        # run; a pathological >max_pending_runs live-run host
+                        # loses steering LOUDLY, never memory silently.
+                        if len(self._pending) > self.max_pending_runs:
+                            oldest_run = next(iter(self._pending))
+                            dropped = self._pending.pop(oldest_run, [])
+                            print(
+                                f"[loop_hooks] #FALLBACK pending-steering cap ({self.max_pending_runs} runs) "
+                                f"reached: dropped {len(dropped)} undelivered injection(s) for run {oldest_run} "
+                                "(likely a failure-terminated run whose host never discarded)",
+                                file=sys.stderr,
+                            )
                     else:
                         # No run context (off-loop dispatch): dropping silently
                         # would violate works-or-loud; report instead.

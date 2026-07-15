@@ -3,6 +3,88 @@
 First-class hooks on the ReAct/CodeAct/MemAct loops. One shared contract:
 `src/abstractagent/adapters/loop_hooks.py`, exported from the package root.
 
+## Taxonomy at a glance
+
+The event stream has **three planes**, all delivered through one handler
+signature:
+
+1. **Canonical lifecycle events** (7 names) — the stable vocabulary hosts
+   subscribe to. Raw adapter steps are mapped onto them by
+   `DEFAULT_EVENT_MAP` (pluggable), so the three loops speak one language
+   where they share behavior.
+2. **Raw pass-through steps** — every unmapped step passes through under its
+   raw name. The hook set is **total, never a filter**: nothing the loop
+   emits is hidden from a capture host.
+3. **Hook-layer status events** — the layer reports on itself (steer queued,
+   handler error contained, slow strike, undelivered steering discarded)
+   through the same stream, so observability of the observer costs nothing
+   extra.
+
+There is exactly **one write channel** back into the loop: a handler's
+steering return. It never touches loop state directly — it rides the durable
+guidance inbox (`_runtime.inbox`, the same channel as `inject_guidance`) and
+is consumed at the next reason boundary, where the loop fires
+`message_drained` as the receipt.
+
+### Where events fire in the loop
+
+```mermaid
+flowchart TD
+    START([turn starts]) --> REASON
+
+    subgraph turn ["one agent turn (all three loops)"]
+        REASON["reason — LLM call<br/>◆ cycle_start<br/>◆ message_drained (if guidance was queued)"]
+        PARSE["parse<br/>◆ tool_proposed (ReAct)"]
+        ACT["act — dispatch tools<br/>(raw: act, act_blocked, delegate_agent)"]
+        OBSERVE["observe — fold results<br/>◆ tool_executed"]
+        REVIEW["review / verifier (opt-in)<br/>(raw: review steps;<br/>absorbed failure → review_skipped)"]
+
+        REASON --> PARSE
+        PARSE -->|tool calls| ACT
+        ACT --> OBSERVE
+        OBSERVE --> REASON
+        PARSE -->|"ask_user tool"| WAIT["wait for user<br/>◆ user_wait"]
+        WAIT --> RESP["resume<br/>◆ user_response"]
+        RESP --> REASON
+        PARSE -->|final answer| REVIEW
+        REVIEW -->|"verdict: incomplete<br/>(review_tool_calls / next_prompt)"| ACT
+    end
+
+    REVIEW -->|"verdict: complete<br/>(or absorbed failure → review_skipped)"| DONE["done<br/>◆ turn_end (outcome: final_answer)"]
+    REASON -.->|"iteration budget exhausted"| MAXI["max_iterations — tool-free conclusion<br/>◆ turn_end (outcome: iteration_budget)<br/>◆ message_drained (conclusion-boundary drain)"]
+    DONE --> END([turn ends])
+    MAXI --> END
+```
+
+◆ = canonical event; parenthesized names are raw pass-through steps.
+
+### The steer round-trip
+
+```mermaid
+sequenceDiagram
+    participant L as Agent loop (tick thread)
+    participant H as LoopHooks dispatch
+    participant U as Your handler
+    participant I as Durable inbox (_runtime.inbox)
+
+    L->>H: emit(step, data)
+    H->>H: map to canonical name, deep-copy payload
+    H->>U: HookEvent (read-only copy)
+    alt handler listens
+        U-->>H: None / ""
+    else handler steers
+        U-->>H: "guidance" or {"inject": "guidance"}
+        H->>H: queue per-run (◆ hook_steer)
+        Note over H,I: folded at the loop's next drain point
+        H->>I: append as durable guidance
+        L->>I: next reason boundary consumes it
+        L->>H: ◆ message_drained (the receipt)
+    else handler misbehaves
+        U--xH: raises / bad shape / too slow
+        H->>H: contained (◆ hook_error / ◆ hook_slow)<br/>run unaffected; 3 slow strikes = benched
+    end
+```
+
 ```python
 from abstractagent import LoopHooks, HookEvent, ReactAgent
 
@@ -31,7 +113,7 @@ Canonical names come from `DEFAULT_EVENT_MAP` (pluggable per
 |---|---|---|---|
 | `cycle_start` | `reason` | each reasoning cycle begins | all three |
 | `tool_proposed` | `parse_tool_calls` | model proposed a tool batch | ReAct (CodeAct/MemAct emit the raw `parse` step instead) |
-| `tool_executed` | `observe` | one tool result observed | all three |
+| `tool_executed` | `observe` | one tool result observed — payload carries `tool`, `success`, `result`, and `call_id` (since 2026-07-13; empty string when the batch carried none) so fleet controllers can correlate tool_call → approval → result | all three |
 | `turn_end` | `done`, `max_iterations` | turn finished; `data.outcome` = `final_answer` \| `iteration_budget` | all three |
 | `user_wait` | `ask_user` | loop asked the user | all three |
 | `user_response` | `user_response` | user's answer resumed the loop | all three |
@@ -42,9 +124,51 @@ composed host — e.g. an entity visit — continues the run past this turn's
 final answer). Treat `data.get("handed_off")` as ReAct-specific.
 
 Unmapped steps pass through under their raw names — the hook set is total,
-never a filter. Useful raw steps include `parse_final`, `act`, `act_blocked`,
-`allowlist_pruned`, `delegate_agent`, the review/verifier steps, and the
-hook layer's own status events below. Every event carries `run_id` and
+never a filter. The full per-adapter step inventory is DECLARED in
+`abstractagent.adapters.emit_inventory` (`REACT_STEPS` / `CODEACT_STEPS` /
+`MEMACT_STEPS`) and a drift test pins it against the actual emit call sites,
+so the constants are authoritative. Highlights: `context_warning` (one-shot
+`#FALLBACK` payload when estimated usage crosses `warn_tokens_pct` of the
+`max_tokens` accounting ceiling), `delegate_agent_substrate` (a palette
+profile was applied to a delegated child), the review/verifier steps
+(`review_request`, `review`, `review_tool_calls`, `review_skipped`), and
+MemAct's finalize steps (`finalize_request`, `finalize`, `finalize_skipped`,
+`finalize_used_draft`).
+
+Parse payload common core (0028 contract wave, 2026-07-14): every adapter's
+`parse` payload guarantees `has_tool_calls` (bool), `tool_calls`
+(list of `{name, arguments, call_id}`), and `content_preview` (≤200 chars;
+the string `"(no content)"` when the reply was empty — a sentinel, not
+model text); loop-specific extras (ReAct's full `content`/`reasoning`/
+`iteration`) are additive on top — consumers key on the core. CodeAct
+asymmetry: an action can follow `has_tool_calls: false` — a fenced code
+block routes to execution. CodeAct's parse payload carries the additive
+`has_code` (bool) for exactly this; a consumer pre-rendering approval or
+inspection UI from parse payloads must treat `has_tool_calls || has_code`
+as "an action is coming" on CodeAct.
+
+Budget exhaustion emits exactly ONCE per turn (0028 multi-emit fix): ReAct's
+conclusion node announces `max_iterations_reached` at first entry (before the
+conclusion call's latency) and fires `max_iterations` (canonical `turn_end`,
+outcome `iteration_budget`) once, at the completion branch where the turn
+actually ends. Per-turn report state (`review_skipped`, MemAct's
+`finalize_skipped`, the announce latch) resets at BOTH turn boundaries — the
+ask_user boundary and the visit composition boundary (`reset_react_turn`) —
+so reports and `complete_output` reflect the CURRENT turn; the emit/ledger
+history keeps the full record.
+
+Stability contract:
+
+- **Canonical event names** (the table above) are frozen.
+- **Raw step names** (the inventory constants) are stable-with-announced-renames;
+  a rename is a contract revision, never a drive-by edit, and lands in
+  `emit_inventory.RENAMED_STEPS` (the migration record). Executed at founding
+  publication (2026-07-13, zero consumers existed): CodeAct's
+  `parse_retry_empty_response` → `parse_retry_empty` (one semantic, one name).
+  Known asymmetry kept: ReAct emits no `init` (siblings do).
+- **`#FALLBACK` / `#TRUNCATION` markers** in payloads are stable.
+- **Error prose is NOT a contract** — key on step names, payload keys, and
+  `metadata.kind`, never on error strings. Every event carries `run_id` and
 `agent` (workflow id); `iteration` is set when the underlying payload carries
 one (notably `cycle_start` and ReAct's `message_drained`).
 

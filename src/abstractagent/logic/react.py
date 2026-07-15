@@ -23,15 +23,35 @@ class ReActLogic:
         self,
         *,
         tools: List[ToolDefinition],
-        max_history_messages: int = -1,
+        max_history_messages: Optional[int] = None,
         max_tokens: Optional[int] = None,
     ):
+        # max_history_messages/max_tokens are DEPRECATED-IGNORED (fable5 B-F9
+        # 2026-07-13): they were always accepted-and-ignored here (the dead-knob
+        # class) — window policy lives in _limits, output caps in
+        # _limits.max_output_tokens. A hard TypeError removal broke shipped
+        # abstractcode call sites (regression adversary P0, same day), so the
+        # one-release shim warns loudly on MEANINGFUL values and ignores the
+        # legacy no-op spellings (None / -1). Removal lands next release.
+        if max_history_messages is not None and max_history_messages != -1:
+            import warnings
+
+            warnings.warn(
+                "max_history_messages on the Logic constructor was never applied and is "
+                "deprecated-ignored; window policy lives in _limits (removal next release)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if max_tokens is not None:
+            import warnings
+
+            warnings.warn(
+                "max_tokens on the Logic constructor was never applied and is "
+                "deprecated-ignored; use the agent facades' max_output_tokens (removal next release)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._tools = list(tools)
-        self._max_history_messages = int(max_history_messages)
-        # -1 means unlimited (send all messages), otherwise must be >= 1
-        if self._max_history_messages != -1 and self._max_history_messages < 1:
-            self._max_history_messages = 1
-        self._max_tokens = max_tokens
 
     @property
     def tools(self) -> List[ToolDefinition]:
@@ -109,7 +129,7 @@ class ReActLogic:
             "  Batch independent read-only tool calls to reduce iterations.\n"
             "  Example: read multiple files/ranges or run multiple searches in one response.\n"
             "  If reading nearby ranges of the same file, prefer ONE call with a wider range.\n"
-            "  Only split tool calls across turns when later calls depend on earlier outputs; do NOT batch side-effectful tools (write_file/edit_file/execute_command/send_email/send_whatsapp_message/send_telegram_message/send_telegram_artifact).\n"
+            "  Only split tool calls across turns when later calls depend on earlier outputs; do NOT batch side-effectful tools (write_file/edit_file/execute_command/send_email/send_whatsapp_message/send_telegram_message/send_telegram_artifact, and any mcp:: tool — treat MCP tools as side-effectful).\n"
             "- When context is getting large, use delegate_agent(task, context, tools) to offload an independent subtask with minimal context.\n"
             "- Keep tool call arguments small and valid; avoid embedding huge blobs (large file contents / giant JSON) directly in arguments.\n"
             "- Attachments:\n"

@@ -92,6 +92,12 @@ def test_codeact_plan_mode_routes_to_plan_node() -> None:
 
 
 def test_codeact_review_mode_routes_to_reason_when_incomplete() -> None:
+    """Incomplete verdict with no tool calls routes STRAIGHT to reason with the
+    verifier's next_prompt as guidance. The old "re-ask reviewer once" branch
+    was deleted (fable5 P1 2026-07-13): the re-review payload was byte-identical
+    so the runtime idempotency layer REPLAYED the first verdict (a guaranteed
+    no-op), and the reviewer-directed nudge ("Return JSON only") leaked into the
+    MAIN model's durable guidance — ReAct resolved the same fork the same way."""
     tool = ToolDefinition(name="execute_python", description="Exec", parameters={})
     wf = create_codeact_workflow(logic=CodeActLogic(tools=[tool]))
     run = _run(vars=_base_vars(runtime_ns={"review_mode": True, "review_max_rounds": 1}))
@@ -103,16 +109,11 @@ def test_codeact_review_mode_routes_to_reason_when_incomplete() -> None:
     run.vars["_temp"]["review_llm_response"] = {
         "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
     }
-    # New contract: "incomplete + no tool calls" is behaviorally invalid → re-ask reviewer once.
-    review_parse_1 = wf.get_node("review_parse")(run, _Ctx())
-    assert review_parse_1.next_node == "review"
-
-    # If the reviewer remains unactionable, we fall back to prompting the agent back to reason.
-    run.vars["_temp"]["review_llm_response"] = {
-        "data": {"complete": False, "missing": ["x"], "next_prompt": "Do x next", "next_tool_calls": []},
-    }
-    review_parse_2 = wf.get_node("review_parse")(run, _Ctx())
-    assert review_parse_2.next_node == "reason"
+    review_parse = wf.get_node("review_parse")(run, _Ctx())
+    assert review_parse.next_node == "reason"
     inbox = run.vars["_runtime"].get("inbox")
     assert isinstance(inbox, list)
-    assert inbox and "[Review]" in str(inbox[-1].get("content", ""))
+    assert inbox and "[Review] Do x next" in str(inbox[-1].get("content", ""))
+    # The reviewer-directed nudge never enters the main model's guidance.
+    assert not any("Return JSON only" in str(m.get("content", "")) for m in inbox if isinstance(m, dict))
+    assert "review_retry_count" not in run.vars["_runtime"]
