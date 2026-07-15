@@ -2,6 +2,28 @@
 
 ## Unreleased (2026-07-12)
 
+### Fixed (2026-07-15 — verifier schema strict-mode expressibility, airelay 422 incident)
+- **Review verifier schema was inexpressible under OpenAI strict validators**:
+  `next_tool_calls[].arguments` declared a free-form dict
+  (`{"type": "object"}` without `properties`) — OpenAI-strict backends
+  (subscription relays, responses API) refuse the whole request with a
+  deterministic 4xx (`invalid_json_schema` / "Extra required key 'arguments'
+  supplied"), killing every ReAct/CodeAct review cycle on those providers
+  (operator-reported: airelay gpt-5.4, `LLM_CALL failed ... 422`). Fix: the
+  shared `verifier_response_schema()` (new, in `generation_params`) declares
+  `arguments` as a JSON-ENCODED STRING — the same convention OpenAI's own
+  function-calling wire format uses — and parse sites normalize through
+  `coerce_verifier_tool_arguments` (dicts pass through for lenient providers
+  and legacy transcripts; JSON-object strings decode; anything else degrades
+  to `{}` exactly as before). ReAct and CodeAct review nodes now share one
+  schema instead of two divergent literals. Live-verified: the new schema is
+  accepted natively with `strict:true` on the previously-failing backend.
+  Pins in `tests/test_verifier_schema_strict.py` (strict-rules checker walks
+  every object node: properties + required-all + additionalProperties:false).
+  Defense-in-depth: abstractcore independently gained a schema-rejection →
+  prompted-lane fallback, so even inexpressible schemas survive (see
+  abstractcore CHANGELOG).
+
 ### Fixed (2026-07-14, batch 8 — backlog 0011: sibling transcripts on strict providers)
 - **CodeAct/MemAct 400'd on native OpenAI at iteration 2**: both sibling
   parse nodes appended assistant messages CONTENT-ONLY while their

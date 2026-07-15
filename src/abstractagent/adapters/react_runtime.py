@@ -27,12 +27,14 @@ from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from .generation_params import (
     DELEGATE_SUBSTRATE_KEYS,
     coerce_iterations,
+    coerce_verifier_tool_arguments,
     compose_prompt_slots,
     context_usage_warning,
     is_side_effect_tool,
     resolve_max_iterations,
     runtime_llm_params,
     tool_tags_map,
+    verifier_response_schema,
 )
 from .loop_hooks import LoopHooks
 from .media import extract_media_from_context
@@ -2038,25 +2040,10 @@ def create_react_workflow(
             f"Tool outputs:\n{observations}\n\n"
             f"Allowed tools:\n{', '.join(allow) if allow else '(none)'}\n\n"
         )
-        schema = {
-            "type": "object",
-            "properties": {
-                "complete": {"type": "boolean"},
-                "missing": {"type": "array", "items": {"type": "string"}},
-                "next_prompt": {"type": "string"},
-                "next_tool_calls": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}},
-                        "required": ["name", "arguments"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["complete", "missing", "next_prompt", "next_tool_calls"],
-            "additionalProperties": False,
-        }
+        # Strict-expressible shared schema (arguments ride as a JSON string —
+        # a free-form {"type":"object"} dict is refused by OpenAI-strict
+        # validators; see verifier_response_schema for the full rationale).
+        schema = verifier_response_schema()
 
         emit("review_request", {"tool_messages": len(tool_msgs)})
         # The explicit output cap covers the verifier too (regression adversary
@@ -2148,9 +2135,9 @@ def create_react_workflow(
                 if not isinstance(item, dict):
                     continue
                 name = str(item.get("name") or "").strip()
-                args = item.get("arguments")
-                if not isinstance(args, dict):
-                    args = {}
+                # `arguments` arrives as a JSON-encoded string per the strict
+                # schema; dicts (legacy/lenient shape) pass through unchanged.
+                args = coerce_verifier_tool_arguments(item.get("arguments"))
                 if name:
                     next_tool_calls.append({"name": name, "arguments": args})
 

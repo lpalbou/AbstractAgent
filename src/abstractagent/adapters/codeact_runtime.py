@@ -14,10 +14,12 @@ from abstractruntime.memory.active_context import ActiveContextPolicy
 from .generation_params import (
     DELEGATE_SUBSTRATE_KEYS,
     coerce_iterations,
+    coerce_verifier_tool_arguments,
     compose_prompt_slots,
     context_usage_warning,
     resolve_max_iterations,
     runtime_llm_params,
+    verifier_response_schema,
 )
 from .media import extract_media_from_context
 from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
@@ -1394,28 +1396,10 @@ def create_codeact_workflow(
             f"Allowed tools:\n{_format_allowed_tools()}\n\n"
         )
 
-        schema = {
-            "type": "object",
-            "properties": {
-                "complete": {"type": "boolean"},
-                "missing": {"type": "array", "items": {"type": "string"}},
-                "next_prompt": {"type": "string"},
-                "next_tool_calls": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "arguments": {"type": "object"},
-                        },
-                        "required": ["name", "arguments"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["complete", "missing", "next_prompt", "next_tool_calls"],
-            "additionalProperties": False,
-        }
+        # Strict-expressible shared schema (arguments ride as a JSON string —
+        # a free-form {"type":"object"} dict is refused by OpenAI-strict
+        # validators; see verifier_response_schema for the full rationale).
+        schema = verifier_response_schema()
 
         emit("review_request", {"tool_messages": len(tool_msgs)})
 
@@ -1507,9 +1491,9 @@ def create_codeact_workflow(
                 if not isinstance(item, dict):
                     continue
                 name = str(item.get("name") or "").strip()
-                args = item.get("arguments")
-                if not isinstance(args, dict):
-                    args = {}
+                # `arguments` arrives as a JSON-encoded string per the strict
+                # schema; dicts (legacy/lenient shape) pass through unchanged.
+                args = coerce_verifier_tool_arguments(item.get("arguments"))
                 if name:
                     next_tool_calls.append({"name": name, "arguments": args})
 

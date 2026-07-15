@@ -8,6 +8,7 @@ backward compatibility with older runs that may not have these keys in
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional
 
 
@@ -291,6 +292,78 @@ def context_usage_warning(
             "trimmed by this loop; this is observability only."
         ),
     }
+
+
+def verifier_response_schema() -> Dict[str, Any]:
+    """Verifier JSON schema shared by the ReAct and CodeAct review nodes.
+
+    STRICT-MODE EXPRESSIBLE BY CONSTRUCTION (airelay 422 incident, 2026-07-15):
+    OpenAI-strict validators (and subscription relays in front of them) require
+    every object node to declare `properties`, a `required` array listing every
+    key, and `additionalProperties: false`. A free-form dict — a bare
+    `{"type": "object"}` without `properties` — violates those rules by
+    construction and gets the WHOLE request refused with a deterministic 4xx.
+
+    `next_tool_calls[].arguments` is therefore a JSON-ENCODED STRING, exactly
+    like OpenAI's own function-calling wire format (which encodes tool
+    arguments as a JSON string for the same reason). Parse sites accept both
+    this string shape and the legacy object shape via
+    `coerce_verifier_tool_arguments` (lenient providers and older transcripts
+    may still carry objects).
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "complete": {"type": "boolean"},
+            "missing": {"type": "array", "items": {"type": "string"}},
+            "next_prompt": {"type": "string"},
+            "next_tool_calls": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "arguments": {
+                            "type": "string",
+                            "description": (
+                                "Tool arguments as a JSON-encoded object string, "
+                                "e.g. \"{\\\"path\\\": \\\"notes.txt\\\"}\". "
+                                "Use \"{}\" when the tool takes no arguments."
+                            ),
+                        },
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["complete", "missing", "next_prompt", "next_tool_calls"],
+        "additionalProperties": False,
+    }
+
+
+def coerce_verifier_tool_arguments(args: Any) -> Dict[str, Any]:
+    """Normalize a verifier-proposed tool-call `arguments` value to a dict.
+
+    The verifier schema declares `arguments` as a JSON-encoded string (see
+    `verifier_response_schema`), but parse sites stay liberal: dicts pass
+    through unchanged (legacy shape; lenient providers that ignored the
+    schema), JSON-object strings are decoded, and anything else — including
+    JSON that decodes to a non-object — degrades to `{}` exactly like the
+    previous non-dict handling did.
+    """
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        text = args.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def coerce_iterations(raw: Any) -> Optional[int]:
