@@ -156,6 +156,19 @@ reuse degraded), lifted verbatim from the LLM result's
 never an empty placeholder. The struct's field vocabulary is core's contract,
 not this layer's — treat unknown fields as additive.
 
+Sight lane (2026-07-21, operator ruling c4089 over c3969 shape A): when a
+SUCCESSFUL tool result's dict output declares a `media` list (paths or
+`{"$artifact": id}` refs, authored by the producing tool — camera capture
+results are the founding producer), ReAct's observe emits `media_captured`
+(`{tool, count, call_id}`) and folds the refs into the NEXT reason call's
+`payload.media` (or the max-iterations conclusion call when the budget wall
+lands first), merged after context attachments and deduped by artifact
+id/path. Consumption is ONE-SHOT — image tokens ride exactly one model call;
+the durable transcript keeps the tool's textual ref. The pending set is
+burst-bounded (6, most-recent wins); trims emit `media_dropped`
+(`{dropped, kept, reason}`), never silent. Pending refs are per-turn state:
+`reset_react_turn` clears them at composition boundaries.
+
 Budget exhaustion emits exactly ONCE per turn (0028 multi-emit fix): ReAct's
 conclusion node announces `max_iterations_reached` at first entry (before the
 conclusion call's latency) and fires `max_iterations` (canonical `turn_end`,

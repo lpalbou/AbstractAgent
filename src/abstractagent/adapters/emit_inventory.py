@@ -81,6 +81,14 @@ REACT_STEPS = COMMON_STEPS | frozenset(
         # or A-B-A-B tool-batch streak forces the conclusion path; payload
         # {kind: repeat|oscillation, span, cycle}.
         "stuck_streak",
+        # Sight lane (c3969 shape A / c4089 ruling, 2026-07-21): a successful
+        # tool result DECLARED media refs on its output dict — payload
+        # {tool, count, call_id}; the refs ride the next reason/conclude
+        # call's `media` one-shot.
+        "media_captured",
+        # The pending-media burst bound trimmed oldest refs (most-recent
+        # wins) — payload {dropped, kept, reason}; never silent.
+        "media_dropped",
         "review",
         "review_request",
         "review_skipped",

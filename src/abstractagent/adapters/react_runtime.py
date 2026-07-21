@@ -42,7 +42,12 @@ from .generation_params import (
     verifier_response_schema,
 )
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
-from .media import extract_media_from_context
+from .media import (
+    extract_media_from_context,
+    extract_media_from_tool_result,
+    media_item_key,
+    merge_media_lists,
+)
 from .tool_allowlist import note_pruned_grants
 from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
 from ..logic.react import ReActLogic
@@ -375,6 +380,14 @@ _DEFERRED_ACTION_VERB_RE = re.compile(
     # Verbs that typically imply external actions (tools/files/web/edits).
     r"(?i)\b(read|open|search|list|skim|inspect|explore|scan|run|execute|edit|fetch|download|creat(?:e|ing))\b"
 )
+
+# Sight-lane burst bound (c3969 shape A / c4089 ruling): media refs captured
+# from tool results ride the NEXT model call one-shot; a pathological batch
+# (N captures in one iteration) must not put N images on a single provider
+# call. Most-recent wins — the newest capture is the one the model was acting
+# on; drops are emitted (never silent). Deliberately a constant, not a knob:
+# the bound exists to cap cost blowup, not to be tuned per run.
+_PENDING_MEDIA_MAX = 6
 
 _TOOL_CALL_MARKERS = ("<function_call>", "<tool_call>", "<|tool_call|>", "```tool_code")
 
@@ -792,6 +805,9 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
             "turn_captures",
             # Forced-batch marker is per-answer state; a new turn starts clean.
             "review_forced_batch",
+            # Sight-lane pending refs are per-turn: a finished turn's unconsumed
+            # captures must not attach to the next visitor's first call.
+            "pending_media",
         ):
             temp.pop(key, None)
 
@@ -1158,7 +1174,17 @@ def create_react_workflow(
             task_text = str(task or "").strip()
             if task_text:
                 payload["prompt"] = task_text
-        media = extract_media_from_context(context)
+        # Context attachments ride every call; tool-captured refs (sight lane)
+        # ride THIS call one-shot and clear. Context first in the merge so a
+        # duplicate capture of a staged attachment collapses onto the staged
+        # copy. Crash-replay safe: the pop lands in the same tick/save that
+        # issues this LLM_CALL, so a replayed reason recomputes the identical
+        # payload and idempotency reuse fires.
+        pending_media = temp.pop("pending_media", None)
+        media = merge_media_lists(
+            extract_media_from_context(context),
+            pending_media if isinstance(pending_media, list) else None,
+        )
         if media:
             payload["media"] = media
 
@@ -1978,6 +2004,7 @@ def create_react_workflow(
 
         obs_list: list[dict[str, Any]] = []
         ran_names: list[str] = []
+        captured_media: list[Any] = []
         for r in results:
             if not isinstance(r, dict):
                 continue
@@ -1992,6 +2019,18 @@ def create_react_workflow(
             # = two tools ran).
             if not r.get("blocked"):
                 ran_names.append(name)
+
+            # Sight lane (c3969 shape A): a successful result may DECLARE media
+            # refs on its output dict (camera's authored contract — never
+            # sniffed from rendered prose). Collected here, folded into the
+            # next reason/conclude call's `media` (one-shot; see reason_node).
+            result_media = extract_media_from_tool_result(r)
+            if result_media:
+                captured_media.extend(result_media)
+                emit(
+                    "media_captured",
+                    {"tool": name, "count": len(result_media), "call_id": str(r.get("call_id") or "")},
+                )
 
             display = _display(output)
             if not success:
@@ -2031,6 +2070,23 @@ def create_react_workflow(
                 captures = {}
                 temp["turn_captures"] = captures
             captures["tools_ran"] = list(captures.get("tools_ran") or []) + ran_names
+
+        # Sight-lane accumulation: pending media survives the observe→act
+        # queue-split loop (several observe passes per iteration) in per-turn
+        # state, deduped by identity, bounded most-recent-wins. The next
+        # reason/conclude call consumes it one-shot — image tokens ride
+        # exactly one model call while the transcript keeps the textual ref
+        # (re-look = analyze_media or re-capture, never a silent re-attach).
+        if captured_media:
+            merged = merge_media_lists(
+                temp.get("pending_media") if isinstance(temp.get("pending_media"), list) else None,
+                captured_media,
+            ) or []
+            if len(merged) > _PENDING_MEDIA_MAX:
+                dropped = len(merged) - _PENDING_MEDIA_MAX
+                merged = merged[-_PENDING_MEDIA_MAX:]
+                emit("media_dropped", {"dropped": dropped, "kept": len(merged), "reason": "pending_media_cap"})
+            temp["pending_media"] = merged
 
         if last_cycle is not None:
             # EXTEND, never assign (fable5 P1 2026-07-13): observe runs
@@ -2467,7 +2523,15 @@ def create_react_workflow(
                 if task_text:
                     payload["prompt"] = task_text
 
-            media = extract_media_from_context(context)
+            # Same sight-lane consumption as reason_node: when the budget wall
+            # lands right after a capture batch, reason never runs again — the
+            # conclusion is the next (and last) model call, so it gets the
+            # captured refs. One-shot pop, same crash-replay reasoning.
+            pending_media = temp.pop("pending_media", None)
+            media = merge_media_lists(
+                extract_media_from_context(context),
+                pending_media if isinstance(pending_media, list) else None,
+            )
             if media:
                 payload["media"] = media
 
