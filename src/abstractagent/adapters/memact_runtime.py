@@ -16,6 +16,7 @@ from .generation_params import (
     coerce_iterations,
     compose_prompt_slots,
     context_usage_warning,
+    guidance_wrapper,
     prompt_cache_capture,
     resolve_max_iterations,
     runtime_llm_params,
@@ -546,7 +547,8 @@ def create_memact_workflow(
                 _new_message(
                     ctx,
                     role="user",
-                    content=f"[Operator guidance — this amends the task; the final answer must satisfy it]\n{guidance}",
+                    # Lane-honest wrapper (c2792/c2796/c2798): see guidance_wrapper.
+                    content=f"{guidance_wrapper(runtime_ns)}\n{guidance}",
                     metadata={"kind": "operator_guidance"},
                 )
             )

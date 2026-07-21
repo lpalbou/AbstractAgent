@@ -77,6 +77,10 @@ REACT_STEPS = COMMON_STEPS | frozenset(
         "parse_retry_empty",
         "parse_retry_plan_only",
         "parse_retry_truncated",
+        # 0017 work half (2026-07-21): fires once when a consecutive-identical
+        # or A-B-A-B tool-batch streak forces the conclusion path; payload
+        # {kind: repeat|oscillation, span, cycle}.
+        "stuck_streak",
         "review",
         "review_request",
         "review_skipped",

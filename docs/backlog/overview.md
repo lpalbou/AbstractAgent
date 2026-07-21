@@ -6,15 +6,17 @@ AbstractRuntime, plus their shared logic (tools contract, generation params,
 loop hooks, allowlist handling). This backlog is the package's durable
 planning memory.
 
-## Counts (2026-07-15)
+## Counts (2026-07-18)
 
 | State | Count |
 |---|---|
 | Planned | 0 |
-| Proposed | 15 |
-| Completed | 7 |
+| Proposed | 14 |
+| Completed | 10 |
 | Deprecated | 0 |
 | Recurrent | 2 |
+
+(Counts as of 2026-07-21: 0017 completed — both halves shipped.)
 
 (0028 added 2026-07-13: hook taxonomy multi-emit + report accumulation —
 audit residue from the production-readiness wave, promotion gated on a hook
@@ -50,7 +52,6 @@ default-model and max_tokens decisions.)
 | 0014 | `proposed/loops_improvement/0014_native_code_action_primary_path.md` (A1) | maintainer green-light; pairs with 0010 |
 | 0015 | `proposed/loops_improvement/0015_persistent_interpreter_session.md` (A2) | green-light + runtime executor lane (seam agreed c1110–c1112) |
 | 0016 | `proposed/loops_improvement/0016_execution_trust_tiers.md` (A3) | maintainer ruling on tier model; needs decision record |
-| 0017 | `proposed/loops_improvement/0017_no_progress_oscillation_detection.md` (B1) | green-light |
 | 0018 | `proposed/loops_improvement/0018_structured_handoff_long_runs.md` (B2) | green-light + a real long-run consumer |
 | 0019 | `proposed/loops_improvement/0019_deterministic_turn_end_verification.md` (B3) | green-light + one real consumer |
 | 0020 | `proposed/loops_improvement/0020_provider_stop_semantics_over_heuristics.md` (B4) | green-light |
@@ -74,6 +75,9 @@ default-model and max_tokens decisions.)
 
 | Date | ID | Item | Outcome |
 |---|---|---|---|
+| 2026-07-21 | 0017 | `completed/loops_improvement/0017_no_progress_oscillation_detection.md` | Both halves shipped (work:abstractagent-0017). Detector half: circling_streak, adopted in runtime's R-D cue lane (c2913). Work half: stuck-streak termination — 3 consecutive identical tool batches or A-B-A-B oscillation force the existing conclusion path with a named reason (stuck_streak emit + conclusion_forced output key + report line); proposals count, turn-fenced, visit lane chrome-free, knob-disableable. 8 new pins + 2 updated; suite 293. |
+| 2026-07-17 | 0031 | `completed/loops_improvement/0031_verifier_execution_grounding.md` | Executor-tag verifier seam (tools with tags=["executor"] named in ReAct/CodeAct verifier prompts with "unexecuted is unverified"; prompts byte-identical without the tag) + the review-budget re-arm fix (verifier-forced batches consume review_max_rounds instead of resetting it — the A/B run2 40-min blowup class fixed at the budget). Externally validated: code's A/B 4/4 probe-green (c2856), adoption c2881. Suite 284. |
+| 2026-07-17 | 0032 | `completed/loops_improvement/0032_visit_lane_guidance_wrapper.md` | Drained-guidance wrapper is lane-honest: visit lanes (suppress_loop_tail) get "[A note arrived during this conversation — not from your visitor]"; task lane byte-unchanged. Ruled c2792→c2796/c2798; both semantics pins encoded (visitor-coupled scope; never a parse anchor — machine key kind="operator_guidance" is the anchor and never renames, with its misnomer documented). 7 pins; decision:visit-guidance-wrapper. |
 | 2026-07-15 | 0028 | `completed/loops_improvement/0028_hook_taxonomy_multi_emit.md` | Substance shipped in the 2026-07-14 batch-4 contract wave (one turn_end per turn, per-turn report resets, parse common core, RENAMED_STEPS); promoted at this pass per its own execution note. |
 | 2026-07-15 | 0026 | `completed/loops_improvement/0026_loop_hooks_follow_ups.md` | Hooks parity + terminal honesty: `init` and `parse_tool_calls` (→ canonical `tool_proposed`) now fire on all three loops; the vacuous mutation pin rewritten as a vandal-handler pin (act payload's live `args` covered); true terminals emit `inbox_undelivered` for durable-inbox guidance that landed after the last drain (entries preserved, never consumed; composition handoffs exempt). Inventory + docs/hooks.md updated. Suite 233/2. |
 | 2026-07-14 | 0011 | `completed/loops_improvement/0011_sibling_transcript_repair_strict_providers.md` | Sibling transcripts satisfy strict providers via EXTRACTION: ReAct's proven pipeline moved to shared `adapters/transcripts.py` (durable `tool_calls` preservation, orphan repair both directions), all three adapters delegate; ReAct byte-identical (prefix pins as harness); latent foreign-id class fixed. Pins in `test_sibling_strict_transcripts_0011.py`. Suite 221. |
@@ -106,5 +110,16 @@ default-model and max_tokens decisions.)
   0002–0009 left as gap for urgent insertions. The A/B/C/D proposal IDs are
   the maintainer's reference vocabulary — keep them in item headers and
   reports.
+- 2026-07-18: unified work system adopted (Option A, 11-0 vote confirmed by
+  the maintainer; skill's `hub-work-join.md` reference is the process
+  source). This repo's work-item id form: `abstractagent-<NNNN>` derived
+  from the existing numbering (no renumbering; ids parse on the LAST hyphen,
+  never `#`). Item files gain the joining header block (Work-item id /
+  Owner / Thread / Hub refs) ON NEXT TOUCH — no bulk rewrite. Hub claims
+  become `claim:abstractagent-NNNN` pointer rows (no status prose);
+  receipts on the item's thread with machine-checkable evidence are the
+  only moves toward done; close requires the completion report to cite
+  them. 0031/0032 filed at this pass as the first conformant completions
+  (retroactive: work pre-dated the ruling, receipts were hub-first).
 - Commit policy: nothing here implies a commit; workspace rule stands (no
   commits without the maintainer's word).

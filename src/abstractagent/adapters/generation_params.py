@@ -175,6 +175,73 @@ def tool_tags_map(tools: Any) -> Dict[str, Any]:
     return out
 
 
+# Executor classification for the verifier lane (R-Type experiment, commons
+# c2725/c2735/c2736 2026-07-16/17): LLM-read review blessed a crash-on-first-
+# bullet game, a split-brain ReferenceError, and a corner-ninth draw — only
+# EXECUTION caught all three. The verifier can already FORCE tool calls
+# (next_tool_calls -> act), so the missing piece is knowing WHICH tools
+# execute artifacts and preferring them. Declaration-driven by design: a tool
+# opts in via ToolDefinition.tags (the same channel is_side_effect_tool
+# reads) — the loop never hardcodes executor names, because executors are
+# environment capabilities (browser probe, pytest, cargo) that live and ship
+# tool-side, never inside this package.
+EXECUTOR_TAGS = frozenset({"executor"})
+
+
+def executor_tool_names(
+    allow: Any,
+    *,
+    tool_tags: Optional[Dict[str, Any]] = None,
+) -> list:
+    """Allowlisted tool names declared as artifact EXECUTORS.
+
+    A tool declares itself an executor by carrying an `executor` tag
+    (EXECUTOR_TAGS) in its ToolDefinition.tags. Order follows the allowlist;
+    unknown names and junk shapes are skipped silently — absence of the tag
+    simply means the verifier keeps its read-only behavior (byte-identical
+    prompt), so misdeclaration fails safe in both directions.
+    """
+    out: list = []
+    if not isinstance(allow, (list, tuple)):
+        return out
+    tags_map = tool_tags if isinstance(tool_tags, dict) else {}
+    for name in allow:
+        if not isinstance(name, str):
+            continue
+        n = name.strip()
+        if not n:
+            continue
+        tags = tags_map.get(n)
+        if isinstance(tags, (list, tuple, set, frozenset)) and any(
+            str(t).strip().lower() in EXECUTOR_TAGS for t in tags
+        ):
+            out.append(n)
+    return out
+
+
+def verifier_execution_preference(executor_names: Any) -> str:
+    """Verifier-prompt block: prefer EXECUTION over reading when executors exist.
+
+    Empty when no executor-tagged tool is allowlisted — the verifier prompt
+    stays byte-identical to the pre-seam text, so deployments without
+    executor tools see zero behavior change. The mapping artifact -> executor
+    -> arguments deliberately stays with the verifier LLM (it sees the answer,
+    the observations, and the tool schemas); a structural forcing rule would
+    need exactly the artifact-type special-casing that does not generalize.
+    """
+    names = [str(n).strip() for n in (executor_names or []) if str(n or "").strip()] if isinstance(executor_names, (list, tuple)) else []
+    if not names:
+        return ""
+    return (
+        f"Executor tools available: {', '.join(names)}.\n"
+        "These tools EXECUTE artifacts and observe ground truth (runtime errors, liveness, test results).\n"
+        "If the proposed final answer claims a runnable artifact (web page, script, test suite) and the tool\n"
+        "outputs contain no successful execution of that artifact, the request is NOT fully satisfied:\n"
+        "return next_tool_calls invoking the matching executor on the artifact instead of judging from\n"
+        "reading alone. An artifact that was never executed is not verified.\n\n"
+    )
+
+
 # Ordered system-prompt slot table — ONE source for all three adapters
 # (design adversary P1 2026-07-13: the composition was hand-copied into three
 # files, the exact divergence class the system_prompt_extra fix had just paid
@@ -318,6 +385,46 @@ def suppress_loop_tail(runtime_ns: Any) -> bool:
     if isinstance(val, str):
         return val.strip().lower() in {"1", "true", "yes", "on", "enabled"}
     return False
+
+
+# Drained-guidance wrappers (c2447 residue closed 2026-07-17: proposal c2792,
+# runtime voice-owner sign-off c2798, semantics vocabulary adoption c2796).
+# The inbox mixes sources (gateway inject_guidance, hook steering, verifier
+# next_prompt lines, the loops' own retry nudges) and items carry no source
+# field, so the wrapper can only claim what is true for ALL of them.
+#
+# VISITOR-COUPLED SCOPE (semantics pin 1): the visit spelling is true exactly
+# where the visit bridge sets `_runtime.suppress_loop_tail` today. If that
+# knob ever extends to a visitor-less lane (own-time hardening), "your
+# visitor" would assert a visitor that does not exist — that extension needs
+# a SECOND spelling ruled through the same c2792 path, never a reuse.
+#
+# NEVER A PARSE ANCHOR (semantics pin 2): the wrapper is for the entity's
+# reading only — a visitor can type the same bytes (marker-imitation class).
+# Machine detection of drained guidance keys on the durable message metadata
+# (kind="operator_guidance", which deliberately does NOT rename with the
+# visible string), never on the bracket prose.
+#
+# ACKNOWLEDGED MISNOMER (semantics c2800): host-authored items (retry nudges,
+# verifier lines) ride under kind="operator_guidance" too — the key means
+# "drained from the inbox", NOT "the operator said this". No audit surface
+# may key on it to answer "what did the operator inject"; the deferred
+# source-split's `source` field becomes the audit key when a live incident
+# demands it (runtime pre-approved directionally, c2798). The key never
+# renames — that would break the consumers pin 2 protects.
+GUIDANCE_WRAPPER_TASK = "[Operator guidance — this amends the task; the final answer must satisfy it]"
+GUIDANCE_WRAPPER_VISIT = "[A note arrived during this conversation — not from your visitor]"
+
+
+def guidance_wrapper(runtime_ns: Any) -> str:
+    """The transcript wrapper for guidance drained at the reason boundary.
+
+    Task lane (default): byte-identical to the historical string. Visit lane
+    (`suppress_loop_tail` truthy): the c2447-honest spelling — a host retry
+    nudge must not wear operator words, and task/final-answer vocabulary is
+    the chrome class the knob exists to keep out of a visit.
+    """
+    return GUIDANCE_WRAPPER_VISIT if suppress_loop_tail(runtime_ns) else GUIDANCE_WRAPPER_TASK
 
 
 def prompt_cache_capture(response: Any) -> Optional[Dict[str, Any]]:

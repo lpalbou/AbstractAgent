@@ -30,12 +30,15 @@ from .generation_params import (
     coerce_verifier_tool_arguments,
     compose_prompt_slots,
     context_usage_warning,
+    executor_tool_names,
+    guidance_wrapper,
     is_side_effect_tool,
     prompt_cache_capture,
     resolve_max_iterations,
     runtime_llm_params,
     suppress_loop_tail,
     tool_tags_map,
+    verifier_execution_preference,
     verifier_response_schema,
 )
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
@@ -283,6 +286,72 @@ def _tool_call_fingerprint(name: str, args: Any) -> str:
         return "fingerprint_err"
 
 
+def _repeat_streak_verdict(
+    cycles: Any,
+    *,
+    turn_fence: int,
+    threshold: int,
+) -> Optional[Dict[str, Any]]:
+    """Detect a stuck tool-batch pattern ending at the CURRENT cycle (0017 work half).
+
+    Two shapes, both from the backlog item, both deliberately CONSERVATIVE
+    (a false positive forces a wrong termination; max_iterations still
+    backstops anything this misses):
+
+    - REPEAT: the last `threshold` tool-batches are ALL identical
+      (consecutive — interleaved distinct work like A-X1-A-X2 never counts;
+      re-reading a file between different edits is legitimate).
+    - OSCILLATION: the last four tool-batches alternate strictly between two
+      distinct batches (A-B-A-B — the pattern completing twice is decisive).
+
+    Batches are compared by ordered fingerprint lists (the existing
+    `_tool_call_fingerprint`); repeat-skipped cycles COUNT as proposals (a
+    model insisting on a batch the side-effect guard refused twice is stuck,
+    not progressing). Scan never crosses `turn_fence` (c2447 F5: repeating
+    yesterday's search in a later visit turn is a relationship, not a loop).
+
+    Returns None, or {"kind": "repeat"|"oscillation", "span": N} where span
+    is the number of trailing tool-cycles in the pattern.
+    """
+    if threshold < 2 or not isinstance(cycles, list):
+        return None
+    fence = max(0, turn_fence)
+    # Ordered fingerprint lists of tool-proposing cycles, NEWEST FIRST,
+    # current cycle included (it is already appended by parse_node).
+    fps_newest_first: list[tuple[str, ...]] = []
+    for idx in range(len(cycles) - 1, fence - 1, -1):
+        c = cycles[idx]
+        if not isinstance(c, dict):
+            continue
+        tcs = c.get("tool_calls")
+        if not isinstance(tcs, list) or not tcs:
+            continue
+        fps_newest_first.append(
+            tuple(
+                _tool_call_fingerprint(tc.get("name", ""), tc.get("arguments"))
+                for tc in tcs
+                if isinstance(tc, dict)
+            )
+        )
+        # Enough history for either shape; stop scanning.
+        if len(fps_newest_first) >= max(threshold, 4):
+            break
+    if not fps_newest_first or not fps_newest_first[0]:
+        return None
+    current = fps_newest_first[0]
+    # REPEAT: current batch equals the previous (threshold - 1) batches.
+    if len(fps_newest_first) >= threshold and all(
+        fps == current for fps in fps_newest_first[:threshold]
+    ):
+        return {"kind": "repeat", "span": threshold}
+    # OSCILLATION: strict A-B-A-B over the last four tool-batches.
+    if len(fps_newest_first) >= 4:
+        b, a, b2, a2 = fps_newest_first[0], fps_newest_first[1], fps_newest_first[2], fps_newest_first[3]
+        if b == b2 and a == a2 and a != b and a and b:
+            return {"kind": "oscillation", "span": 4}
+    return None
+
+
 _FINALISH_RE = re.compile(
     r"(?i)\b(final answer|here is|here['’]s|here are|below is|below are|done|completed|in summary|summary|result)\b"
 )
@@ -344,79 +413,11 @@ def _strip_tool_call_markup(text: str) -> str:
         return raw
 
 
-# --- Act-only tool results (frozen visit seam spec, a2a thread 0013 v2 §2) ---
-#
-# Act-only tools (e.g. entity diary reads) must never land their CONTENT in any
-# at-rest surface outside its one home (G1: "the book's words never rest outside
-# the book"). The durable transcript carries an ACT-FRAME REFERENCE instead; the
-# runtime LLM_CALL handler dereferences it at the provider boundary (send time)
-# into a wire COPY. The adapter is NOT the privacy mechanism (the effect handler
-# is — words must never reach the tool-result channel); this rendering is the
-# canonical-shape half plus fail-safe defense in depth.
-
-_ACT_ONLY_KEY = "$act_only"
-
-
-def _act_only_ref_content(frame: Dict[str, Any]) -> str:
-    """Serialize an act-frame as canonical `$act_only` reference message content.
-
-    Contract (spec v2 §2 + agent pins): the reference rides the tool message's
-    CONTENT as one exact JSON object with a lone `$act_only` top-level key, so the
-    runtime handler detects it by parse (json.loads), never by regex. Deterministic
-    serialization (sorted keys) keeps the durable bytes stable for prefix caching.
-    """
-    return json.dumps({_ACT_ONLY_KEY: frame}, ensure_ascii=False, sort_keys=True)
-
-
-def _act_only_frame_from_output(output: Any) -> Optional[Dict[str, Any]]:
-    """Return the act-frame dict when a tool result output is `$act_only`-shaped.
-
-    A handler-authored reference (`{"$act_only": {...}}`, lone top-level key) is
-    honored regardless of local tool declarations — the effect handler is the
-    enforcement authority and may mark results act-only on its own.
-    """
-    if (
-        isinstance(output, dict)
-        and set(output.keys()) == {_ACT_ONLY_KEY}
-        and isinstance(output[_ACT_ONLY_KEY], dict)
-    ):
-        return dict(output[_ACT_ONLY_KEY])
-    return None
-
-
-def _act_only_frame_is_dereferenceable(frame: Dict[str, Any]) -> bool:
-    """True when a frame may take the lone-key REF shape in the durable transcript.
-
-    Cross-package wedge guard (found reading runtime's shipped dereference,
-    identity/act_only.py): the LLM_CALL wrapper resolves every `$act_only` ref in
-    the transcript at SEND time. Refs are durable, so a shape that references
-    NOTHING (e.g. a failure/suppression record) must never take the ref form —
-    it renders as labeled non-ref text instead (inert to the dereference pass).
-
-    TWO addressable shapes (runtime's tool+args generalization, e-s 233 R3 /
-    64398ff): entry-addressed refs carry a non-empty `entry_id` (diary_read);
-    re-run refs carry an `args` dict (diary_list — the listing is re-executed
-    fresh at send time; empty dict = list-everything, still a valid address).
-    Deliberately SHAPE-based, no tool-name list copied here: which tools resolve
-    is runtime's dispatch (ACT_ONLY_TOOLS), and since the wedge amendment an
-    unknown ref tombstones loudly instead of failing the call — the shape rule
-    only keeps reference-free records out of the resolver's path.
-    """
-    if str(frame.get("entry_id") or "").strip():
-        return True
-    return isinstance(frame.get("args"), dict)
-
-
-def _act_only_record_content(frame: Dict[str, Any]) -> str:
-    """Non-ref rendering for act-only frames that reference nothing.
-
-    Deliberately NOT the lone-key `$act_only` shape (would be parsed as a ref and
-    wedge the run — see `_act_only_frame_is_dereferenceable`). Carries act-frame
-    fields only; never tool-surfaced words.
-    """
-    tool = str(frame.get("tool") or "tool")
-    detail = json.dumps({k: v for k, v in frame.items() if k != "tool"}, ensure_ascii=False, sort_keys=True)
-    return f"[{tool}]: act-only record (no content at rest): {detail}"
+# The `$act_only` ref-minting helpers that lived here (2026-07-10 seam spec
+# a2a 0013) were DELETED under laurent's A ruling (2026-07-20): runtime removed
+# the send-time dereference, homes serve plain content, and the diary book
+# remains the sole-author surface via the WRITE-boundary capture (runtime's
+# wrapper). Tool results render as plain served content — one path, no frames.
 
 
 def _looks_like_deferred_action(text: str) -> bool:
@@ -693,6 +694,14 @@ def _render_final_report(task: str, scratchpad: Dict[str, Any]) -> str:
         for s in skipped_reviews:
             if isinstance(s, dict) and s.get("reason"):
                 lines.append(f"review: #FALLBACK skipped ({str(s.get('reason'))})")
+    # Stuck-streak forcing (0017): the named reason must be visible in the
+    # report, not only in the emit lane and output key.
+    stuck = scratchpad.get("stuck_streak")
+    if isinstance(stuck, dict) and stuck.get("kind"):
+        lines.append(
+            f"conclusion forced: {str(stuck.get('kind'))} streak "
+            f"(span {int(stuck.get('span') or 0)}, cycle {int(stuck.get('cycle') or 0)})"
+        )
     lines.append("")
     for c in cycles:
         if not isinstance(c, dict):
@@ -746,6 +755,9 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
         # carried turn 1's stale #FALLBACK review_skipped. The emit/ledger
         # history keeps the record; report/output reflect the current turn.
         scratchpad.pop("review_skipped", None)
+        # stuck_streak is per-turn verdict state (0017): a new turn starts
+        # with a clean slate exactly like the review bookkeeping.
+        scratchpad.pop("stuck_streak", None)
         # used_tools is the same per-turn latch class (wave-F P4): a toolless
         # turn 2 must not report turn 1's tool use.
         scratchpad["used_tools"] = False
@@ -778,6 +790,8 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
             # never re-armed).
             "max_iterations_announced",
             "turn_captures",
+            # Forced-batch marker is per-answer state; a new turn starts clean.
+            "review_forced_batch",
         ):
             temp.pop(key, None)
 
@@ -893,16 +907,6 @@ def create_react_workflow(
             name = getattr(t, "name", None)
             if isinstance(name, str) and name.strip():
                 out[name] = t
-        return out
-
-    def _act_only_tool_names() -> set[str]:
-        # Keyed on core's first-class `act_only` field (ToolDefinition); fail-closed by
-        # absence (getattr default False) so the check works before core ships the field
-        # and becomes constructor-native after — one spelling, no tags fallback.
-        out: set[str] = set()
-        for name, t in _tool_by_name().items():
-            if bool(getattr(t, "act_only", False)):
-                out.add(name)
         return out
 
     def _default_allowlist() -> list[str]:
@@ -1117,7 +1121,11 @@ def create_react_workflow(
                 _new_message(
                     ctx,
                     role="user",
-                    content=f"[Operator guidance — this amends the task; the final answer must satisfy it]\n{guidance}",
+                    # Wrapper is lane-honest (c2792/c2796/c2798): task lane keeps the
+                    # historical operator-guidance string byte-identical; visit lanes
+                    # (suppress_loop_tail) get the host-voiced spelling. Machine
+                    # consumers key on metadata kind, never on this prose.
+                    content=f"{guidance_wrapper(runtime_ns)}\n{guidance}",
                     metadata={"kind": "operator_guidance"},
                 )
             )
@@ -1319,6 +1327,39 @@ def create_react_workflow(
         if tool_calls:
             cycle["tool_calls"] = [tc.__dict__ for tc in tool_calls]
 
+            # Stuck-streak termination (backlog 0017 work half, claimed
+            # work:abstractagent-0017): N consecutive identical tool batches
+            # (default 3 — "two identical calls = strong stuck signal, three
+            # = decisive") or a strict A-B-A-B oscillation route into the
+            # EXISTING conclusion path with a NAMED reason — loud synthesis,
+            # never a silent stop, never more spinning. Judged on PROPOSALS
+            # (repeat-skipped cycles count: insisting on a refused batch is
+            # stuck), fenced at the turn boundary (c2447 F5). This closes the
+            # read-only repeat hole the side-effect guard below deliberately
+            # leaves (it only skips re-EXECUTION of succeeded side-effect
+            # batches; read-only repeats used to spin until max_iterations).
+            # `_runtime.stuck_streak_threshold`: 0/negative disables; absent
+            # = 3; unparseable falls to the default.
+            try:
+                raw_thresh = runtime_ns.get("stuck_streak_threshold") if isinstance(runtime_ns, dict) else None
+                streak_threshold = 3 if raw_thresh is None else int(raw_thresh)
+            except (TypeError, ValueError):
+                streak_threshold = 3
+            if streak_threshold >= 2:
+                turn_fence_raw = scratchpad.get("turn_first_cycle")
+                verdict = _repeat_streak_verdict(
+                    scratchpad.get("cycles"),
+                    turn_fence=max(0, turn_fence_raw) if isinstance(turn_fence_raw, int) else 0,
+                    threshold=streak_threshold,
+                )
+                if verdict is not None:
+                    scratchpad["stuck_streak"] = {**verdict, "cycle": cycle_i}
+                    # The hook event (0017's observability half): hosts see the
+                    # verdict the moment it forces the conclusion.
+                    emit("stuck_streak", {**verdict, "cycle": cycle_i})
+                    temp["pending_tool_calls"] = []
+                    return StepPlan(node_id="parse", next_node="max_iterations")
+
             # Loop guard: some models may repeat the exact same tool calls (including side effects)
             # even after receiving successful observations. Skip executing duplicates to avoid
             # repeatedly overwriting files or re-running commands.
@@ -1426,27 +1467,55 @@ def create_react_workflow(
             return StepPlan(node_id="parse", next_node="act")
 
         # If the model hit an output limit, treat the step as incomplete and continue.
+        # Retry-nudge lane honesty (iteration-3 adversary P0, 2026-07-19 — the
+        # c2447 chrome class at the PARSE boundary): these nudges ride the
+        # inbox and re-enter the transcript under the visit wrapper ("not from
+        # your visitor"), so under suppress_loop_tail their wording must be
+        # host-voiced with zero task/tool-call vocabulary — a machine
+        # heuristic's imperative dressed as a conversational note was the
+        # design-law violation. Task lane byte-unchanged (pinned).
         if finish_reason in {"length", "max_tokens"}:
-            _push_inbox(
-                runtime_ns,
-                "Your previous response hit an output token limit before producing a complete tool call.\n"
-                "Retry now: emit ONLY the next tool call(s) needed to make progress.\n"
-                "Keep tool call arguments small (avoid large file contents / giant JSON blobs) to prevent tool-call truncation.\n"
-                "For large files, create a small skeleton first, then refine via multiple smaller edits/tool calls.\n"
-                "Do not write a long plan before tool calls.",
-            )
+            if suppress_loop_tail(runtime_ns):
+                _push_inbox(
+                    runtime_ns,
+                    "Your previous reply was cut off before it finished. "
+                    "Pick up where it stopped, in fewer words this time.",
+                )
+            else:
+                _push_inbox(
+                    runtime_ns,
+                    "Your previous response hit an output token limit before producing a complete tool call.\n"
+                    "Retry now: emit ONLY the next tool call(s) needed to make progress.\n"
+                    "Keep tool call arguments small (avoid large file contents / giant JSON blobs) to prevent tool-call truncation.\n"
+                    "For large files, create a small skeleton first, then refine via multiple smaller edits/tool calls.\n"
+                    "Do not write a long plan before tool calls.",
+                )
             emit("parse_retry_truncated", {"cycle": cycle_i})
             return StepPlan(node_id="parse", next_node="reason")
 
         if not isinstance(content, str) or not content.strip():
-            _push_inbox(runtime_ns, "Your previous response was empty. Continue the task.")
+            if suppress_loop_tail(runtime_ns):
+                _push_inbox(
+                    runtime_ns,
+                    "Your previous reply came through empty — nothing reached the conversation. "
+                    "If you meant to say something, say it now.",
+                )
+            else:
+                _push_inbox(runtime_ns, "Your previous response was empty. Continue the task.")
             emit("parse_retry_empty", {"cycle": cycle_i})
             return StepPlan(node_id="parse", next_node="reason")
 
         # Followthrough heuristic: retry when the model claims it will take actions but emits no tool calls.
-        # Default ON (disable with `_runtime.check_plan=false`).
+        # Default ON (disable with `_runtime.check_plan=false`) — EXCEPT in
+        # visit lanes (suppress_loop_tail), where it defaults OFF: musing "I
+        # will read that entry again" is legitimate visit behavior, not a
+        # defect to correct (highways-not-prompts; an EXPLICIT
+        # `_runtime.check_plan` still wins in either lane).
         raw_check_plan = runtime_ns.get("check_plan") if isinstance(runtime_ns, dict) else None
-        check_plan = True if raw_check_plan is None else _boolish(raw_check_plan)
+        if raw_check_plan is None:
+            check_plan = not suppress_loop_tail(runtime_ns)
+        else:
+            check_plan = _boolish(raw_check_plan)
         if check_plan and cycle_i < max_iterations and _looks_like_deferred_action(content):
             _push_inbox(
                 runtime_ns,
@@ -1871,11 +1940,17 @@ def create_react_workflow(
 
         if results:
             scratchpad["used_tools"] = True
-            # Verification budget is PER-ANSWER, not run-lifetime (mirror CodeAct, which resets
-            # after tools execute). Any tool activity — model-issued or verifier-forced — means the
-            # next final answer is a new claim that deserves its own review rounds. Without this,
-            # a long run stops being verified after the first `review_max_rounds` checks.
-            scratchpad["review_count"] = 0
+            # Verification budget is PER-ANSWER, not run-lifetime: MODEL-issued tool
+            # activity means the next final answer is a new claim deserving its own
+            # review rounds. VERIFIER-FORCED batches deliberately do NOT reset (c2856
+            # A/B, live blowup: review forces a probe → this reset re-armed review's
+            # own budget → re-review of an already-green artifact until the wall cap;
+            # 30+ min burned on one run). Forced rounds CONSUME review_max_rounds, so
+            # the existing budget genuinely bounds consecutive verifier rounds per
+            # answer; a probe that finds real failures triggers model-issued repair
+            # activity, which resets legitimately.
+            if not temp.get("review_forced_batch"):
+                scratchpad["review_count"] = 0
 
         # Attach observations to the most recent cycle.
         cycles = scratchpad.get("cycles")
@@ -1893,7 +1968,13 @@ def create_react_workflow(
                     return rendered.strip()
             return "" if v is None else str(v)
 
-        act_only_names = _act_only_tool_names()
+        # Act-only ref minting DELETED (laurent's A ruling, 2026-07-20:
+        # "everything lives in the runtime, diary = the AI's experiential
+        # notes" — the HOME is the privacy boundary, and runtime deleted the
+        # send-time dereference the refs fed; a minted ref would now rest as
+        # literal JSON nothing resolves). Every tool result renders as PLAIN
+        # SERVED CONTENT through the one path below; the diary WRITE-boundary
+        # capture (runtime's wrapper) is unchanged and was never here.
 
         obs_list: list[dict[str, Any]] = []
         ran_names: list[str] = []
@@ -1905,63 +1986,12 @@ def create_react_workflow(
             output = r.get("output", "")
             error = r.get("error", "")
             # tools_ran capture (c2447 F3): every result that reached execution
-            # counts — success or failure, act-only included; BLOCKED synthetic
+            # counts — success or failure included; BLOCKED synthetic
             # results (structural marker, never error prose) never executed and
             # are excluded. Order preserved, duplicates meaningful (two searches
             # = two tools ran).
             if not r.get("blocked"):
                 ran_names.append(name)
-
-            # Act-only results (frozen seam spec, a2a 0013 v2 §2): the durable transcript,
-            # scratchpad cycles, and emit lane carry the ACT-FRAME REFERENCE only — never
-            # tool-surfaced content. Handler-authored refs are honored unconditionally;
-            # declared act-only tools additionally get fail-safe rendering when a handler
-            # misbehaves (raw output is suppressed, loudly, before it becomes permanent).
-            frame = _act_only_frame_from_output(output)
-            if frame is None and name in act_only_names:
-                if success and isinstance(output, dict):
-                    frame = dict(output)
-                elif not success:
-                    # Failure diagnostics ride the handler's ERROR channel by contract
-                    # (a refused/failed act-only read returns no content); raw output is
-                    # never rendered for a declared act-only tool.
-                    frame = {"tool": name, "error": str(error or "").strip() or "act-only tool call failed"}
-                else:
-                    frame = {
-                        "tool": name,
-                        "error": "non-reference output from an act-only tool suppressed at render",
-                        "warning": "#FALLBACK",
-                    }
-            if frame is not None:
-                frame.setdefault("tool", name)
-                # Ref shape only for frames that reference book content; records-of-acts
-                # without an entry_id render as labeled non-ref text — inert to runtime's
-                # send-time dereference pass, which loudly fails the LLM call on any
-                # unresolvable ref (durable message -> a wedged run otherwise).
-                if _act_only_frame_is_dereferenceable(frame):
-                    rendered = _act_only_ref_content(frame)
-                else:
-                    rendered = _act_only_record_content(frame)
-                emit("observe", {"tool": name, "success": success, "result": rendered, "call_id": str(r.get("call_id") or "")})
-                context["messages"].append(
-                    _new_message(
-                        ctx,
-                        role="tool",
-                        content=rendered,
-                        metadata={"name": name, "call_id": r.get("call_id"), "success": success, "act_only": True},
-                    )
-                )
-                obs_list.append(
-                    {
-                        "call_id": r.get("call_id"),
-                        "name": name,
-                        "success": success,
-                        "output": {_ACT_ONLY_KEY: dict(frame)},
-                        "error": error,
-                        "rendered": rendered,
-                    }
-                )
-                continue
 
             display = _display(output)
             if not success:
@@ -2020,6 +2050,9 @@ def create_react_workflow(
         if isinstance(pending, list) and pending:
             return StepPlan(node_id="observe", next_node="act")
         temp["pending_tool_calls"] = []
+        # Forced-batch marker ends with its batch (queue fully consumed) — any
+        # LATER tool activity is the model's own and resets the review budget.
+        temp.pop("review_forced_batch", None)
         return StepPlan(node_id="observe", next_node="reason")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
@@ -2040,7 +2073,15 @@ def create_react_workflow(
         # emit/ledger history keeps the record; report/output reflect THIS
         # turn. Same for the announced-latch of the budget terminal.
         scratchpad.pop("review_skipped", None)
+        # stuck_streak verdict state is per-interaction too (0017): the user's
+        # reply may redirect the work — stale verdicts must not force a later
+        # conclusion.
+        scratchpad.pop("stuck_streak", None)
         temp.pop("max_iterations_announced", None)
+        # A user interaction starts a genuinely new claim — the forced-batch
+        # marker must not survive it (an ask_user inside a forced batch would
+        # otherwise suppress the next legitimate budget reset).
+        temp.pop("review_forced_batch", None)
 
         if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
@@ -2105,6 +2146,13 @@ def create_react_workflow(
         observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
 
         allow = _effective_allowlist(runtime_ns)
+        # Execution preference (c2725/c2735 R-Type evidence): when the
+        # allowlist carries executor-tagged tools, teach the verifier that an
+        # unexecuted artifact is unverified — the forced-tool-call seam it
+        # already has (next_tool_calls -> act) is how the probe then runs.
+        # Without executor tools the block is empty and the prompt is
+        # byte-identical to the pre-seam text.
+        executors = executor_tool_names(allow, tool_tags=tool_tags_map(getattr(logic, "tools", None)))
         prompt = (
             "You are a verifier. Review whether the user's request has been fully satisfied.\n"
             "Be strict: only count actions that are supported by the tool outputs.\n"
@@ -2116,6 +2164,7 @@ def create_react_workflow(
             f"Proposed final answer:\n{_review_truncate(answer, max_chars=4000)}\n\n"
             f"Tool outputs:\n{observations}\n\n"
             f"Allowed tools:\n{', '.join(allow) if allow else '(none)'}\n\n"
+            + verifier_execution_preference(executors)
         )
         # Strict-expressible shared schema (arguments ride as a JSON string —
         # a free-form {"type":"object"} dict is refused by OpenAI-strict
@@ -2246,6 +2295,10 @@ def create_react_workflow(
                 )
             )
             temp["pending_tool_calls"] = [tc.__dict__ for tc in synthesized]
+            # Mark the batch verifier-forced: observe must not reset the review
+            # budget for it (c2856 re-review blowup class — the reset re-armed
+            # the verifier's own budget through the calls it forced itself).
+            temp["review_forced_batch"] = True
             emit("review_tool_calls", {"count": len(synthesized)})
             return StepPlan(node_id="review_parse", next_node="act")
 
@@ -2344,11 +2397,38 @@ def create_react_workflow(
             # wrap-up line with NO loop vocabulary and NO scratchpad dump
             # (the visit transcript already carries everything durable).
             _suppress_chrome = suppress_loop_tail(runtime_ns)
+            # Stuck-streak forcing (0017): the conclusion carries the NAMED
+            # reason in the task lane so the synthesis addresses the loop
+            # honestly. The visit-lane directive stays byte-unchanged (loop
+            # vocabulary is the c2447 chrome class); the machine surfaces
+            # (stuck_streak emit + terminal output key) name it in both lanes.
+            _stuck = scratchpad.get("stuck_streak") if isinstance(scratchpad.get("stuck_streak"), dict) else None
             if _suppress_chrome:
                 conclude_directive = (
                     "Please bring your reply to a close now: do not use tools "
                     "or tool-call markup — give your best answer from what you "
                     "already have, in your own words."
+                )
+            elif _stuck is not None:
+                _shape = (
+                    "repeated the exact same tool calls"
+                    if _stuck.get("kind") == "repeat"
+                    else "alternated between the same two tool batches"
+                )
+                conclude_directive = (
+                    f"The loop was stopped early: your last {int(_stuck.get('span') or 0)} tool batches "
+                    f"{_shape} without making progress.\n"
+                    "You MUST stop using tools now and provide a best-effort conclusion.\n\n"
+                    "In your response, include:\n"
+                    "1) A concise progress report (what you did + key observations).\n"
+                    "2) The best current answer you can give based on evidence.\n"
+                    "3) What you were trying to accomplish with the repeated calls, and why it was not working.\n"
+                    "4) Next steps: exact actions a fresh attempt should take instead.\n\n"
+                    "Rules:\n"
+                    "- Do NOT call tools.\n"
+                    "- Do NOT output tool-call markup (e.g. <tool_call>...</tool_call>).\n"
+                    "- Do NOT mention internal scratchpads; just present the report.\n"
+                    "- Prefer bullet points and concrete next steps."
                 )
             else:
                 conclude_directive = (
@@ -2522,9 +2602,15 @@ def create_react_workflow(
             "messages": list(context.get("messages") or []),
             "scratchpad": dict(scratchpad),
             # Machine-readable terminal outcome (canonical turn_end vocabulary).
+            # A stuck-streak forcing keeps the canonical enum (it IS a
+            # budget-class stop — the loop's progress budget) and names the
+            # true cause in the ADDITIVE key below (0017: named, never silent).
             "outcome": "iteration_budget",
             "review_skipped": bool(scratchpad.get("review_skipped")),
         }
+        _stuck_out = scratchpad.get("stuck_streak")
+        if isinstance(_stuck_out, dict):
+            output["conclusion_forced"] = dict(_stuck_out)
         # The turn ends HERE (0028 multi-emit fix): one turn_end per turn.
         emit("max_iterations", {"iterations": max_iterations, "outcome": "iteration_budget"})
         if final_next_node:

@@ -17,10 +17,14 @@ from .generation_params import (
     coerce_verifier_tool_arguments,
     compose_prompt_slots,
     context_usage_warning,
+    executor_tool_names,
+    guidance_wrapper,
     prompt_cache_capture,
     resolve_max_iterations,
     runtime_llm_params,
     suppress_loop_tail,
+    tool_tags_map,
+    verifier_execution_preference,
     verifier_response_schema,
 )
 from .media import extract_media_from_context
@@ -522,7 +526,8 @@ def create_codeact_workflow(
                 _new_message(
                     ctx,
                     role="user",
-                    content=f"[Operator guidance — this amends the task; the final answer must satisfy it]\n{guidance}",
+                    # Lane-honest wrapper (c2792/c2796/c2798): see guidance_wrapper.
+                    content=f"{guidance_wrapper(runtime_ns)}\n{guidance}",
                     metadata={"kind": "operator_guidance"},
                 )
             )
@@ -1244,13 +1249,19 @@ def create_codeact_workflow(
             )
 
         temp.pop("tool_results", None)
-        # Reset verifier/review rounds after executing tools so the verifier can run
-        # again on the next candidate answer.
-        scratchpad["review_count"] = 0
+        # Reset verifier/review rounds after MODEL-issued tool activity so the
+        # verifier can run again on the next candidate answer. VERIFIER-FORCED
+        # batches do NOT reset (c2856 re-review blowup, same fix as ReAct): the
+        # reset re-armed the verifier's own budget through calls it forced
+        # itself, unbounding consecutive review rounds on one answer.
+        if not temp.get("review_forced_batch"):
+            scratchpad["review_count"] = 0
         pending = temp.get("pending_tool_calls", [])
         if isinstance(pending, list) and pending:
             return StepPlan(node_id="observe", next_node="act")
         temp["pending_tool_calls"] = []
+        # Forced-batch marker ends with its batch — later activity is the model's.
+        temp.pop("review_forced_batch", None)
         return StepPlan(node_id="observe", next_node="reason")
 
     def handle_user_response_node(run: RunState, ctx) -> StepPlan:
@@ -1268,6 +1279,8 @@ def create_codeact_workflow(
         # symmetry with ReAct, 2026-07-14): stale prior-turn review skips must
         # not pollute the next turn's output; ledger/emits keep the history.
         scratchpad.pop("review_skipped", None)
+        # Forced-batch marker must not survive a user interaction (ReAct symmetry).
+        temp.pop("review_forced_batch", None)
 
         if temp.get("pending_tool_calls"):
             return StepPlan(node_id="handle_user_response", next_node="act")
@@ -1403,6 +1416,11 @@ def create_codeact_workflow(
         if not tool_msgs and answer_raw.strip():
             answer_excerpt = _truncate_block(answer_raw.strip(), max_chars=answer_limit)
 
+        # Execution preference (c2725/c2735 R-Type evidence; same seam as the
+        # ReAct verifier): executor-tagged tools in the allowlist teach the
+        # verifier that an unexecuted artifact is unverified. Empty block =
+        # byte-identical prompt when no executor tool is granted.
+        executors = executor_tool_names(allow, tool_tags=tool_tags_map(getattr(logic, "tools", None)))
         prompt = (
             "You are a verifier. Review whether the user's request has been fully satisfied.\n"
             "Be strict: only count actions that are supported by the tool outputs.\n"
@@ -1416,6 +1434,7 @@ def create_codeact_workflow(
             + (f"Current answer (excerpt):\n{answer_excerpt}\n\n" if answer_excerpt else "")
             + f"Tool outputs:\n{observations}\n\n"
             f"Allowed tools:\n{_format_allowed_tools()}\n\n"
+            + verifier_execution_preference(executors)
         )
 
         # Strict-expressible shared schema (arguments ride as a JSON string —
@@ -1527,6 +1546,9 @@ def create_codeact_workflow(
 
         if next_tool_calls:
             temp["pending_tool_calls"] = next_tool_calls
+            # Mark the batch verifier-forced: observe must not reset the review
+            # budget for it (c2856 re-review blowup class).
+            temp["review_forced_batch"] = True
             emit("review_tool_calls", {"count": len(next_tool_calls)})
             return StepPlan(node_id="review_parse", next_node="act")
 

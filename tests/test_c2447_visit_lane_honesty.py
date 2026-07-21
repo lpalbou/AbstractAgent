@@ -363,3 +363,133 @@ def test_blocked_calls_never_count_as_ran() -> None:
     )
     captures = ((state.vars or {}).get("_temp") or {}).get("turn_captures") or {}
     assert not captures.get("tools_ran"), "blocked builtin calls must not count as ran"
+
+
+# ---------------------------------------------------------------------------
+# Drained-guidance wrapper (c2447 residue closed: c2792 proposal,
+# runtime voice-owner sign-off c2798, semantics adoption + 2 pins c2796)
+# ---------------------------------------------------------------------------
+
+_GUIDANCE_ITEM = {"content": "Please weave the earlier thread back in."}
+_TASK_WRAPPER = "[Operator guidance — this amends the task; the final answer must satisfy it]"
+_VISIT_WRAPPER = "[A note arrived during this conversation — not from your visitor]"
+
+
+@pytest.mark.parametrize("loop", ["react", "codeact", "memact"])
+def test_task_lane_guidance_wrapper_byte_unchanged(loop: str) -> None:
+    """Without the visit knob, the historical wrapper stays byte-identical —
+    task-agent transcripts and their consumers see zero change."""
+    payloads, _ = _drive(
+        loop,
+        _scripts_for(loop, with_tool=False),
+        runtime_vars={"inbox": [dict(_GUIDANCE_ITEM)]},
+    )
+    text = _all_payload_text(payloads)
+    assert _TASK_WRAPPER in text
+    assert _VISIT_WRAPPER not in text
+
+
+@pytest.mark.parametrize("loop", ["react", "codeact", "memact"])
+def test_visit_lane_guidance_wrapper_is_host_voiced(loop: str) -> None:
+    """Under `suppress_loop_tail`, drained guidance — operator injections and
+    the loops' own retry nudges alike — wears the host-voiced wrapper: no
+    fabricated operator attribution, no task/final-answer vocabulary (the
+    c2447 chrome class). The guidance WORDS still reach the model."""
+    payloads, _ = _drive(
+        loop,
+        _scripts_for(loop, with_tool=False),
+        runtime_vars={"suppress_loop_tail": True, "inbox": [dict(_GUIDANCE_ITEM)]},
+    )
+    text = _all_payload_text(payloads)
+    assert _VISIT_WRAPPER in text
+    assert "[Operator guidance" not in text
+    assert "Please weave the earlier thread back in." in text
+
+
+# ---------------------------------------------------------------------------
+# Retry-nudge lane honesty (iteration-3 adversary P0, 2026-07-19): the parse
+# boundary's own retry nudges ride the inbox and re-enter the transcript under
+# the visit wrapper — in visit lanes their wording must be host-voiced (no
+# task/tool-call vocabulary), and the followthrough heuristic must not correct
+# musing ("I will read that entry again" is a legitimate visit thought).
+# ---------------------------------------------------------------------------
+
+def test_visit_lane_empty_retry_is_host_voiced() -> None:
+    payloads, _ = _drive(
+        "react",
+        [{"content": "", "tool_calls": []}, _FINAL_REPLY],
+        runtime_vars={"suppress_loop_tail": True},
+    )
+    text = _all_payload_text(payloads)
+    assert "Continue the task" not in text
+    assert "nothing reached the conversation" in text
+
+
+def test_task_lane_empty_retry_byte_unchanged() -> None:
+    payloads, _ = _drive("react", [{"content": "", "tool_calls": []}, _FINAL_REPLY])
+    assert "Your previous response was empty. Continue the task." in _all_payload_text(payloads)
+
+
+# The musing MUST genuinely match the deferred-action heuristic (intent word
+# "I will" + action verb "read"), or the defaults-off pin passes vacuously —
+# the explicit-check_plan control test proves the phrase trips the heuristic.
+_MUSING_REPLY = {"content": "I will read that diary entry again, when the moment is right.", "tool_calls": []}
+
+
+def test_visit_lane_followthrough_nudge_defaults_off() -> None:
+    """Deferred-action prose ("I will read...") is musing in a visit — the
+    turn completes with the prose as the answer, no corrective nudge."""
+    payloads, state = _drive(
+        "react",
+        [dict(_MUSING_REPLY)],
+        runtime_vars={"suppress_loop_tail": True},
+    )
+    assert "you did not call any tools" not in _all_payload_text(payloads)
+    assert (state.output or {}).get("answer", "").startswith("I will read that diary entry")
+
+
+def test_visit_lane_explicit_check_plan_still_wins() -> None:
+    """An EXPLICIT _runtime.check_plan=true is honored even in a visit lane —
+    the lane flips only the DEFAULT (and this control proves _MUSING_REPLY
+    trips the heuristic, so the defaults-off pin above is not vacuous)."""
+    payloads, _ = _drive(
+        "react",
+        [dict(_MUSING_REPLY), _FINAL_REPLY],
+        runtime_vars={"suppress_loop_tail": True, "check_plan": True},
+    )
+    assert "you did not call any tools" in _all_payload_text(payloads)
+
+
+def test_visit_lane_truncation_retry_is_host_voiced() -> None:
+    truncated = {"content": "I was starting to say", "tool_calls": [], "finish_reason": "length"}
+    payloads, _ = _drive(
+        "react",
+        [truncated, _FINAL_REPLY],
+        runtime_vars={"suppress_loop_tail": True},
+    )
+    text = _all_payload_text(payloads)
+    # The task-lane wording (tool-call coaching) must not reach a visit; the
+    # host-voiced line must. Assert on the nudge strings, not the whole
+    # payload (the persona/system prompt legitimately mentions tools).
+    assert "output token limit" not in text
+    assert "Pick up where it stopped" in text
+
+
+def test_guidance_machine_anchor_is_metadata_never_prose() -> None:
+    """Semantics pin 2 (c2796): the wrapper is for the entity's reading only
+    — a visitor can type the same bytes, so machine detection of drained
+    guidance keys on the durable message metadata (kind="operator_guidance",
+    which deliberately does NOT rename with the visible string), never on
+    the bracket prose."""
+    _, state = _drive(
+        "react",
+        [_FINAL_REPLY],
+        runtime_vars={"suppress_loop_tail": True, "inbox": [dict(_GUIDANCE_ITEM)]},
+    )
+    messages = ((state.vars or {}).get("context") or {}).get("messages") or []
+    drained = [
+        m for m in messages
+        if isinstance(m, dict) and (m.get("metadata") or {}).get("kind") == "operator_guidance"
+    ]
+    assert len(drained) == 1, "the structured anchor must identify exactly the drained message"
+    assert _VISIT_WRAPPER in str(drained[0].get("content") or "")

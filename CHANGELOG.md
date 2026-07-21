@@ -2,6 +2,134 @@
 
 ## Unreleased (2026-07-12)
 
+### Added (2026-07-21 — backlog 0017 work half: stuck-streak termination)
+- **`react_runtime.py::_repeat_streak_verdict` + parse-boundary wiring**
+  (work:abstractagent-0017): read-only repeat loops used to spin uncounted
+  until max_iterations (the side-effect guard deliberately skips only
+  re-execution of succeeded side-effect batches). Now N consecutive identical
+  tool batches (default 3 — "two identical calls = strong stuck signal, three
+  = decisive"; `_runtime.stuck_streak_threshold`, 0/negative disables) or a
+  strict A-B-A-B oscillation over the last four tool batches route into the
+  EXISTING conclusion path with a NAMED reason: new `stuck_streak` hook event
+  ({kind, span, cycle}; emit inventory updated), additive `conclusion_forced`
+  terminal-output key (canonical outcome enum unchanged), a report line, and
+  a task-lane conclusion directive naming the loop. Conservatism pinned:
+  judged on PROPOSALS (guard-skipped cycles count — insisting on a refused
+  batch is stuck), consecutive-only (interleaved distinct work never counts;
+  three-distinct-batch cycles left to max_iterations by design), turn-fenced
+  in visits (c2447 F5 reuse) with the visit-lane conclude directive staying
+  chrome-free. Composition update: the 0029 #7 skip/nudge alternation now
+  TERMINATES at the third identical proposal instead of alternating forever
+  (original guard property still pinned independently with the streak
+  disabled). CodeAct/MemAct twins deferred to 0021's shared core (recorded).
+  Tests: `tests/test_stuck_streak_termination.py` (8) + 2 updated 0029 pins.
+  Suite 293.
+
+### Removed (2026-07-20 — act-only ref minting deleted per laurent's A ruling)
+- **`react_runtime.py` `$act_only` observation rendering**: laurent ruled
+  "everything lives in the runtime, diary = the AI's experiential notes" — the
+  act-only visit-transcript ref machinery had no mandate. Runtime deleted the
+  send-time dereference (their receipt, dm:agent--runtime#2); this adapter's
+  minting half followed: the module-level ref helpers, the factory's
+  `_act_only_tool_names`, and observe_node's frame branch are gone. Every tool
+  result renders as PLAIN SERVED CONTENT through the one path; a minted ref
+  would have rested as literal JSON nothing resolves. `ToolDefinition.act_only`
+  is render-inert here (the field may persist core-side). The diary book's
+  sole-author property is unchanged — it lives in the WRITE-boundary capture
+  (runtime's wrapper), which was never in this adapter.
+  `tests/test_react_act_only_observation.py` rewritten as the post-ruling pin
+  set (served-content-rests-plainly, no-ref-ever-minted resurrection guard,
+  act_only-field inert; 3 pins). Suite 284.
+
+### Fixed (2026-07-19 — retry-nudge lane honesty: the parse boundary's pushes go host-voiced in visit lanes)
+- **Visit-lane retry nudges (iteration-3 adversary P0)**: the parse boundary's
+  own retry nudges ride the durable inbox and re-enter the transcript under
+  the visit wrapper ("[A note arrived during this conversation — not from
+  your visitor]") — so a machine heuristic's imperative ("Your previous
+  response was empty. Continue the task.") wore anonymous-note clothing with
+  task vocabulary inside a visit, exactly the c2447 chrome class at a
+  boundary the original wave missed. Under `_runtime.suppress_loop_tail`:
+  the empty-reply and truncation retries are host-voiced with zero task/
+  tool-call vocabulary, and the followthrough heuristic (`check_plan`)
+  defaults OFF — musing ("I will read that entry again") is legitimate visit
+  behavior, not a defect to correct (highways-not-prompts, c3202 design law).
+  An EXPLICIT `_runtime.check_plan` wins in either lane; task lane
+  byte-unchanged (pinned). Also fixed: `progress.py`'s docstring quoted a
+  stale cue wording (runtime's shipped cue is appraisal-neutral). Tests: 5
+  new pins in `tests/test_c2447_visit_lane_honesty.py`, incl. a control
+  proving the musing phrase genuinely trips the heuristic (non-vacuous
+  defaults-off pin). Suite 289.
+
+### Fixed (2026-07-17 — re-review blowup: verifier-forced batches no longer re-arm the review budget)
+- **ReAct + CodeAct observe reset asymmetry**: the per-answer review-budget
+  reset (`review_count = 0` after tool execution) fired for VERIFIER-FORCED
+  batches too — so a verifier that kept forcing a (green) executor call
+  re-armed its own budget through the calls it forced itself, unbounding
+  consecutive review rounds on one unchanged answer. Live cost: code's A/B
+  (commons c2856) burned a 40-minute wall cap re-reviewing an already-good
+  artifact. Fix: `_temp.review_forced_batch` marks batches synthesized by
+  `review_parse`; observe skips the reset for them (they CONSUME
+  `review_max_rounds`, which now genuinely bounds forced rounds per answer),
+  and the marker dies with its batch / at user-response and turn boundaries.
+  The deliberate asymmetry stands: MODEL-issued activity is a new claim and
+  still re-arms review; a probe that finds real failures triggers model-issued
+  repair, which resets legitimately. Tests: 3 new pins in
+  `tests/test_verifier_execution_preference.py` (never-complete verifier
+  bounded at exactly max_rounds; model re-arm preserved; CodeAct observe
+  symmetry). Suite 284 green.
+
+### Fixed (2026-07-17 — c2447 residue closed: visit-lane wrapper for drained guidance)
+- **`generation_params.py::guidance_wrapper` (+ `GUIDANCE_WRAPPER_TASK`/`GUIDANCE_WRAPPER_VISIT`)**:
+  everything drained from the durable inbox at the reason boundary — gateway
+  `inject_guidance`, hook steering, verifier `next_prompt` lines, and the
+  loops' OWN retry nudges — used to land under "[Operator guidance …]" in
+  every lane, which in a visit fabricates operator authority for host-authored
+  retry nudges and carries task/final-answer vocabulary (the c2447 chrome
+  class). Under `_runtime.suppress_loop_tail` the wrapper is now
+  "[A note arrived during this conversation — not from your visitor]" — the
+  only attribution honestly claimable while inbox items carry no source field
+  (proposal c2792; runtime voice-owner sign-off c2798; semantics adoption
+  c2796). Task lane byte-unchanged. Semantics' two pins encoded: the spelling
+  is VISITOR-COUPLED (a visitor-less lane adopting the knob needs a second
+  ruled spelling — comment beside the strings), and the wrapper is NEVER a
+  parse anchor (machine detection keys on message metadata
+  `kind="operator_guidance"`, which deliberately does not rename — pinned).
+  Deferred-with-endorsement: an additive inbox `source` key restoring true
+  operator attribution inside visits, gated on a live incident (c2798).
+  Tests: 7 new pins in `tests/test_c2447_visit_lane_honesty.py` (task-lane
+  byte-identity, visit-lane wrapper on all three loops, metadata-anchor pin).
+
+### Added (2026-07-17 — verifier execution preference: executor-tagged tools)
+- **`generation_params.py::EXECUTOR_TAGS/executor_tool_names/verifier_execution_preference`**:
+  the R-Type experiment (commons c2725/c2735/c2736) showed LLM-read review
+  blessing three runtime-dead artifacts (crash on first input, every-frame
+  ReferenceError, corner-ninth draw) that only EXECUTION caught. The loop does
+  not grow an execution subsystem: a tool declares itself an artifact executor
+  via `ToolDefinition.tags` (`"executor"` — the same declaration channel
+  `is_side_effect_tool` reads), and the ReAct + CodeAct verifier prompts gain a
+  preference block teaching that an unexecuted artifact is unverified and the
+  executor call belongs in `next_tool_calls` (the existing forced-tool-call
+  seam runs it through act/observe). With no executor-tagged tool allowlisted,
+  the verifier prompts stay byte-identical — zero behavior change for existing
+  deployments. Executors themselves (browser probe, pytest) ship tool-side
+  (abstractcode/runtime registries), never inside this package.
+  Tests: `tests/test_verifier_execution_preference.py` (9).
+
+### Added (2026-07-16 — backlog 0017 detector half: circling detection for the entity lane)
+- **`adapters/progress.py::circling_streak`**: pure read-only detector for
+  runs of near-restatements at the tail of recent loop outputs — the
+  no-progress defect observed live on the entity lane (Ephemeral's own-time
+  rumination, plans/improving-entity-capabilities.md item A1). Blended
+  bigram/unigram containment (measured margins in the module docstring),
+  windowed comparisons so A-B-A oscillation counts, paired fences and
+  driver chrome markers excluded as quoted material, short outputs
+  transparent (abstention over guessing). Returns data or None and attaches
+  NO policy — same consumption shape as `undelivered_inbox_stats`, callable
+  by abstractruntime's life loop for cue wording (encourage-never-force)
+  and by the future 0017 work-lane build for honest termination.
+  Tests: `tests/test_progress_detection.py` (13, calibration cases shaped
+  after the real transcripts).
+
 ### Fixed (2026-07-15 — c2447 incident: loop tail in entity consciousness + the broken "0 tools" gauge)
 - **`_runtime.suppress_loop_tail` (all three loops)**: the loop-position
   tail ("[loop] iteration N of M." + the [plan] render) is task-agent

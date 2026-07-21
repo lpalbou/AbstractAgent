@@ -164,21 +164,10 @@ def test_truncation_always_marked_even_at_tiny_bounds() -> None:
     assert 'suffix = ""' not in src, "an unmarked-truncation branch is back"
 
 
-def test_repeat_guard_scans_past_skipped_cycles() -> None:
-    """0029 #7: a skipped cycle records tool_calls but no observations — the
-    NEXT identical batch used to compare against IT (no observations -> guard
-    disengaged) and the protection alternated skip/execute/skip. The skip now
-    stamps `repeat_skipped` and the scan passes over marked cycles."""
-    from abstractagent.adapters.react_runtime import create_react_workflow
-    from abstractagent.logic.react import ReActLogic
-
-    write_tool = ToolDefinition(name="write_file", description="w", parameters={})
-    steps: list = []
-    wf = create_react_workflow(logic=ReActLogic(tools=[write_tool]), on_step=lambda s, d: steps.append((s, d)))
-
+def _repeat_guard_scenario_vars() -> Dict[str, Any]:
     executed = {"role": "assistant", "content": "wrote it"}
     tool_call = {"name": "write_file", "arguments": {"path": "a.txt", "content": "x"}, "call_id": "c1"}
-    vars: Dict[str, Any] = {
+    return {
         "context": {"task": "t", "messages": [{"role": "user", "content": "t"}, executed]},
         "scratchpad": {
             "iteration": 3,
@@ -196,6 +185,44 @@ def test_repeat_guard_scans_past_skipped_cycles() -> None:
         "_temp": {"llm_response": {"content": "", "tool_calls": [dict(tool_call)]}},
         "_limits": {"max_iterations": 10, "current_iteration": 3},
     }
+
+
+def test_third_identical_proposal_now_concludes_via_stuck_streak() -> None:
+    """COMPOSITION UPDATE (0017 work half, 2026-07-21): this scenario — an
+    executed batch, a guard-skipped identical proposal (nudge delivered), and
+    a THIRD identical proposal — is now decisively terminated by the
+    stuck-streak layer (proposals count; the model ignored the nudge). The
+    old endless skip/nudge alternation was the 0017 defect in side-effect
+    clothing."""
+    from abstractagent.adapters.react_runtime import create_react_workflow
+    from abstractagent.logic.react import ReActLogic
+
+    write_tool = ToolDefinition(name="write_file", description="w", parameters={})
+    steps: list = []
+    wf = create_react_workflow(logic=ReActLogic(tools=[write_tool]), on_step=lambda s, d: steps.append((s, d)))
+    run = _run(_repeat_guard_scenario_vars(), node="parse")
+    plan = wf.get_node("parse")(run, _Ctx())
+    assert plan.next_node == "max_iterations"
+    assert [s for s, _ in steps if s == "stuck_streak"], "streak verdict must be loud"
+
+
+def test_repeat_guard_scans_past_skipped_cycles() -> None:
+    """0029 #7 (property preserved under the 0017 layer): a skipped cycle
+    records tool_calls but no observations — the NEXT identical batch used to
+    compare against IT (no observations -> guard disengaged) and the
+    protection alternated skip/execute/skip. The skip stamps `repeat_skipped`
+    and the scan passes over marked cycles. Driven with the streak DISABLED
+    so the original guard behavior stays independently pinned (configs with
+    stuck_streak_threshold=0 or >3 still rely on it)."""
+    from abstractagent.adapters.react_runtime import create_react_workflow
+    from abstractagent.logic.react import ReActLogic
+
+    write_tool = ToolDefinition(name="write_file", description="w", parameters={})
+    steps: list = []
+    wf = create_react_workflow(logic=ReActLogic(tools=[write_tool]), on_step=lambda s, d: steps.append((s, d)))
+
+    vars = _repeat_guard_scenario_vars()
+    vars["_runtime"]["stuck_streak_threshold"] = 0
     run = _run(vars, node="parse")
     plan = wf.get_node("parse")(run, _Ctx())
     # The guard must still engage (scan past the skipped cycle to cycle 1).
