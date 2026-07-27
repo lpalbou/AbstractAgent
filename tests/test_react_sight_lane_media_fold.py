@@ -125,6 +125,13 @@ def _capture_call(call_id: str = "call_1") -> Dict[str, Any]:
 # End-to-end fold behavior.
 # ---------------------------------------------------------------------------
 
+def _stamped(ref: Dict[str, Any]) -> Dict[str, Any]:
+    """Tool-captured dict refs carry the provenance stamp (adversary P1-1)."""
+    out = dict(ref)
+    out.setdefault("origin", "tool_capture")
+    return out
+
+
 def test_tool_result_media_rides_next_reason_call_one_shot() -> None:
     refs = [{"$artifact": "art-photo-1", "filename": "preview.jpg"}]
     llm_script = [
@@ -143,7 +150,7 @@ def test_tool_result_media_rides_next_reason_call_one_shot() -> None:
 
     assert len(payloads) == 3
     assert "media" not in payloads[0]
-    assert payloads[1].get("media") == refs
+    assert payloads[1].get("media") == [_stamped(r) for r in refs]
     # One-shot: the call AFTER consumption carries no media again.
     assert "media" not in payloads[2]
 
@@ -173,7 +180,7 @@ def test_context_attachments_persist_while_captures_are_one_shot_and_deduped() -
     # Call 1: context attachment only.
     assert payloads[0].get("media") == [staged]
     # Call 2: staged copy wins the dedup (context first), new capture appended.
-    assert payloads[1].get("media") == [staged, captured_new]
+    assert payloads[1].get("media") == [staged, _stamped(captured_new)]
     # Call 3: capture consumed; context attachment still rides.
     assert payloads[2].get("media") == [staged]
 
@@ -236,7 +243,10 @@ def test_multi_batch_accumulation_across_observe_passes() -> None:
         "call_b": {"success": True, "output": {"media": [{"$artifact": "shot-b"}]}},
     }
     payloads, _state = _run_scripted_loop(llm_script, tool_outputs)
-    assert payloads[1].get("media") == [{"$artifact": "shot-a"}, {"$artifact": "shot-b"}]
+    assert payloads[1].get("media") == [
+        _stamped({"$artifact": "shot-a"}),
+        _stamped({"$artifact": "shot-b"}),
+    ]
 
 
 def test_conclude_call_consumes_pending_media_at_budget_wall() -> None:
@@ -254,7 +264,7 @@ def test_conclude_call_consumes_pending_media_at_budget_wall() -> None:
         vars_extra={"_limits": {"max_iterations": 1}},
     )
     assert len(payloads) == 2
-    assert payloads[1].get("media") == refs
+    assert payloads[1].get("media") == [_stamped(r) for r in refs]
 
 
 def test_reset_react_turn_clears_pending_media() -> None:
@@ -273,12 +283,49 @@ def test_reset_react_turn_clears_pending_media() -> None:
 
 def test_extract_media_from_tool_result_contract() -> None:
     ok = {"success": True, "output": {"media": ["/tmp/a.jpg", {"$artifact": "x"}, {"junk": 1}, "", 42]}}
-    assert extract_media_from_tool_result(ok) == ["/tmp/a.jpg", {"$artifact": "x"}]
+    # Dict refs get the provenance stamp; strings (bare paths) ride unstamped.
+    assert extract_media_from_tool_result(ok) == ["/tmp/a.jpg", {"$artifact": "x", "origin": "tool_capture"}]
     assert extract_media_from_tool_result({"success": False, "output": {"media": ["/tmp/a.jpg"]}}) is None
     assert extract_media_from_tool_result({"success": True, "output": "prose /tmp/a.jpg"}) is None
     assert extract_media_from_tool_result({"success": True, "output": {}}) is None
     assert extract_media_from_tool_result({"success": True, "output": {"media": []}}) is None
     assert extract_media_from_tool_result("not-a-dict") is None  # type: ignore[arg-type]
+    # A producer-authored origin is never overwritten.
+    pre = {"success": True, "output": {"media": [{"$artifact": "y", "origin": "custom"}]}}
+    assert extract_media_from_tool_result(pre) == [{"$artifact": "y", "origin": "custom"}]
+
+
+def test_parse_retry_restores_last_call_media() -> None:
+    """Adversary P1-2: a malformed-output retry must see the SAME image the
+    model is being asked to rewrite its words about — one-shot is per
+    successfully parsed answer, never per HTTP call."""
+    refs = [{"$artifact": "art-retry"}]
+    llm_script = [
+        _capture_call("call_1"),
+        {"content": "", "tool_calls": []},  # empty reply -> parse_retry_empty -> reason again
+        {"content": "The scene shows a desk.", "tool_calls": []},
+    ]
+    tool_outputs = {"call_1": {"success": True, "output": {"media": refs}}}
+    payloads, _state = _run_scripted_loop(llm_script, tool_outputs)
+
+    assert len(payloads) == 3
+    expected = [_stamped(r) for r in refs]
+    # First consumption AND the retry both carry the refs.
+    assert payloads[1].get("media") == expected
+    assert payloads[2].get("media") == expected
+
+
+def test_accumulate_media_recapture_takes_newest_slot() -> None:
+    """Adversary P2-1: a re-captured item must survive the head-trimming cap —
+    accumulation is newest-position-wins, unlike the payload merge."""
+    from abstractagent.adapters.media import accumulate_media
+
+    existing = [f"/tmp/{c}.jpg" for c in "abcdef"]  # full pending set (6)
+    new = ["/tmp/a.jpg", "/tmp/g.jpg"]  # re-capture a + fresh g
+    merged = accumulate_media(existing, new)
+    # a moved to the tail; the cap (applied by the caller) trims stale heads.
+    assert merged == ["/tmp/b.jpg", "/tmp/c.jpg", "/tmp/d.jpg", "/tmp/e.jpg", "/tmp/f.jpg", "/tmp/a.jpg", "/tmp/g.jpg"]
+    assert merged[-6:] == ["/tmp/c.jpg", "/tmp/d.jpg", "/tmp/e.jpg", "/tmp/f.jpg", "/tmp/a.jpg", "/tmp/g.jpg"]
 
 
 def test_normalize_media_items_shapes() -> None:
@@ -289,6 +336,36 @@ def test_normalize_media_items_shapes() -> None:
     assert normalize_media_items([]) is None
     assert normalize_media_items("not-a-list") is None
     assert normalize_media_items(("/t.png",)) == ["/t.png"]
+
+
+def test_origin_absence_is_load_bearing() -> None:
+    """Semantics pins 1+2 (c4136): the origin vocabulary is a CLOSED SET
+    declared at the stamping surface, and ABSENCE means host-staged-and-loud
+    — enforceable here as: every dict ref leaving the tool-result extractor
+    carries an origin from the set, and the context (host-staged) extractor
+    never stamps. A buggy tool cannot reach degrade by omitting the stamp."""
+    from abstractagent.adapters.media import (
+        MEDIA_ORIGIN_TOOL_CAPTURE,
+        MEDIA_ORIGIN_VALUES,
+        extract_media_from_context,
+    )
+
+    assert MEDIA_ORIGIN_TOOL_CAPTURE in MEDIA_ORIGIN_VALUES
+
+    # Every dict ref from a tool result is stamped with a declared value.
+    out = extract_media_from_tool_result(
+        {"success": True, "output": {"media": [{"$artifact": "x"}, {"artifact_id": "y"}, "/tmp/p.jpg"]}}
+    )
+    assert out is not None
+    for item in out:
+        if isinstance(item, dict):
+            assert item.get("origin") in MEDIA_ORIGIN_VALUES
+
+    # Host-staged context attachments NEVER gain an origin here (absence =
+    # host-staged is only true if this lane never stamps them).
+    staged = extract_media_from_context({"attachments": [{"$artifact": "att", "filename": "f.pdf"}]})
+    assert staged == [{"$artifact": "att", "filename": "f.pdf"}]
+    assert all("origin" not in item for item in staged if isinstance(item, dict))
 
 
 def test_media_item_key_and_merge_dedup_order() -> None:

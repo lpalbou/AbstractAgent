@@ -10,7 +10,6 @@ Use:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
 
@@ -19,8 +18,12 @@ def main(argv: list[str] | None = None) -> int:
         prog="react-agent",
         description="Deprecated: the interactive REPL moved to AbstractCode.",
     )
-    parser.add_argument("--provider", default=os.getenv("ABSTRACTCODE_PROVIDER", "ollama"))
-    parser.add_argument("--model", default=os.getenv("ABSTRACTCODE_MODEL", "qwen3:4b-instruct-2507-q4_K_M"))
+    # Behavior-env-vars ruling (commons c4157, 2026-07-21): this stub used to
+    # sniff ABSTRACTCODE_PROVIDER/MODEL just to echo them into the printed
+    # suggestion — a cross-package env read for zero behavior. Plain defaults;
+    # the real selection lives in abstractcode's own config.
+    parser.add_argument("--provider", default="<provider>")
+    parser.add_argument("--model", default="<model>")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     print("The AbstractAgent interactive REPL has moved to AbstractCode.\n")

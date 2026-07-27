@@ -33,6 +33,7 @@ from .generation_params import (
     executor_tool_names,
     guidance_wrapper,
     is_side_effect_tool,
+    normalize_thinking,
     prompt_cache_capture,
     resolve_max_iterations,
     runtime_llm_params,
@@ -43,13 +44,14 @@ from .generation_params import (
 )
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .media import (
+    accumulate_media,
     extract_media_from_context,
     extract_media_from_tool_result,
     media_item_key,
     merge_media_lists,
 )
 from .tool_allowlist import note_pruned_grants
-from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
+from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, sanitize_transcript_messages
 from ..logic.react import ReActLogic
 
 
@@ -806,8 +808,10 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
             # Forced-batch marker is per-answer state; a new turn starts clean.
             "review_forced_batch",
             # Sight-lane pending refs are per-turn: a finished turn's unconsumed
-            # captures must not attach to the next visitor's first call.
+            # captures must not attach to the next visitor's first call. The
+            # retry stash is the same lifecycle class.
             "pending_media",
+            "last_call_media",
         ):
             temp.pop(key, None)
 
@@ -1180,7 +1184,14 @@ def create_react_workflow(
         # copy. Crash-replay safe: the pop lands in the same tick/save that
         # issues this LLM_CALL, so a replayed reason recomputes the identical
         # payload and idempotency reuse fires.
+        # One-shot means per SUCCESSFUL PARSE, not per HTTP call (adversary
+        # P1-2): the popped list is stashed so parse's malformed-output retry
+        # branches can restore it — a retry asking the model to rewrite what
+        # it said about an image must not run image-blind. parse_node clears
+        # the stash on every non-retry branch.
         pending_media = temp.pop("pending_media", None)
+        if isinstance(pending_media, list) and pending_media:
+            temp["last_call_media"] = pending_media
         media = merge_media_lists(
             extract_media_from_context(context),
             pending_media if isinstance(pending_media, list) else None,
@@ -1284,6 +1295,16 @@ def create_react_workflow(
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
         response = temp.get("llm_response", {})
 
+        # Sight-lane retry restore (adversary P1-2): the reason call that just
+        # returned may have carried one-shot captured media. Popped here into a
+        # local — the malformed-output retry branches below re-arm it as
+        # pending (the retry call must see the same image the model is being
+        # asked to rewrite its words about); every other branch drops it (the
+        # parse succeeded, consumption is complete).
+        last_call_media = temp.pop("last_call_media", None)
+        if not (isinstance(last_call_media, list) and last_call_media):
+            last_call_media = None
+
         # Accumulate entity-runtime result-boundary captures across the turn's
         # iterations (G1 write direction, runtime b8b8c78): `diary_entries` (word-free
         # metadata) and `act_only_warnings` ride EACH LLM result and would be lost when
@@ -1311,15 +1332,9 @@ def create_react_workflow(
         max_iterations = resolve_max_iterations(limits, scratchpad)
         if max_iterations < 1:
             max_iterations = 1
-        reasoning_text = ""
-        try:
-            if isinstance(response, dict):
-                rc = response.get("reasoning")
-                if rc is None:
-                    rc = response.get("reasoning_content")
-                reasoning_text = str(rc or "")
-        except Exception:
-            reasoning_text = ""
+        # Shared reader (reasoning-first-citizen plan): one implementation
+        # across the three loops, byte-identical behavior here.
+        reasoning_text = extract_reasoning_text(response)
         parse_payload: Dict[str, Any] = {
             "iteration": cycle_i,
             "max_iterations": max_iterations,
@@ -1513,10 +1528,12 @@ def create_react_workflow(
                     "Your previous response hit an output token limit before producing a complete tool call.\n"
                     "Retry now: emit ONLY the next tool call(s) needed to make progress.\n"
                     "Keep tool call arguments small (avoid large file contents / giant JSON blobs) to prevent tool-call truncation.\n"
-                    "For large files, create a small skeleton first, then refine via multiple smaller edits/tool calls.\n"
+                    "For large files, create a small skeleton first, then refine with multi-hunk edit_file diff calls sized to fit the output budget (fewer hunks per call if a call was cut off).\n"
                     "Do not write a long plan before tool calls.",
                 )
             emit("parse_retry_truncated", {"cycle": cycle_i})
+            if last_call_media:
+                temp["pending_media"] = last_call_media
             return StepPlan(node_id="parse", next_node="reason")
 
         if not isinstance(content, str) or not content.strip():
@@ -1529,6 +1546,8 @@ def create_react_workflow(
             else:
                 _push_inbox(runtime_ns, "Your previous response was empty. Continue the task.")
             emit("parse_retry_empty", {"cycle": cycle_i})
+            if last_call_media:
+                temp["pending_media"] = last_call_media
             return StepPlan(node_id="parse", next_node="reason")
 
         # Followthrough heuristic: retry when the model claims it will take actions but emits no tool calls.
@@ -1550,6 +1569,8 @@ def create_react_workflow(
                 "If you are already done, provide the final answer with NO tool calls.",
             )
             emit("parse_retry_plan_only", {"cycle": cycle_i})
+            if last_call_media:
+                temp["pending_media"] = last_call_media
             return StepPlan(node_id="parse", next_node="reason")
 
         # Final answer candidate. Before stopping, optionally run a verification pass (0217):
@@ -1740,7 +1761,33 @@ def create_react_workflow(
                     # unless explicitly enabled.
                     child_allow = [t for t in allow if t not in {"delegate_agent", "ask_user"}]
                 else:
-                    child_allow = _normalize_allowlist(tools_raw)
+                    # Grant containment (tool-tiers adversary P0, 2026-07-22): the
+                    # explicit `tools` arg is MODEL-CONTROLLED and used to normalize
+                    # against the FULL registry — a parent granted {read_file,
+                    # delegate_agent} could spawn a child holding execute_command.
+                    # A delegated child's exposure is a SUBSET of the parent's,
+                    # always (the substrate-palette self-escalation rule, applied
+                    # to tools). Order follows the child's request; dropped names
+                    # surface in the tool error below when nothing survives.
+                    parent_allow = set(allow)
+                    requested = _normalize_allowlist(tools_raw)
+                    child_allow = [t for t in requested if t in parent_allow]
+                    if requested and not child_allow:
+                        temp["tool_results"] = {
+                            "results": [
+                                {
+                                    "call_id": str(tc.get("call_id") or ""),
+                                    "name": "delegate_agent",
+                                    "success": False,
+                                    "output": None,
+                                    "error": (
+                                        "delegate_agent tools must be a subset of the parent's allowed tools; "
+                                        f"none of {sorted(set(requested))} are granted to this run"
+                                    ),
+                                }
+                            ]
+                        }
+                        return StepPlan(node_id="act", next_node="observe")
 
                 if not delegated_task:
                     temp["tool_results"] = {
@@ -1821,6 +1868,13 @@ def create_react_workflow(
                     "thinking",
                     "max_output_tokens",
                     "tool_prompt_examples",
+                    # Approval policy inherits MONOTONICALLY (tool-tiers adversary
+                    # P0, 2026-07-22): a run-scoped tightening (require_approval
+                    # on fetch_url, tier-derived auto-approve sets) silently
+                    # DROPPED in children — the child fell back to static
+                    # defaults, auto-running what the parent's host forced to
+                    # ask. Same dict, at-most-equal authority.
+                    "tool_policy",
                 ):
                     _v = runtime_ns.get(_k)
                     if _v is not None:
@@ -1881,10 +1935,27 @@ def create_react_workflow(
                         )
                     sub_vars["_runtime"]["provider"] = prof_provider
                     sub_vars["_runtime"]["model"] = prof_model
-                    emit(
-                        "delegate_agent_substrate",
-                        {"substrate": substrate_name, "provider": prof_provider, "model": prof_model},
-                    )
+                    # Reasoning member of the selection triple (reasoning-
+                    # first-citizen plan): a profile may pin the substrate's
+                    # thinking level. Declared-and-valid wins over the
+                    # inherited value; present-but-invalid warns and keeps
+                    # inheritance (deny-safe, never a failed delegation).
+                    substrate_emit = {"substrate": substrate_name, "provider": prof_provider, "model": prof_model}
+                    if isinstance(profile, dict) and profile.get("thinking") is not None:
+                        prof_thinking = normalize_thinking(profile.get("thinking"))
+                        if prof_thinking is not None:
+                            sub_vars["_runtime"]["thinking"] = prof_thinking
+                            substrate_emit["thinking"] = prof_thinking
+                        else:
+                            emit(
+                                "delegate_agent_substrate_skew",
+                                {
+                                    "substrate": substrate_name,
+                                    "ignored_keys": ["thinking"],
+                                    "warning": "#FALLBACK substrate thinking value not recognized; child keeps the inherited value",
+                                },
+                            )
+                    emit("delegate_agent_substrate", substrate_emit)
 
                 payload = {
                     "workflow_id": str(getattr(run, "workflow_id", "") or "react_agent"),
@@ -2077,15 +2148,26 @@ def create_react_workflow(
         # reason/conclude call consumes it one-shot — image tokens ride
         # exactly one model call while the transcript keeps the textual ref
         # (re-look = analyze_media or re-capture, never a silent re-attach).
+        # Accumulation is NEWEST-position-wins (adversary P2-1): a re-captured
+        # item takes the tail, so the head-trimming cap evicts stale refs, not
+        # the ref the model just refreshed.
         if captured_media:
-            merged = merge_media_lists(
-                temp.get("pending_media") if isinstance(temp.get("pending_media"), list) else None,
-                captured_media,
-            ) or []
+            existing = temp.get("pending_media")
+            merged = accumulate_media(existing if isinstance(existing, list) else None, captured_media)
             if len(merged) > _PENDING_MEDIA_MAX:
-                dropped = len(merged) - _PENDING_MEDIA_MAX
+                dropped_items = merged[:-_PENDING_MEDIA_MAX]
                 merged = merged[-_PENDING_MEDIA_MAX:]
-                emit("media_dropped", {"dropped": dropped, "kept": len(merged), "reason": "pending_media_cap"})
+                emit(
+                    "media_dropped",
+                    {
+                        "dropped": len(dropped_items),
+                        "kept": len(merged),
+                        "reason": "pending_media_cap",
+                        # Identity keys so consumers can tell WHICH refs were
+                        # trimmed (adversary P2-4: counts alone can't).
+                        "dropped_keys": [k for k in (media_item_key(i) for i in dropped_items) if k],
+                    },
+                )
             temp["pending_media"] = merged
 
         if last_cycle is not None:
@@ -2526,8 +2608,11 @@ def create_react_workflow(
             # Same sight-lane consumption as reason_node: when the budget wall
             # lands right after a capture batch, reason never runs again — the
             # conclusion is the next (and last) model call, so it gets the
-            # captured refs. One-shot pop, same crash-replay reasoning.
+            # captured refs. One-shot pop + retry stash, same reasoning as
+            # reason/parse (the conclude-retry branch below restores it).
             pending_media = temp.pop("pending_media", None)
+            if isinstance(pending_media, list) and pending_media:
+                temp["last_call_media"] = pending_media
             media = merge_media_lists(
                 extract_media_from_context(context),
                 pending_media if isinstance(pending_media, list) else None,
@@ -2594,6 +2679,11 @@ def create_react_workflow(
         content, tool_calls = logic.parse_response(resp)
         answer = str(content or "").strip()
         temp.pop("max_iterations_llm_response", None)
+        # Sight-lane retry stash (adversary P1-2, conclude twin of parse_node's):
+        # restored below on the one bounded conclude-retry; dropped otherwise.
+        last_call_media = temp.pop("last_call_media", None)
+        if not (isinstance(last_call_media, list) and last_call_media):
+            last_call_media = None
 
         # If the model still emitted tool calls, or if it leaked tool-call markup as plain text,
         # retry once with a stricter instruction.
@@ -2618,6 +2708,8 @@ def create_react_workflow(
                         "Return ONLY the final report and next steps as plain text.\n"
                         "Do NOT include any tool calls or tool-call markup (e.g. <tool_call>...</tool_call>).",
                     )
+                if last_call_media:
+                    temp["pending_media"] = last_call_media
                 return StepPlan(node_id="max_iterations", next_node="max_iterations")
             # Last resort: strip any leaked tool markup so we don't persist it as the final answer.
             answer = _strip_tool_call_markup(answer).strip()

@@ -83,11 +83,13 @@ REACT_STEPS = COMMON_STEPS | frozenset(
         "stuck_streak",
         # Sight lane (c3969 shape A / c4089 ruling, 2026-07-21): a successful
         # tool result DECLARED media refs on its output dict — payload
-        # {tool, count, call_id}; the refs ride the next reason/conclude
-        # call's `media` one-shot.
+        # {tool, count, call_id}. Fires at CAPTURE time; refs that survive
+        # the burst bound ride the next reason/conclude call's `media`
+        # one-shot (trims are announced by media_dropped, so the pair is the
+        # honest record of what actually rode).
         "media_captured",
         # The pending-media burst bound trimmed oldest refs (most-recent
-        # wins) — payload {dropped, kept, reason}; never silent.
+        # wins) — payload {dropped, kept, reason, dropped_keys}; never silent.
         "media_dropped",
         "review",
         "review_request",

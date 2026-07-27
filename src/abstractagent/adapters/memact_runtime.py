@@ -23,7 +23,7 @@ from .generation_params import (
     suppress_loop_tail,
 )
 from .media import extract_media_from_context
-from .transcripts import assistant_tool_calls_payload, sanitize_transcript_messages
+from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, sanitize_transcript_messages
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .tool_allowlist import note_pruned_grants
 from ..logic.memact import MemActLogic
@@ -651,6 +651,10 @@ def create_memact_workflow(
             "has_tool_calls": bool(tool_calls),
             "tool_calls": [{"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls],
             "content_preview": (str(content or "")[:200] if content else "(no content)"),
+            # Reasoning parity (reasoning-first-citizen plan, agent section):
+            # the separated thinking channel was surfaced by ReAct only —
+            # additive on the common core, same shared reader.
+            "reasoning": extract_reasoning_text(response),
         }
         # Additive cache observability (0030 residue, 2026-07-15).
         cache_struct = prompt_cache_capture(response)
@@ -781,7 +785,30 @@ def create_memact_workflow(
                     # unless explicitly enabled.
                     child_allow = [t for t in allow if t not in {"delegate_agent", "ask_user"}]
                 else:
-                    child_allow = _normalize_allowlist(tools_raw)
+                    # Grant containment (tool-tiers adversary P0, 2026-07-22; see
+                    # react_runtime's delegate branch): the model-controlled
+                    # `tools` arg normalized against the FULL registry — a child
+                    # could hold tools the parent was never granted. Child
+                    # exposure is a SUBSET of the parent's, always.
+                    parent_allow = set(allow)
+                    requested = _normalize_allowlist(tools_raw)
+                    child_allow = [t for t in requested if t in parent_allow]
+                    if requested and not child_allow:
+                        temp["tool_results"] = {
+                            "results": [
+                                {
+                                    "call_id": str(tc.get("call_id") or ""),
+                                    "name": "delegate_agent",
+                                    "success": False,
+                                    "output": None,
+                                    "error": (
+                                        "delegate_agent tools must be a subset of the parent's allowed tools; "
+                                        f"none of {sorted(set(requested))} are granted to this run"
+                                    ),
+                                }
+                            ]
+                        }
+                        return StepPlan(node_id="act", next_node="observe")
 
                 if not delegated_task:
                     temp["tool_results"] = {
@@ -859,6 +886,9 @@ def create_memact_workflow(
                     "thinking",
                     "max_output_tokens",
                     "tool_prompt_examples",
+                    # Approval policy inherits monotonically (tool-tiers adversary
+                    # P0, 2026-07-22; see react_runtime's delegate branch).
+                    "tool_policy",
                 ):
                     _v = runtime_ns.get(_k)
                     if _v is not None:
@@ -919,10 +949,26 @@ def create_memact_workflow(
                         )
                     sub_vars["_runtime"]["provider"] = prof_provider
                     sub_vars["_runtime"]["model"] = prof_model
-                    emit(
-                        "delegate_agent_substrate",
-                        {"substrate": substrate_name, "provider": prof_provider, "model": prof_model},
-                    )
+                    # Reasoning member of the selection triple (reasoning-
+                    # first-citizen plan; see react_runtime's delegate branch):
+                    # declared-and-valid wins; present-but-invalid warns and
+                    # keeps the inherited value (deny-safe).
+                    substrate_emit = {"substrate": substrate_name, "provider": prof_provider, "model": prof_model}
+                    if isinstance(profile, dict) and profile.get("thinking") is not None:
+                        prof_thinking = normalize_thinking(profile.get("thinking"))
+                        if prof_thinking is not None:
+                            sub_vars["_runtime"]["thinking"] = prof_thinking
+                            substrate_emit["thinking"] = prof_thinking
+                        else:
+                            emit(
+                                "delegate_agent_substrate_skew",
+                                {
+                                    "substrate": substrate_name,
+                                    "ignored_keys": ["thinking"],
+                                    "warning": "#FALLBACK substrate thinking value not recognized; child keeps the inherited value",
+                                },
+                            )
+                    emit("delegate_agent_substrate", substrate_emit)
 
                 payload = {
                     "workflow_id": str(getattr(run, "workflow_id", "") or "memact_agent"),

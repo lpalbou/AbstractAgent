@@ -36,6 +36,27 @@ from abstractcore.tools import ToolCall
 INTERACTIVE_BUILTIN_NAMES = frozenset({"ask_user"})
 
 
+def extract_reasoning_text(response: Any) -> str:
+    """Return the model's separated reasoning text from an LLM result, or "".
+
+    One shared reader for all three loop adapters (reasoning-first-citizen
+    plan, agent section: reasoning extraction was ReAct-only, which is the
+    drift class backlog 0021 exists for). Providers report the separated
+    thinking channel as `reasoning` (core-normalized) or `reasoning_content`
+    (some OpenAI-compatible servers); absent means the model interleaved or
+    withheld it — "" is honest, never a placeholder.
+    """
+    try:
+        if isinstance(response, dict):
+            rc = response.get("reasoning")
+            if rc is None:
+                rc = response.get("reasoning_content")
+            return str(rc or "")
+    except Exception:
+        pass
+    return ""
+
+
 def assistant_tool_calls_payload(tool_calls: List[ToolCall]) -> list[dict[str, Any]]:
     """OpenAI-shaped `tool_calls` metadata for a durable assistant message."""
     tc_payload: list[dict[str, Any]] = []

@@ -256,7 +256,13 @@ PROMPT_SLOTS: tuple = (
 #: Palette profile keys the delegate branches understand. Anything else in a
 #: granted profile is version skew and must warn loudly (silent half-applied
 #: grants are the fall-open class).
-DELEGATE_SUBSTRATE_KEYS = frozenset({"provider", "model", "description"})
+#: `thinking` joined 2026-07-27 (reasoning-first-citizen plan, agent section):
+#: a substrate profile is an AI-selection surface, so it carries the full
+#: triple — provider, model, and optionally the reasoning effort for that
+#: model. Absent thinking = the child keeps the inherited value (a sub-agent
+#: is not a different mind unless the host says so); present-but-invalid
+#: warns and falls back to inheritance (deny-safe, never a failed delegation).
+DELEGATE_SUBSTRATE_KEYS = frozenset({"provider", "model", "description", "thinking"})
 
 
 def compose_prompt_slots(base: str, runtime_ns: Optional[Dict[str, Any]]) -> str:

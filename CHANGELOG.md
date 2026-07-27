@@ -2,6 +2,109 @@
 
 ## Unreleased (2026-07-12)
 
+### Changed (2026-07-27 — tool-batching prompt rule narrowed, operator ruling)
+- **All three loop prompts**: the blanket "do NOT batch side-effectful tools"
+  rule (measured effect: 79.5% singleton batches, edit_file batched 0/149 —
+  the model serialized everything) is replaced by a target-scoped rule: never
+  batch two calls that touch the SAME target (same-file edits shift each
+  other's line coordinates); calls on different, independent targets may ride
+  one turn (the runtime executes a batch in order). execute_command /
+  execute_python / comms sends / mcp:: tools stay never-batch, by real tool
+  name. A pointer to the compliant one-call multi-hunk diff path sits beside
+  the ban ("One call is not a batch"), and the large-file guidance now
+  prefers one multi-hunk diff call per revision pass. The truncation-retry
+  nudge no longer re-teaches the old serializing behavior mid-run (adversary
+  finding: in-context text beats system-prompt rules). MemAct, which had no
+  side-effect rule at all, gains the same clause. Pins:
+  `tests/test_batching_prompt_rule.py` (7 tests — rule present, blanket text
+  gone, executor bans bound to real names, in all three loops).
+
+### Added (2026-07-27 — reasoning-first-citizen, agent section build)
+- **Parse reasoning parity across all three loops**: CodeAct and MemAct parse
+  step events now carry the `reasoning` field (the model's separated thinking
+  text, `""` when absent) exactly like ReAct. One shared reader,
+  `adapters/transcripts.py::extract_reasoning_text` — ReAct's inline
+  extraction was moved there so the three loops cannot drift.
+- **Delegate substrate palette gains the reasoning member**: a host-granted
+  profile in `_runtime.delegate_substrates` may now carry `thinking` next to
+  `provider`/`model` — a substrate pick is a full model selection, and the
+  selection is a triple. Rules: a valid declared value pins the child (wins
+  over inheritance); absent means the child inherits the parent's effective
+  value; present-but-invalid emits a loud `#FALLBACK` skew warning and keeps
+  inheritance (never a failed delegation). The `delegate_agent_substrate`
+  step event names the applied thinking. All three adapters.
+- **`tests/test_reasoning_first_citizen_agent.py`** (11 pins): shared-reader
+  contract, parse parity in each loop (present + absent), substrate thinking
+  applied / inherited / invalid-warns, and `thinking` recognized as a known
+  palette key (no version-skew warning).
+
+### Added (2026-07-26 — vision-ruling composition pins, commons c5681 claim)
+- **`tests/test_delegate_session_route_composition.py`** (3 pins, fable5
+  adversary folded): delegated sub-agents' `analyze_media` receives the
+  `_session_route` stamp derived from the CHILD run's effective route —
+  inheritance case, substrate-override case (the load-bearing discriminator;
+  also pins the F1 dual: the palette never writes back into the PARENT's
+  route), and depth-2 (grandchild inherits the child's OVERRIDDEN route).
+  Cross-package faithful: drives the real ReAct delegate branch against
+  runtime's real `make_tool_calls_handler` (the stamp site). Zero adapter
+  code change — the composition worked by construction via the existing
+  provider/model inheritance list. Release note: the abstractruntime
+  dependency floor must rise when the stamp ships in a release (a released
+  runtime without the stamp fails these pins loudly, never false-passes).
+
+### Fixed (2026-07-22 — delegate_agent grant containment, tool-tiers adversary P0)
+- **`react_runtime.py`/`codeact_runtime.py`/`memact_runtime.py` delegate branch**:
+  the `delegate_agent` tool's model-controlled `tools` arg was normalized
+  against the FULL registry — a parent granted `{read_file, delegate_agent}`
+  could spawn a child holding `execute_command` (privilege escalation past the
+  parent grant). Now `child_allow ⊆ parent_allow` (intersection); a wholly
+  ungranted request is a tool error (parent decides), never a silent toolless
+  child. Also: `_runtime.tool_policy` now inherits into delegated children —
+  it was dropped, so a parent's run-scoped approval tightening silently
+  reverted to static defaults one level down (and a tier-derived auto-approve
+  set would never reach children). Monotonic inheritance: a sub-agent's powers
+  are a subset of its parent's, always. Pins:
+  `tests/test_react_delegate_agent_tool.py` (+3: subset, all-ungranted-is-error,
+  policy-inheritance). Surfaced by the tool-tiers cycle-1 design adversary.
+
+### Changed (2026-07-21 — behavior-env-vars ruling, commons c4157)
+- **`repl.py` (deprecated `react-agent` stub)**: removed the
+  `ABSTRACTCODE_PROVIDER`/`ABSTRACTCODE_MODEL` env sniff — a cross-package
+  env read used only to echo values into the "use abstractcode" suggestion
+  text. Env inventory receipt (c4163): runtime paths carry ZERO behavior env
+  reads (provider/model/gates ride run vars from the gateway);
+  `ABSTRACTFRAMEWORK_IMPROVEMENTS_PATH` classified deployment (data sink
+  location); test-gate vars out of scope.
+
+### Added (2026-07-21 — sight lane: tool-result media fold, c4089 operator ruling)
+- **`adapters/media.py` + `react_runtime.py` observe/reason/conclude wiring**
+  (agents-that-see lane, commons c3969 shape A): a SUCCESSFUL tool result
+  whose dict output DECLARES a `media` list (bare paths or `{"$artifact": id}`
+  refs — camera capture results are the founding producer; authored-only,
+  never prose-sniffed, never from failures) now folds into the NEXT reason
+  call's `payload.media` (or the max-iterations conclusion call), where the
+  runtime llm_client's existing `$artifact` resolution takes over. The agent
+  finally SEES what it shoots. Semantics: one-shot per successfully PARSED
+  answer (malformed-output parse retries and the bounded conclude-retry
+  restore the same refs — a rewrite is never image-blind; fable5 adversary
+  P1-2), merged after context attachments with artifact-id/path dedup,
+  burst-bounded (6, newest-position-wins so a re-capture survives the trim;
+  adversary P2-1), per-turn (`reset_react_turn` clears pending + stash).
+  Tool-captured dict refs are stamped `origin: "tool_capture"` (provenance
+  for a runtime-side degrade-not-fail resolver — adversary P1-1: a bogus
+  tool-authored ref currently hard-fails the next LLM call at the runtime
+  handler; cross-seat ask filed). New hook events `media_captured`
+  ({tool, count, call_id}) and `media_dropped` ({dropped, kept, reason,
+  dropped_keys}); emit inventory + docs/hooks.md updated (including the
+  overlap note with the runtime's own `_runtime.pending_media` attachment
+  lane and the stuck-streak interaction for identical-args watch loops).
+  CodeAct/MemAct twins deferred to 0021's shared core (recorded, same 0017
+  precedent). Semantics vocabulary pass (c4136) folded: origin values are a
+  CLOSED SET declared at the stamping surface (`MEDIA_ORIGIN_VALUES`), and
+  absence-is-load-bearing (unstamped = host-staged-and-loud) is contract
+  text + pinned by test. Tests: `tests/test_react_sight_lane_media_fold.py`
+  (13). Suite 306.
+
 ### Added (2026-07-21 — backlog 0017 work half: stuck-streak termination)
 - **`react_runtime.py::_repeat_streak_verdict` + parse-boundary wiring**
   (work:abstractagent-0017): read-only repeat loops used to spin uncounted

@@ -93,6 +93,33 @@ section with reasons, never deleted.
   operator's actual law from the team's inferred elaborations — elaborations
   are deletable and should be built cheap.
 
+## Prompt rules are mechanisms (batching wave, 2026-07-27)
+
+- **Blanket prompt bans measurably shape behavior**: "do NOT batch
+  side-effectful tools" produced 79.5% singleton tool turns and edit_file
+  batched 0/149 (code-tui's ledger numbers). Models obey blunt rules
+  faithfully — scope a ban to the actual hazard (same-target batching), not
+  the tool category, and teach the compliant fast path beside the ban ("one
+  multi-hunk diff call is not a batch").
+- **In-context nudges beat system-prompt rules**: the truncation-retry nudge
+  ("refine via multiple smaller edits") re-taught the OLD serializing rule
+  mid-run after the system prompt was fixed — injected transcript text wins
+  over the static rule at the decision moment. When changing any prompt rule,
+  grep the ADAPTERS for nudge/retry copies of the same guidance, not just the
+  logic prompts (the 0021 drift class extended to nudges).
+- **Prompt text needs pins like code does**: the blanket rule was removed
+  with zero test delta — nothing pinned it, so nothing could catch a silent
+  revert either. When a prompt line IS the mechanism (a ruled behavior),
+  pin the load-bearing phrases in all loop copies
+  (tests/test_batching_prompt_rule.py).
+- **Ban lists must name real tools**: CodeAct's first draft said "never batch
+  execute/run_code" — matching NO registered tool name (`execute_python`,
+  `execute_command`), so the ban bound nothing. Adversary-caught; always
+  check ban vocabulary against the actual registry names.
+- **Plain-language ruling (laurent c5798, CRITICAL, standing)**: all hub
+  posts, questions to humans, and code comments in clear concise human
+  language — no invented jargon ("door leg"), no compressed shorthand.
+
 ## Session mechanics (this seat)
 
 - **Session reconstruction**: on respawn, verify the tree (run the suite),

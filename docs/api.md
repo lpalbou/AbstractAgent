@@ -127,9 +127,12 @@ Per-run controls (via `ReactAgent.start(...)`):
 Host-level `_runtime` slots (raw-workflow hosts; see `docs/skills-attachment.md`):
 - `skills_block`: skills attachment slot (composed before `system_prompt_extra`)
 - `system_prompt_extra`: behavioral-directive slot
-- `delegate_substrates`: `{name: {provider, model}}` palette for the
-  `delegate_agent` tool's optional `substrate` argument (unknown names fail as
-  loud tool errors; the palette never propagates to grandchildren)
+- `delegate_substrates`: `{name: {provider, model, description?, thinking?}}`
+  palette for the `delegate_agent` tool's optional `substrate` argument
+  (unknown names fail as loud tool errors; the palette never propagates to
+  grandchildren). A profile may pin the child's reasoning effort via
+  `thinking` (same values as `_runtime.thinking`); absent means the child
+  inherits the parent's value, invalid warns and inherits.
 
 ### `create_codeact_agent(...) -> CodeActAgent`
 

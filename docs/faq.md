@@ -70,7 +70,7 @@ agent.start(task, allowed_tools=unattended_allowlist(my_tools),
 
 ## Can a delegated sub-agent run on a different model?
 
-Only if the HOST grants it: set `_runtime.delegate_substrates = {"name": {"provider": ..., "model": ..., "description": ...}}`
+Only if the HOST grants it: set `_runtime.delegate_substrates = {"name": {"provider": ..., "model": ..., "description": ..., "thinking": ...}}`
 and the model may pass `substrate="name"` to `delegate_agent` (granted names +
 descriptions are rendered into the system prompt so the model can see what it
 may ask for). Unknown names fail as loud tool errors; raw provider/model strings

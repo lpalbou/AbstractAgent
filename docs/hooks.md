@@ -139,8 +139,12 @@ Parse payload common core (0028 contract wave, 2026-07-14): every adapter's
 `parse` payload guarantees `has_tool_calls` (bool), `tool_calls`
 (list of `{name, arguments, call_id}`), and `content_preview` (≤200 chars;
 the string `"(no content)"` when the reply was empty — a sentinel, not
-model text); loop-specific extras (ReAct's full `content`/`reasoning`/
-`iteration`) are additive on top — consumers key on the core. CodeAct
+model text). Since 2026-07-27 every adapter also carries `reasoning`: the
+model's separated thinking text when the provider reported one
+(`response.reasoning` / `reasoning_content`), `""` when absent — one shared
+reader across the three loops. Loop-specific extras (ReAct's full
+`content`/`iteration`) remain additive on top — consumers key on the core.
+CodeAct
 asymmetry: an action can follow `has_tool_calls: false` — a fenced code
 block routes to execution. CodeAct's parse payload carries the additive
 `has_code` (bool) for exactly this; a consumer pre-rendering approval or
@@ -163,11 +167,27 @@ results are the founding producer), ReAct's observe emits `media_captured`
 (`{tool, count, call_id}`) and folds the refs into the NEXT reason call's
 `payload.media` (or the max-iterations conclusion call when the budget wall
 lands first), merged after context attachments and deduped by artifact
-id/path. Consumption is ONE-SHOT — image tokens ride exactly one model call;
-the durable transcript keeps the tool's textual ref. The pending set is
-burst-bounded (6, most-recent wins); trims emit `media_dropped`
-(`{dropped, kept, reason}`), never silent. Pending refs are per-turn state:
-`reset_react_turn` clears them at composition boundaries.
+id/path. Consumption is ONE-SHOT per successfully parsed answer — image
+tokens ride one model call, and the malformed-output retry paths
+(`parse_retry_truncated`/`_empty`/`_plan_only`, plus the bounded
+conclude-retry) restore the same refs so a rewrite is never image-blind; the
+durable transcript keeps the tool's textual ref. Dict refs captured from
+tools are stamped `origin: "tool_capture"` (provenance for degrade-not-fail
+resolution — a tool-authored bogus ref should not kill the run the way a
+missing host-staged attachment legitimately does; the runtime resolver half
+is a filed cross-seat ask). The pending set is burst-bounded (6, most-recent
+wins — a re-captured ref takes the newest slot); trims emit `media_dropped`
+(`{dropped, kept, reason, dropped_keys}`), never silent. Pending refs and the
+retry stash are per-turn state: `reset_react_turn` clears them at composition
+boundaries. Related but distinct: the runtime's OWN attachment lane
+(`_runtime.pending_media`, fed by `open_attachment`/`read_file` media
+recovery in abstractruntime's effect handlers) merges at the LLM_CALL
+handler below this layer — the two lanes dedup by the same artifact-id key
+on the wire today; convergence is tracked with backlog 0021. Known
+interaction: a framing loop of byte-identical capture batches (same tool,
+same args, three consecutive) trips the 0017 stuck-streak guard like any
+other repeated batch — interleaved distinct work never counts, and hosts
+running deliberate watch loops own `_runtime.stuck_streak_threshold`.
 
 Budget exhaustion emits exactly ONCE per turn (0028 multi-emit fix): ReAct's
 conclusion node announces `max_iterations_reached` at first entry (before the
