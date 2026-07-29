@@ -159,6 +159,7 @@ def create_codeact_workflow(
     logic: CodeActLogic,
     on_step: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     hooks: Optional[LoopHooks] = None,
+    workflow_id: str = "codeact_agent",
 ) -> WorkflowSpec:
     if hooks is not None and not hooks.agent:
         hooks.agent = "codeact_agent"
@@ -1704,7 +1705,7 @@ def create_codeact_workflow(
         )
 
     return WorkflowSpec(
-        workflow_id="codeact_agent",
+        workflow_id=workflow_id,
         entry_node="init",
         nodes={
             node_id: _with_run_context(node_fn)

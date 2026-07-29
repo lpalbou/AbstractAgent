@@ -1,6 +1,12 @@
 """AbstractAgent - Agent implementations using AbstractRuntime and AbstractCore."""
 
 from .adapters.loop_hooks import DEFAULT_EVENT_MAP, HookEvent, LoopHooks
+from .adapters.native_loop_registry import (
+    audit_native_loop_manifest,
+    build_native_loop_manifest,
+    materialize_native_loop_spec,
+    pack_native_loop_bundle,
+)
 from .agents import (
     BaseAgent,
     ReactAgent,
@@ -31,6 +37,10 @@ __all__ = [
     "DEFAULT_EVENT_MAP",
     "HookEvent",
     "LoopHooks",
+    "audit_native_loop_manifest",
+    "materialize_native_loop_spec",
+    "build_native_loop_manifest",
+    "pack_native_loop_bundle",
     # ReAct agent
     "ReactAgent",
     "create_react_workflow",

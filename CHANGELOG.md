@@ -2,6 +2,26 @@
 
 ## Unreleased (2026-07-12)
 
+### Added (2026-07-28 — native-loop registry for gateway catalog)
+- **`adapters/native_loop_registry.py`**: manifest audit
+  (`audit_native_loop_manifest`), materialize/pack helpers for manifest-only
+  gateway `.flow` bundles (`react` / `codeact` / `memact` factories).
+- **Top-level exports** for gateway loader imports:
+  `audit_native_loop_manifest`, `materialize_native_loop_spec`,
+  `build_native_loop_manifest`, `pack_native_loop_bundle`.
+- **Operator scripts**: `scripts/build_native_loop_bundle.py` (pack),
+  `scripts/verify_native_loop_gateway_import.py` (dev-tree import smoke).
+- **`docs/api.md`**: gateway loader contract, pack/reload operator path,
+  verify script.
+- **Tests**: `tests/test_native_loop_registry.py` (**16/16**).
+
+### Fixed (2026-07-28 — native-loop default toolset inherit)
+- **`materialize_native_loop_spec`**: when manifest `metadata.allowed_tools`
+  is unset, react/memact/codeact native loops now materialize with the host
+  default tool definitions (mirrors in-process agent factories and code seat
+  `full-auto-write-tools`). Empty `ReActLogic(tools=[])` no longer yields
+  zero tool calls on gateway-hosted `react-agent` bundles.
+
 ### Changed (2026-07-27 — tool-batching prompt rule narrowed, operator ruling)
 - **All three loop prompts**: the blanket "do NOT batch side-effectful tools"
   rule (measured effect: 79.5% singleton batches, edit_file batched 0/149 —

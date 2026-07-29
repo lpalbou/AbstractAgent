@@ -214,3 +214,112 @@ Source of truth:
 - ReAct: `src/abstractagent/adapters/react_runtime.py` (`done_node`, `max_iterations_node`)
 - CodeAct: `src/abstractagent/adapters/codeact_runtime.py` (`done_node`, `max_iterations_node`)
 - MemAct: `src/abstractagent/adapters/memact_runtime.py` (`done_node`, `max_iterations_node`)
+
+## Native-loop bundles (gateway catalog)
+
+Manifest-only workflow bundles declare a native loop factory instead of
+embedded VisualFlow JSON. Gateway loads them via
+`abstractagent.adapters.materialize_native_loop_spec` and registers the
+returned `WorkflowSpec`.
+
+### Pack audit
+
+```python
+from abstractagent.adapters.native_loop_registry import (
+    audit_native_loop_manifest,
+    materialize_native_loop_spec,
+)
+
+audit_native_loop_manifest(
+    metadata=manifest["metadata"],
+    interfaces=manifest["interfaces"],
+    flows=manifest.get("flows") or [],
+)
+spec = materialize_native_loop_spec(
+    metadata["native_loop_factory"],
+    bundle_ref="react-agent@0.1.0",
+    entrypoint="react",
+    metadata=manifest["metadata"],
+)
+```
+
+Audit rules:
+- `interfaces` must include `abstractcode.agent.v1`
+- `metadata` keys must be in the allowed set (`loop_family`,
+  `native_loop_factory`, `max_iterations_default`, `headless_policy`,
+  `allowed_tools`)
+- shipped `flows` must not contain `wait_until` poller nodes (status-poller
+  subflows defeat native termination)
+
+Supported factories: `react`, `codeact`, `memact`.
+
+### Thin-client discovery contract
+
+After gateway restart/reload, `GET /api/gateway/bundles` exposes
+`metadata.native_loop_factory` and `interfaces` on each bundle item.
+
+Thin clients (e.g. abstractcode-tui) starting a native-loop run must:
+
+1. Select the bundle entrypoint whose `loop_family` matches the desired
+   agent loop (`react`, `codeact`, `memact`).
+2. Treat the **root run** as the answer source — not a
+   `visual_react_agent_*` child subrun. Native loops terminate at flow end
+   with no status-poller subflow.
+3. Pass the user prompt directly in `input_data` — native entrypoints have
+   no VisualFlow input schema (`input_schema` 404 is expected until a stub
+   lands; not blocking headless benches).
+
+Workflow id for materialized specs:
+`{bundle_ref}:{entrypoint}` (e.g. `react-agent@0.1.0:react`).
+
+### Operator pack and gateway reload
+
+Pack manifest-only `.flow` bundles from this repo (gateway serves them; no
+VisualFlow JSON inside):
+
+```bash
+cd abstractagent
+python scripts/build_native_loop_bundle.py \
+  --output-dir /tmp/native-loop-bundles \
+  --version 0.1.0 \
+  --bundle-id react-agent react \
+  --bundle-id codeact-agent codeact \
+  --bundle-id memact-agent memact
+```
+
+Each file is `{bundle_id}@{version}.flow` containing only `manifest.json`.
+Omit repeated `--bundle-id` flags to pack the script defaults
+(`codeact-agent`, `memact-agent`).
+
+Upload to a running gateway and reload the catalog (replace host/port/token):
+
+```bash
+for f in /tmp/native-loop-bundles/*.flow; do
+  curl -sS -X POST "http://127.0.0.1:8080/api/gateway/bundles/upload?reload=true" \
+    -H "Authorization: Bearer $ABSTRACTGATEWAY_AUTH_TOKEN" \
+    -F "file=@${f}"
+done
+```
+
+Verify discovery after reload:
+
+```bash
+curl -sS "http://127.0.0.1:8080/api/gateway/bundles" \
+  -H "Authorization: Bearer $ABSTRACTGATEWAY_AUTH_TOKEN" \
+  | jq '.[] | select(.metadata.native_loop_factory) | {bundle_id, entrypoints, native_loop_factory: .metadata.native_loop_factory}'
+```
+
+Requirements:
+- The gateway process must import `abstractagent` (editable install in the
+  gateway venv is the usual dev setup). Loader calls
+  `abstractagent.materialize_native_loop_spec` at catalog load time.
+- Dev-tree smoke before upload:
+
+```bash
+python scripts/verify_native_loop_gateway_import.py
+```
+
+- If a bundle was already registered under the same version, tombstone the old
+  catalog version or bump `--version` before re-upload.
+- A full gateway restart also picks up bundles on disk; `reload=true` avoids
+  bouncing a shared `:8080` stack when only the catalog changed.
