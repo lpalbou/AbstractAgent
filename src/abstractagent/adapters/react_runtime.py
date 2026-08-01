@@ -51,7 +51,12 @@ from .media import (
     merge_media_lists,
 )
 from .tool_allowlist import note_pruned_grants
-from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, sanitize_transcript_messages
+from .transcripts import (
+    assistant_tool_calls_payload,
+    elide_oversized_content,
+    extract_reasoning_text,
+    sanitize_transcript_messages,
+)
 from ..logic.react import ReActLogic
 
 
@@ -1026,11 +1031,48 @@ def create_react_workflow(
                 out.append(d)
         return out
 
-    def _sanitize_llm_messages(messages: Any) -> List[Dict[str, Any]]:
+    def _sanitize_llm_messages(
+        messages: Any, *, limits: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         # Shared extraction (0011): the proven ReAct pipeline lives in
-        # adapters/transcripts.py and serves all three loops. ReAct passes no
-        # truncate hook (it never bounded messages at this boundary).
-        return sanitize_transcript_messages(messages)
+        # adapters/transcripts.py and serves all three loops. ReAct
+        # historically passed no truncate hook ("full context" policy —
+        # init_node still seeds -1 for plain task runs). The 2026-08-01
+        # ephemeral incident ended the UNCONDITIONAL form of that policy: a
+        # 494,932-char role="tool" message (a 5MB PNG read as text) rested in
+        # a visit's durable transcript and this unbounded seam replayed it
+        # into every later call until the upstream refused the request over
+        # the model's context window — one bad turn poisoned every future
+        # turn. ReAct now honors the SAME `_limits` knobs CodeAct/MemAct
+        # document (max_message_chars / max_tool_message_chars; <= 0 = no
+        # per-loop bound). Hosts that compose these nodes seed real values —
+        # the entity visit lane seeds tool-result-first caps at BRIDGE
+        # (abstractruntime visit_workflow, derived from the abstractmemory
+        # seam arithmetic) — and the always-on monster guard inside
+        # sanitize_transcript_messages floors every lane regardless, which is
+        # what makes an ALREADY-poisoned stored session recover on replay.
+        def _limit_int(key: str, default: int) -> int:
+            if not isinstance(limits, dict):
+                return default
+            raw = limits.get(key, default)
+            if isinstance(raw, bool):
+                return default
+            try:
+                return int(raw)
+            except Exception:
+                return default
+
+        max_message_chars = _limit_int("max_message_chars", -1)
+        max_tool_message_chars = _limit_int("max_tool_message_chars", -1)
+        if max_message_chars <= 0 and max_tool_message_chars <= 0:
+            return sanitize_transcript_messages(messages)
+
+        def _bound(text: str, role: str) -> str:
+            limit = max_tool_message_chars if role == "tool" else max_message_chars
+            label = "oversized tool result" if role == "tool" else f"oversized {role} message"
+            return elide_oversized_content(text, cap=limit, label=label)
+
+        return sanitize_transcript_messages(messages, truncate=_bound)
 
     builtin_effect_tools = {
         "ask_user",
@@ -1169,7 +1211,7 @@ def create_react_workflow(
 
 
         payload: Dict[str, Any] = {"prompt": ""}
-        sanitized_messages = _sanitize_llm_messages(messages_view)
+        sanitized_messages = _sanitize_llm_messages(messages_view, limits=limits)
         if sanitized_messages:
             payload["messages"] = sanitized_messages
         else:
@@ -2597,7 +2639,7 @@ def create_react_workflow(
             )
 
             payload: Dict[str, Any] = {"prompt": ""}
-            sanitized_messages = _sanitize_llm_messages(messages_view)
+            sanitized_messages = _sanitize_llm_messages(messages_view, limits=limits)
             if sanitized_messages:
                 payload["messages"] = sanitized_messages
             else:

@@ -16,6 +16,8 @@ prompt-prefix pins are the regression harness for the extraction.
 Pipeline (payload boundary ONLY — durable history is never mutated):
 1. field filtering (drop runtime metadata providers reject),
 2. optional marked truncation (ADR-0026: any lossy bound keeps a marker),
+   plus the always-on oversized-message floor (the 2026-08-01 monster
+   guard — see OVERSIZED_MESSAGE_CLAMP_CHARS),
 3. assistant `tool_calls` sanitization (function entries, stable synthetic ids),
 4. orphan repair BOTH directions (unanswered tool_calls ids get deterministic
    synthetic tool results; unpaired tool messages fold into inert user notes),
@@ -34,6 +36,48 @@ from abstractcore.tools import ToolCall
 # unanswered is a genuinely lost result and must SAY so (a repair that papers over
 # real loss with a false claim actively misleads the model).
 INTERACTIVE_BUILTIN_NAMES = frozenset({"ask_user"})
+
+# THE MONSTER GUARD (operator incident 2026-08-01, entity "ephemeral",
+# driver-lane visit: a 5MB screenshot read as text poisoned the session —
+# a 494,932-char `role:"tool"` message rested in the durable transcript and
+# rode EVERY subsequent packing pass, until a 48-message, 722,453-char
+# request was refused upstream over the model's context window; the session
+# was wedged permanently because the transcript is durable and replayed
+# whole). This function is the ONE payload seam every loop passes (ReAct,
+# CodeAct, MemAct — and entity visits, which are ReAct composed under
+# runtime's visit graph), so a floor HERE is what lets an already-poisoned
+# STORED session recover on its next packing pass: durable history is never
+# mutated, but no single replayed message may enter a payload unbounded.
+#
+# Cap provenance: 200,000 chars is the stack's largest sanctioned budget
+# for an ENTIRE replayed session history (abstractgateway bundle_host
+# session seeding: 24k chars default, `min(200000, …)` hard ceiling). A
+# single message larger than the largest whole-history budget in the stack
+# is structurally a monster in every lane, never legitimate content. Loop
+# hooks (CodeAct/MemAct `_limits` bounds, ReAct's `_limits`-driven hook,
+# the entity visit lane's BRIDGE-seeded caps) bound FIRST and tighter;
+# this guard is only the floor under all of them. ADR-0026: the cut is
+# marked in-text and the full content stays durable (run vars + ledger).
+OVERSIZED_MESSAGE_CLAMP_CHARS = 200_000
+
+
+def elide_oversized_content(text: str, *, cap: int, label: str) -> str:
+    """Head + labeled stub for content too large to re-send whole.
+
+    Deterministic (byte-stable across packing passes — the prompt-prefix
+    cache property survives because the same stored message always clamps
+    to the same bytes) and never silent (ADR-0026). `cap <= 0` = no bound.
+    """
+    s = str(text or "")
+    if cap <= 0 or len(s) <= cap:
+        return s
+    head = s[:cap]
+    #[WARNING:TRUNCATION] payload-boundary clamp; durable history keeps the full text
+    return (
+        head
+        + f"\n… [{len(s) - len(head):,} chars elided: {label} - clamped at the LLM "
+        "payload boundary; the full text remains in the durable record]"
+    )
 
 
 def extract_reasoning_text(response: Any) -> str:
@@ -141,6 +185,16 @@ def sanitize_transcript_messages(
 
         if truncate is not None:
             content_str = truncate(content_str, role)
+        # Structural floor under every lane and hook (see the monster-guard
+        # note on OVERSIZED_MESSAGE_CLAMP_CHARS): tool results are the aimed-
+        # at class (the 2026-08-01 poison was a tool message), but a monster
+        # is a monster whatever role smuggles it — the same guard applies to
+        # all, at a bound no honest message of ANY role reaches.
+        content_str = elide_oversized_content(
+            content_str,
+            cap=OVERSIZED_MESSAGE_CLAMP_CHARS,
+            label=("oversized tool result" if role == "tool" else f"oversized {role} message"),
+        )
 
         entry: Dict[str, Any] = {"role": role, "content": content_str}
         if role == "tool":
