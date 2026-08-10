@@ -55,6 +55,7 @@ from .transcripts import (
     assistant_tool_calls_payload,
     elide_oversized_content,
     extract_reasoning_text,
+    parse_content_preview,
     sanitize_transcript_messages,
 )
 from ..logic.react import ReActLogic
@@ -440,6 +441,84 @@ def _strip_tool_call_markup(text: str) -> str:
 # wrapper). Tool results render as plain served content — one path, no frames.
 
 
+_TRUNCATION_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
+
+
+def _zero_usage_with_speech(response: Any) -> bool:
+    """True when the completion reports ZERO tokens yet carries text.
+
+    The abort marker (operator 2026-08-02, LM Studio + qwen3.6-35b-a3b): a
+    generation cut mid-tool-call returns HTTP 200 with the tool-call PREFACE as
+    `content`, `tool_calls: []`, `finish_reason: "stop"` and
+    `usage: {prompt_tokens: 0, completion_tokens: 0, total_tokens: 0}`. The
+    dropped tool call is reported only in the provider's own server log
+    ("Failed to generate a tool call … omitted from the response"); the wire
+    body carries no error field at all.
+
+    A completion that produced text cannot have consumed zero prompt tokens and
+    produced zero completion tokens — that pair is impossible for work that
+    actually finished. Absent/empty usage is UNKNOWN and returns False: we
+    never manufacture a verdict from missing evidence.
+
+    This duplicates abstractcore's provider-side detector on purpose — the
+    metadata annotation is the primary signal, this is the backstop for
+    substrates that hand the loop a raw response dict.
+    """
+    if not isinstance(response, dict):
+        return False
+    usage = response.get("usage")
+    if not isinstance(usage, dict) or not usage:
+        return False
+    counters = [
+        usage.get(k)
+        for k in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+        )
+        if usage.get(k) is not None
+    ]
+    if not counters or any(bool(c) for c in counters):
+        return False
+    for key in ("content", "reasoning"):
+        val = response.get(key)
+        if isinstance(val, str) and val.strip():
+            return True
+    return False
+
+
+def _truncation_kind(response: Any, finish_reason: str, tool_calls: Any) -> str:
+    """Classify a completion as lost work: "output_cap", "aborted_generation" or "".
+
+    A response that DID carry tool calls is never lost work, whatever else it
+    says — the step made progress and `act` will run it.
+
+    Order of evidence (strongest first):
+    1. the provider's own annotation (`metadata.truncation_kind`, written by
+       abstractcore's `_annotate_output_truncation`);
+    2. `finish_reason` in {length, max_tokens, max_output_tokens};
+    3. the zero-usage abort marker, for which finish_reason reads "stop".
+    """
+    if tool_calls:
+        return ""
+    meta = response.get("metadata") if isinstance(response, dict) else None
+    if isinstance(meta, dict):
+        kind = meta.get("truncation_kind")
+        if isinstance(kind, str) and kind.strip():
+            return kind.strip()
+        if meta.get("generation_aborted"):
+            return "aborted_generation"
+        if meta.get("output_truncated"):
+            return "output_cap"
+    if finish_reason in _TRUNCATION_FINISH_REASONS:
+        return "output_cap"
+    if _zero_usage_with_speech(response):
+        return "aborted_generation"
+    return ""
+
+
 def _looks_like_deferred_action(text: str) -> bool:
     """Return True when the model claims it will take actions but emits no tool calls.
 
@@ -612,25 +691,45 @@ def _truncate_preview(text: str, *, max_chars: int) -> str:
     return s[:keep].rstrip() + suffix
 
 
-def _render_cycles_for_conclusion_prompt(scratchpad: Dict[str, Any]) -> str:
+def _render_cycles_for_conclusion_prompt(
+    scratchpad: Dict[str, Any],
+    *,
+    limits: Optional[Dict[str, Any]] = None,
+) -> str:
     cycles = scratchpad.get("cycles")
     if not isinstance(cycles, list) or not cycles:
         return ""
 
-    # The conclusion prompt should have access to the full loop trace, but still needs
-    # to be bounded (tool outputs may be huge).
-    max_cycles = 25
-    max_thought_chars = 900
-    max_obs_chars = 360
+    # ADR-0026 (2026-08-02 purge): the conclusion prompt is the LAST call of a
+    # budget-exhausted run — the one place the model must see everything it
+    # did. Hardcoded 25-cycle / 900-char-thought / 360-char-observation bounds
+    # sat here and starved exactly that call: a 40-cycle run concluded having
+    # been shown 25 cycles' worth of 360-char observation stubs. All three are
+    # caller-set via `_limits` now; unset (-1) = the WHOLE trace.
+    def _lim(key: str) -> int:
+        if not isinstance(limits, dict):
+            return -1
+        try:
+            return int(limits.get(key, -1))
+        except (TypeError, ValueError):
+            return -1
+
+    max_cycles = _lim("conclusion_max_cycles")
+    max_thought_chars = _lim("conclusion_max_thought_chars")
+    max_obs_chars = _lim("conclusion_max_observation_chars")
 
     view = [c for c in cycles if isinstance(c, dict)]
     total = len(view)
-    if total > max_cycles:
+    if max_cycles > 0 and total > max_cycles:
         view = view[-max_cycles:]
 
     lines: list[str] = []
     if total > len(view):
-        lines.append(f"(showing last {len(view)} of {total} cycles)")
+        #[WARNING:TRUNCATION] caller-set _limits.conclusion_max_cycles window; full cycles stay in scratchpad + ledger
+        lines.append(
+            f"#[WARNING:TRUNCATION] showing last {len(view)} of {total} cycles "
+            f"(caller-set _limits.conclusion_max_cycles={max_cycles})"
+        )
         lines.append("")
 
     for c in view:
@@ -687,9 +786,8 @@ def _render_cycles_for_conclusion_prompt(scratchpad: Dict[str, Any]) -> str:
                         else:
                             # Structural key listing (not content); disclose when clipped.
                             keys_view = [str(k) for k in out.keys()]
-                            text = f"keys={keys_view[:8]}" + (
-                                f" (+{len(keys_view) - 8} more keys)" if len(keys_view) > 8 else ""
-                            )
+                            # ADR-0026: list every structural key (no [:8] slice).
+                            text = f"keys={keys_view}"
                     else:
                         text = str(out or "").strip()
                 text = _truncate_preview(text, max_chars=max_obs_chars)
@@ -1275,13 +1373,22 @@ def create_react_workflow(
             tail_parts.append(f"[loop] iteration {int(iteration)} of {int(max_iterations)}.")
             plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
             if isinstance(plan_text, str) and plan_text.strip():
-                # Bound the rendered plan so a pathological (or runaway) plan cannot balloon every
-                # subsequent request. The full plan stays durable in scratchpad; this is a display cap.
+                # ADR-0026 (2026-08-02 purge): the plan the model wrote for ITSELF
+                # rides this tail on every subsequent request. A hardcoded 4000-char
+                # cap sat here and amputated long plans from the step they were
+                # written to drive. Caller-set via `_limits.plan_render_max_chars`;
+                # unset (-1) = the whole plan.
                 plan_render = plan_text.strip()
-                _plan_cap = 4000
-                if len(plan_render) > _plan_cap:
-                    #[WARNING:TRUNCATION] bounded plan render in the trailing loop message
-                    plan_render = plan_render[:_plan_cap].rstrip() + f"\n… (plan truncated, {len(plan_text.strip()):,} chars total)"
+                try:
+                    _plan_cap = int(limits.get("plan_render_max_chars", -1))
+                except (TypeError, ValueError):
+                    _plan_cap = -1
+                if _plan_cap > 0 and len(plan_render) > _plan_cap:
+                    #[WARNING:TRUNCATION] caller-set _limits.plan_render_max_chars bound
+                    plan_render = plan_render[:_plan_cap].rstrip() + (
+                        f"\n… #[WARNING:TRUNCATION] plan clipped to the caller-set "
+                        f"_limits.plan_render_max_chars={_plan_cap} ({len(plan_text.strip()):,} chars total)"
+                    )
                 tail_parts.append(f"[plan]\n{plan_render}")
         tail_text = "\n\n".join(tail_parts).strip()
         if tail_text and isinstance(payload.get("messages"), list):
@@ -1369,6 +1476,7 @@ def create_react_workflow(
         if isinstance(response, dict):
             fr = response.get("finish_reason")
             finish_reason = str(fr or "").strip().lower() if fr is not None else ""
+        truncation_kind = _truncation_kind(response, finish_reason, tool_calls)
 
         cycle_i = int(scratchpad.get("iteration", 0) or 0)
         max_iterations = resolve_max_iterations(limits, scratchpad)
@@ -1389,7 +1497,7 @@ def create_react_workflow(
             "tool_calls": [
                 {"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls
             ],
-            "content_preview": (str(content or "")[:200] if content else "(no content)"),
+            "content_preview": parse_content_preview(content),
             "content": str(content or ""),
             "reasoning": reasoning_text,
         }
@@ -1557,12 +1665,31 @@ def create_react_workflow(
         # host-voiced with zero task/tool-call vocabulary — a machine
         # heuristic's imperative dressed as a conversational note was the
         # design-law violation. Task lane byte-unchanged (pinned).
-        if finish_reason in {"length", "max_tokens"}:
+        # `truncation_kind` covers BOTH deaths (see `_truncation_kind`):
+        # "output_cap" (finish_reason=length — the historical branch) and
+        # "aborted_generation" (operator 2026-08-02: a zero-usage HTTP 200
+        # whose tool call the server silently dropped, finish_reason="stop").
+        # The abort used to fall through this whole ladder into
+        # `_looks_like_deferred_action`, where a lost tool call was recorded as
+        # a plan-only cycle — a guess about the model's INTENT standing in for
+        # a known FAULT of the transport. Same recovery shape (retry the step,
+        # ask for a smaller unit of work), but now named, counted and visible.
+        if truncation_kind:
+            aborted = truncation_kind == "aborted_generation"
             if suppress_loop_tail(runtime_ns):
                 _push_inbox(
                     runtime_ns,
                     "Your previous reply was cut off before it finished. "
                     "Pick up where it stopped, in fewer words this time.",
+                )
+            elif aborted:
+                _push_inbox(
+                    runtime_ns,
+                    "Your previous response was cut off mid-generation and the tool call it carried was lost — nothing ran.\n"
+                    "Retry now: emit ONLY the next tool call(s) needed to make progress.\n"
+                    "Make this call SMALLER than the one that was cut off (avoid large file contents / giant JSON blobs).\n"
+                    "For large files, create a small skeleton first, then refine with multi-hunk edit_file diff calls sized to fit the output budget.\n"
+                    "Do not write a plan before the tool call.",
                 )
             else:
                 _push_inbox(
@@ -1573,7 +1700,24 @@ def create_react_workflow(
                     "For large files, create a small skeleton first, then refine with multi-hunk edit_file diff calls sized to fit the output budget (fewer hunks per call if a call was cut off).\n"
                     "Do not write a long plan before tool calls.",
                 )
-            emit("parse_retry_truncated", {"cycle": cycle_i})
+            # VISIBILITY (operator 2026-08-02): a lost tool call is not a
+            # cycle of thinking — mark the scratchpad cycle as a fault and keep
+            # a run-scoped tally so "13 cycles" can be read as
+            # productive-vs-recovery instead of an opaque number.
+            cycle["truncated"] = truncation_kind
+            cycle["lost_tool_call"] = True
+            lost = int(scratchpad.get("truncated_cycles", 0) or 0) + 1
+            scratchpad["truncated_cycles"] = lost
+            emit(
+                "parse_retry_truncated",
+                {
+                    "cycle": cycle_i,
+                    "kind": truncation_kind,
+                    "finish_reason": finish_reason or None,
+                    "truncated_cycles": lost,
+                    "content_preview": (parse_content_preview(content) if str(content or "") else None),
+                },
+            )
             if last_call_media:
                 temp["pending_media"] = last_call_media
             return StepPlan(node_id="parse", next_node="reason")
@@ -2312,6 +2456,23 @@ def create_react_workflow(
         plan_text = str(plan).strip() if isinstance(plan, str) and plan.strip() else "(no plan)"
         answer = str(temp.get("final_answer") or "").strip()
 
+        # ADR-0026 (2026-08-02 purge): the verifier used to read at most the
+        # LAST 8 tool messages, each clipped to 2000 chars, and a 4000-char
+        # clip of the answer. A verifier told to be "strict: only count
+        # actions that are supported by the tool outputs" while the tool
+        # outputs are silently amputated returns false negatives by
+        # construction. All three bounds are now caller-set via `_limits`
+        # (CodeAct's already were — this was the drift), default -1 = whole.
+        def _limit_int(key: str) -> int:
+            try:
+                return int(limits.get(key, -1))
+            except (TypeError, ValueError):
+                return -1
+
+        tool_limit = _limit_int("review_max_tool_output_chars")
+        answer_limit = _limit_int("review_max_answer_chars")
+        max_tool_msgs = _limit_int("review_max_tool_messages")
+
         messages = list(context.get("messages") or [])
         tool_msgs: list[str] = []
         for m in reversed(messages):
@@ -2319,8 +2480,13 @@ def create_react_workflow(
                 continue
             content = m.get("content")
             if isinstance(content, str) and content.strip():
-                tool_msgs.append(_review_truncate(content.strip(), max_chars=2000))
-            if len(tool_msgs) >= 8:
+                tool_msgs.append(_review_truncate(content.strip(), max_chars=tool_limit))
+            if max_tool_msgs > 0 and len(tool_msgs) >= max_tool_msgs:
+                #[WARNING:TRUNCATION] caller-set _limits.review_max_tool_messages window
+                tool_msgs.append(
+                    f"#[WARNING:TRUNCATION] older tool outputs omitted by the caller-set "
+                    f"_limits.review_max_tool_messages={max_tool_msgs} window"
+                )
                 break
         tool_msgs.reverse()
         observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
@@ -2341,7 +2507,7 @@ def create_react_workflow(
             "Return JSON ONLY.\n\n"
             f"User request:\n{task}\n\n"
             f"Plan:\n{plan_text}\n\n"
-            f"Proposed final answer:\n{_review_truncate(answer, max_chars=4000)}\n\n"
+            f"Proposed final answer:\n{_review_truncate(answer, max_chars=answer_limit)}\n\n"
             f"Tool outputs:\n{observations}\n\n"
             f"Allowed tools:\n{', '.join(allow) if allow else '(none)'}\n\n"
             + verifier_execution_preference(executors)
@@ -2678,7 +2844,7 @@ def create_react_workflow(
                 block_parts.append(f"Host guidance:\n{drained_guidance}")
             block_parts.append(conclude_directive)
             if not _suppress_chrome:
-                scratch_txt = _render_cycles_for_conclusion_prompt(scratchpad)
+                scratch_txt = _render_cycles_for_conclusion_prompt(scratchpad, limits=limits)
                 if scratch_txt:
                     block_parts.append(f"## Scratchpad (ReAct cycles so far)\n{scratch_txt}")
                 tail_text = ("## Max iterations reached\n" + "\n\n".join(block_parts)).strip()
@@ -2766,7 +2932,7 @@ def create_react_workflow(
             else:
                 # Fallback: avoid returning the last tool observation as the "answer".
                 # Provide a deterministic report so users don't lose scratchpad context.
-                scratch_view = _render_cycles_for_conclusion_prompt(scratchpad)
+                scratch_view = _render_cycles_for_conclusion_prompt(scratchpad, limits=limits)
                 parts = [
                     "Max iterations reached.",
                     "I could not produce a final assistant response in time.",

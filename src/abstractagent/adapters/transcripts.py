@@ -80,6 +80,27 @@ def elide_oversized_content(text: str, *, cap: int, label: str) -> str:
     )
 
 
+# The common-core `parse` payload's content preview bound (0028 contract).
+PARSE_CONTENT_PREVIEW_CHARS = 200
+
+
+def parse_content_preview(content: Any, *, cap: int = PARSE_CONTENT_PREVIEW_CHARS) -> str:
+    """The `parse` hook payload's bounded view of the model's reply.
+
+    ADR-0026 §1: the key name says "preview", but a bare slice left every
+    reader — observability surfaces, monitors, replay tooling — unable to
+    tell a 200-char reply from a 20,000-char one that got cut. Name the
+    loss; the full content stays in the durable transcript.
+    #[WARNING:TRUNCATION] parse-hook content preview; full reply in the transcript
+    """
+    s = str(content or "")
+    if not s:
+        return "(no content)"
+    if cap <= 0 or len(s) <= cap:
+        return s
+    return s[:cap] + f"… [#TRUNCATION: {cap} of {len(s):,} chars; full reply in the transcript]"
+
+
 def extract_reasoning_text(response: Any) -> str:
     """Return the model's separated reasoning text from an LLM result, or "".
 

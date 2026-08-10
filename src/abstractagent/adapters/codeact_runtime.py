@@ -28,7 +28,7 @@ from .generation_params import (
     verifier_response_schema,
 )
 from .media import extract_media_from_context
-from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, sanitize_transcript_messages
+from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, parse_content_preview, sanitize_transcript_messages
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .tool_allowlist import note_pruned_grants
 from ..logic.codeact import CodeActLogic
@@ -596,11 +596,19 @@ def create_codeact_workflow(
             if _flag(runtime_ns, "plan_mode", default=False):
                 plan_text = scratchpad.get("plan")
                 if isinstance(plan_text, str) and plan_text.strip():
+                    # ADR-0026 (2026-08-02 purge): same as ReAct — the plan flows
+                    # whole unless the caller sets _limits.plan_render_max_chars.
                     plan_render = plan_text.strip()
-                    _plan_cap = 4000
-                    if len(plan_render) > _plan_cap:
-                        #[WARNING:TRUNCATION] bounded plan render in the trailing loop message
-                        plan_render = plan_render[:_plan_cap].rstrip() + f"\n… (plan truncated, {len(plan_text.strip()):,} chars total)"
+                    try:
+                        _plan_cap = int(limits.get("plan_render_max_chars", -1))
+                    except (TypeError, ValueError):
+                        _plan_cap = -1
+                    if _plan_cap > 0 and len(plan_render) > _plan_cap:
+                        #[WARNING:TRUNCATION] caller-set _limits.plan_render_max_chars bound
+                        plan_render = plan_render[:_plan_cap].rstrip() + (
+                            f"\n… #[WARNING:TRUNCATION] plan clipped to the caller-set "
+                            f"_limits.plan_render_max_chars={_plan_cap} ({len(plan_text.strip()):,} chars total)"
+                        )
                     tail_parts.append(f"[plan]\n{plan_render}")
         tail_text = "\n\n".join(tail_parts).strip()
         if tail_text and isinstance(payload.get("messages"), list):
@@ -663,7 +671,7 @@ def create_codeact_workflow(
             "tool_calls": [
                 {"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls
             ],
-            "content_preview": (content[:200] if content else "(no content)"),
+            "content_preview": parse_content_preview(content),
             "has_code": bool(fenced_code),
             # Reasoning parity (reasoning-first-citizen plan, agent section):
             # the separated thinking channel was surfaced by ReAct only —
@@ -1216,7 +1224,11 @@ def create_codeact_workflow(
             return StepPlan(node_id="execute_code", next_node="reason")
 
         temp.pop("pending_code", None)
-        emit("act", {"tool": "execute_python", "args": {"code": "(inline)", "timeout_s": 10.0}})
+        # ADR-0027: fenced-code execution is a model-authored compute path, so
+        # it must not smuggle in a hidden 10s kill switch. Timeouts belong to
+        # explicit callers; the auto-issued fallback tool call carries only the
+        # code and inherits execute_python's current default (no timeout).
+        emit("act", {"tool": "execute_python", "args": {"code": "(inline)"}})
         allow = _effective_allowlist(runtime_ns)
 
         # Same P0 class, sharper here: re-running the SAME fenced code block is
@@ -1233,7 +1245,7 @@ def create_codeact_workflow(
                     "tool_calls": [
                         {
                             "name": "execute_python",
-                            "arguments": {"code": code, "timeout_s": 10.0},
+                            "arguments": {"code": code},
                             "call_id": "code",
                         }
                     ],
@@ -1408,6 +1420,14 @@ def create_codeact_workflow(
             answer_limit = int(limits.get("review_max_answer_chars", -1))
         except Exception:
             answer_limit = -1
+        try:
+            max_tool_msgs = int(limits.get("review_max_tool_messages", -1))
+        except Exception:
+            max_tool_msgs = -1
+        try:
+            max_user_msgs = int(limits.get("review_max_user_messages", -1))
+        except Exception:
+            max_user_msgs = -1
 
         for m in reversed(messages):
             if not isinstance(m, dict) or m.get("role") != "tool":
@@ -1415,7 +1435,16 @@ def create_codeact_workflow(
             content = m.get("content")
             if isinstance(content, str) and content.strip():
                 tool_msgs.append(_truncate_block(content.strip(), max_chars=tool_limit))
-            if len(tool_msgs) >= 8:
+            # ADR-0026 (2026-08-02 purge): the char clips here were already
+            # caller-set (-1 default), but the MESSAGE-COUNT windows were not —
+            # a verifier told to judge only from tool outputs was silently shown
+            # the last 8. Caller-set now; unset (<=0) = every tool message.
+            if max_tool_msgs > 0 and len(tool_msgs) >= max_tool_msgs:
+                #[WARNING:TRUNCATION] caller-set _limits.review_max_tool_messages window
+                tool_msgs.append(
+                    f"#[WARNING:TRUNCATION] older tool outputs omitted by the caller-set "
+                    f"_limits.review_max_tool_messages={max_tool_msgs} window"
+                )
                 break
         tool_msgs.reverse()
         observations = "\n\n".join(tool_msgs) if tool_msgs else "(no tool outputs)"
@@ -1437,7 +1466,7 @@ def create_codeact_workflow(
             if role == "user" and isinstance(content, str) and content.strip():
                 if content.strip() != task.strip():
                     user_msgs.append(_truncate_block(content.strip(), max_chars=user_limit))
-                    if len(user_msgs) >= 4:
+                    if max_user_msgs > 0 and len(user_msgs) >= max_user_msgs:
                         break
         for m in reversed(messages):
             if not isinstance(m, dict):
@@ -1450,7 +1479,7 @@ def create_codeact_workflow(
             content = m.get("content")
             if isinstance(content, str) and content.strip():
                 ask_prompts.append(_truncate_block(content.strip(), max_chars=user_limit))
-                if len(ask_prompts) >= 4:
+                if max_user_msgs > 0 and len(ask_prompts) >= max_user_msgs:
                     break
 
         user_msgs.reverse()

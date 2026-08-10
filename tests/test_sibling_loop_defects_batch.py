@@ -106,6 +106,26 @@ def test_codeact_fenced_fallback_flag_off_disables_extraction() -> None:
     assert "print('boom')" in temp["final_answer"]
 
 
+def test_codeact_fenced_execution_does_not_inject_hidden_timeout() -> None:
+    """ADR-0027: fenced-code fallback must not smuggle the old 10s timeout."""
+    wf = _codeact_wf()
+    run = _parse_run(content=FENCED_EXAMPLE)
+
+    parse_plan = wf.get_node("parse")(run, _Ctx())
+    assert parse_plan.next_node == "execute_code"
+
+    exec_plan = wf.get_node("execute_code")(run, _Ctx())
+    assert exec_plan.effect is not None and exec_plan.effect.type.value == "tool_calls"
+    tool_calls = exec_plan.effect.payload["tool_calls"]
+    assert tool_calls == [
+        {
+            "name": "execute_python",
+            "arguments": {"code": "print('boom')"},
+            "call_id": "code",
+        }
+    ]
+
+
 def _delegate_act_run(*, workflow_id: str, parent_max: int, arg_max: Optional[int]) -> RunState:
     args: Dict[str, Any] = {"task": "sub task"}
     if arg_max is not None:

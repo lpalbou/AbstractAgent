@@ -137,9 +137,14 @@ MemAct's finalize steps (`finalize_request`, `finalize`, `finalize_skipped`,
 
 Parse payload common core (0028 contract wave, 2026-07-14): every adapter's
 `parse` payload guarantees `has_tool_calls` (bool), `tool_calls`
-(list of `{name, arguments, call_id}`), and `content_preview` (≤200 chars;
-the string `"(no content)"` when the reply was empty — a sentinel, not
-model text). Since 2026-07-27 every adapter also carries `reasoning`: the
+(list of `{name, arguments, call_id}`), and `content_preview` (≤200 chars of
+model text; the string `"(no content)"` when the reply was empty — a
+sentinel, not model text). Per ADR-0026 the preview is never a silent cut:
+when the reply exceeds the bound the preview carries a trailing
+`… [#TRUNCATION: 200 of N chars; full reply in the transcript]` marker, so a
+consumer can always tell a short reply from a clipped one. Built by
+`adapters.transcripts.parse_content_preview` — one helper, three loops.
+Since 2026-07-27 every adapter also carries `reasoning`: the
 model's separated thinking text when the provider reported one
 (`response.reasoning` / `reasoning_content`), `""` when absent — one shared
 reader across the three loops. Loop-specific extras (ReAct's full

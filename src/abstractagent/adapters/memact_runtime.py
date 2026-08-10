@@ -23,7 +23,7 @@ from .generation_params import (
     suppress_loop_tail,
 )
 from .media import extract_media_from_context
-from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, sanitize_transcript_messages
+from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, parse_content_preview, sanitize_transcript_messages
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .tool_allowlist import note_pruned_grants
 from ..logic.memact import MemActLogic
@@ -650,7 +650,7 @@ def create_memact_workflow(
         parse_payload: Dict[str, Any] = {
             "has_tool_calls": bool(tool_calls),
             "tool_calls": [{"name": tc.name, "arguments": (dict(tc.arguments) if isinstance(tc.arguments, dict) else (list(tc.arguments) if isinstance(tc.arguments, list) else tc.arguments)), "call_id": tc.call_id} for tc in tool_calls],
-            "content_preview": (str(content or "")[:200] if content else "(no content)"),
+            "content_preview": parse_content_preview(content),
             # Reasoning parity (reasoning-first-citizen plan, agent section):
             # the separated thinking channel was surfaced by ReAct only —
             # additive on the common core, same shared reader.

@@ -16,7 +16,9 @@ class ExecutionResult:
 
 
 class Sandbox(Protocol):
-    def execute(self, code: str, *, timeout_s: float = 10.0) -> ExecutionResult: ...
+    # ADR-0027: None/<=0 = no timeout. A 10.0 default used to live on this
+    # protocol and every implementation inherited the silent kill.
+    def execute(self, code: str, *, timeout_s: Optional[float] = None) -> ExecutionResult: ...
 
     def reset(self) -> None: ...
 
