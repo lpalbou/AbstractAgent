@@ -195,6 +195,7 @@ class CodeActLogic:
             f"{run_code_line}"
             "- Efficiency: batch independent read-only tool calls into a single turn (multiple tool calls) to reduce iterations.\n"
             "  Examples: read_file for multiple files/ranges, search_files with different queries, list_files across folders, analyze_code on multiple targets.\n"
+            "  If reading nearby ranges of the same file, prefer ONE call with a wider range.\n"
             "  Only split tool calls across turns when later calls depend on earlier outputs.\n"
             "  Side-effectful tools: never batch two calls that touch the SAME target (e.g. two edits to one file); calls on DIFFERENT, independent targets may ride one turn — the runtime executes a batch in order. Never batch execute_python, execute_command, comms sends, or any mcp:: tool.\n"
             "  For MULTIPLE edits to ONE file in a turn, prefer ONE edit_file diff call — many hunks apply atomically. One call is not a batch.\n"

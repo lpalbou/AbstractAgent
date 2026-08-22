@@ -187,23 +187,33 @@ def _repeat_guard_scenario_vars() -> Dict[str, Any]:
     }
 
 
-def test_third_identical_proposal_now_concludes_via_stuck_streak() -> None:
-    """COMPOSITION UPDATE (0017 work half, 2026-07-21): this scenario — an
-    executed batch, a guard-skipped identical proposal (nudge delivered), and
-    a THIRD identical proposal — is now decisively terminated by the
-    stuck-streak layer (proposals count; the model ignored the nudge). The
-    old endless skip/nudge alternation was the 0017 defect in side-effect
-    clothing."""
+def test_third_identical_proposal_escalates_to_the_loud_stuck_nudge() -> None:
+    """COMPOSITION UPDATE (0017 work half 2026-07-21; nudge-then-stop
+    2026-08-21): this scenario — an executed batch, a guard-skipped identical
+    proposal (soft nudge delivered), and a THIRD identical proposal — is
+    caught by the stuck-streak layer, which escalates from the guard's one
+    line to the LOUD nudge (batch + count + observations + consequence) and
+    keeps the turn. Termination is no longer instant: it waits for the model
+    to ignore this one too (span 5, `stuck_streak_hard_threshold`). The old
+    endless skip/nudge alternation was the 0017 defect in side-effect
+    clothing, and it is still closed — the batch is not executed."""
     from abstractagent.adapters.react_runtime import create_react_workflow
     from abstractagent.logic.react import ReActLogic
 
     write_tool = ToolDefinition(name="write_file", description="w", parameters={})
     steps: list = []
     wf = create_react_workflow(logic=ReActLogic(tools=[write_tool]), on_step=lambda s, d: steps.append((s, d)))
-    run = _run(_repeat_guard_scenario_vars(), node="parse")
+    vars0 = _repeat_guard_scenario_vars()
+    run = _run(vars0, node="parse")
     plan = wf.get_node("parse")(run, _Ctx())
-    assert plan.next_node == "max_iterations"
-    assert [s for s, _ in steps if s == "stuck_streak"], "streak verdict must be loud"
+    assert plan.next_node == "reason"
+    streaks = [d for s, d in steps if s == "stuck_streak"]
+    assert streaks and streaks[0].get("action") == "nudged", "streak verdict must be loud"
+    # The batch is recorded but NOT executed.
+    assert run.vars["_temp"].get("pending_tool_calls") == []
+    inbox = "\n".join(str(m.get("content") or "") for m in run.vars["_runtime"].get("inbox") or [])
+    assert "[loop guard] You are stuck" in inbox
+    assert "write_file" in inbox
 
 
 def test_repeat_guard_scans_past_skipped_cycles() -> None:

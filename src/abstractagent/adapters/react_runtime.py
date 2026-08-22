@@ -50,6 +50,12 @@ from .media import (
     media_item_key,
     merge_media_lists,
 )
+from .tool_failure_hints import diagnose_tool_failure, output_reads_as_error, render_hint_block
+from .read_orchestration import (
+    advance_last_successful_read_batch,
+    detect_nearby_same_file_staircase,
+    detect_redundant_same_file_full_reread,
+)
 from .tool_allowlist import note_pruned_grants
 from .transcripts import (
     assistant_tool_calls_payload,
@@ -299,11 +305,243 @@ def _tool_call_fingerprint(name: str, args: Any) -> str:
         return "fingerprint_err"
 
 
+def _evidence_text(context: Any, *, max_chars: int = 200_000) -> str:
+    """What the ENVIRONMENT has told this run so far — user messages, tool
+    outputs, system messages. Assistant turns are excluded on purpose: a value
+    the model minted and then echoed in its own text is not evidence that the
+    value exists, and treating it as such is exactly how `artifact_id="a1"`
+    survived twelve calls without anyone noticing it came from nowhere.
+    """
+    msgs = context.get("messages") if isinstance(context, dict) else None
+    if not isinstance(msgs, list):
+        return ""
+    parts: list[str] = []
+    for m in msgs[-80:]:
+        if not isinstance(m, dict):
+            continue
+        if str(m.get("role") or "").strip().lower() == "assistant":
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and c.strip():
+            parts.append(c)
+    joined = "\n".join(parts)
+    return joined[-max_chars:] if len(joined) > max_chars else joined
+
+
+def _tool_names_of(logic_obj: Any) -> list:
+    names: list = []
+    for t in getattr(logic_obj, "tools", None) or []:
+        n = t.get("name") if isinstance(t, dict) else getattr(t, "name", None)
+        if n:
+            names.append(str(n))
+    return names
+
+
+def _observation_fingerprint(cycle: Any) -> Optional[str]:
+    """Identity of what a cycle's tool batch RETURNED, or None when it
+    returned nothing (a cycle the guard refused to execute).
+
+    The 0017 detector fingerprints only the CALL, which cannot tell a stuck
+    loop from a poll that is making progress: `check_status()` answered
+    "10%", then "40%", then "90%" is the same call three times and is not
+    stuck. (No ellipsis in this docstring on purpose: the ADR-0026 lossy-site
+    guard scans for one next to a slice, and the slice here is a hash prefix.)
+    Forensics on the nudge (2026-08-21) put a real polling loop in front of
+    it and it fired. Identical call AND identical answer is the honest
+    trigger.
+    """
+    obs = cycle.get("observations") if isinstance(cycle, dict) else None
+    if not isinstance(obs, list) or not obs:
+        return None
+    parts: list[str] = []
+    for o in obs:
+        if not isinstance(o, dict):
+            parts.append("?")
+            continue
+        body = o.get("error") if o.get("success") is not True else o.get("output")
+        if body is None:
+            body = o.get("output") if o.get("success") is not True else o.get("error")
+        # Hash the body TEXT directly. `_tool_call_fingerprint` takes an
+        # ARGUMENTS value and ignores a bare string, so routing observations
+        # through it made every answer hash the same — the check silently
+        # passed nothing (caught live: a 10%/45%/80% poll still read as
+        # "identical answers").
+        try:
+            body_txt = body if isinstance(body, str) else json.dumps(body, sort_keys=True, default=str)
+        except Exception:
+            body_txt = str(body)
+        parts.append(f"{o.get('name') or 'tool'}|{bool(o.get('success'))}|{body_txt}")
+    try:
+        return hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return "obs_fp_err"
+
+
+def _stop_reason(
+    *,
+    code: str,
+    finished: bool,
+    budget_exhausted: bool,
+    iterations: int,
+    forced: Optional[Dict[str, Any]] = None,
+    max_iterations: Optional[int] = None,
+    by_operator: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """The turn's verdict IN WORDS, authored where the facts are.
+
+    Architecture (operator, 2026-08-21): hosts are thin. AbstractCode's TUI,
+    AbstractObserver, the web client, a WhatsApp or Telegram bridge — all of
+    them reach the same gateway and must render the same answer to "did it
+    finish, and what do I do about it?" without each re-deriving it. The
+    client that DID derive it locally got it wrong for two days: it read
+    `outcome: "iteration_budget"` alone, missed the additive
+    `conclusion_forced` beside it, and told operators to raise a budget that
+    still had 38 of 50 iterations unspent.
+
+    Only this node knows the whole truth — the ceiling, the iterations
+    actually spent, whether a stuck pattern forced the stop, and whether the
+    model was warned first — so this node writes the sentence. `label` is for
+    a status line, `headline` and `remedy` for a card. Additive: `outcome`,
+    `iterations` and `conclusion_forced` keep their existing shapes and
+    meanings for anything already reading them.
+    """
+    kind = str((forced or {}).get("kind") or "")
+    span = int((forced or {}).get("span") or 0)
+    nudged = bool((forced or {}).get("nudged"))
+    iters_txt = f" after {iterations} iterations" if iterations > 0 else ""
+
+    if code == "final_answer":
+        return {
+            "code": code,
+            "finished": True,
+            "budget_exhausted": False,
+            "iterations": iterations,
+            "label": "done",
+            "headline": "",
+            "remedy": "",
+        }
+
+    if by_operator is not None:
+        # Neither a failure nor a budget: the operator asked for the best
+        # answer available and got it. Hosts must not dress this as a
+        # truncation the agent caused.
+        return {
+            "code": "operator_conclude",
+            "finished": False,
+            "budget_exhausted": False,
+            "iterations": iterations,
+            "label": f"concluded on request{iters_txt}",
+            "headline": (
+                f"You asked the agent to conclude{iters_txt}, so it stopped work and answered "
+                "with what it had."
+            ),
+            "remedy": "Anything left unfinished is listed in the answer — send it as a follow-up turn.",
+        }
+
+    if kind:
+        shape = (
+            "alternated between the same two tool batches"
+            if kind == "oscillation"
+            else "repeated the same tool batch"
+        )
+        times = f" {span} times" if span > 0 else ""
+        warned = " It was warned mid-loop and did it again." if nudged else ""
+        short = "oscillating tool calls" if kind == "oscillation" else "repeated tool calls"
+        return {
+            "code": f"stuck_{kind}",
+            "finished": False,
+            # The budget is NOT what stopped this turn, and saying so is the
+            # whole point: the remedy differs.
+            "budget_exhausted": False,
+            "iterations": iterations,
+            "label": f"stopped: {short}{iters_txt}",
+            "headline": (
+                f"The agent stopped early{iters_txt}: it {shape}{times} without making progress, "
+                f"so the loop ended the turn.{warned}"
+            ),
+            "remedy": (
+                "The iteration budget was not the limit, so raising it will not help. Give the agent a "
+                "different route to the same goal, or check whether the tool it kept calling can work here at all."
+            ),
+        }
+
+    ceiling = f" of {max_iterations}" if isinstance(max_iterations, int) and max_iterations > 0 else ""
+    return {
+        "code": "iteration_budget",
+        "finished": False,
+        "budget_exhausted": True,
+        "iterations": iterations,
+        "label": f"stopped: iteration budget{iters_txt}",
+        "headline": (
+            f"The agent ran out of iterations{iters_txt}{ceiling} and STOPPED — it did not finish."
+        ),
+        "remedy": "Raise the iteration budget, or send the remaining work as a follow-up turn.",
+    }
+
+
+def _turn_notices(scratchpad: Any) -> list:
+    """Caveats about the ANSWER, authored here for the same reason as
+    `_stop_reason`: every host shows the same sentence or none of them do."""
+    out: list = []
+    if isinstance(scratchpad, dict) and scratchpad.get("review_skipped"):
+        out.append(
+            {
+                "code": "review_skipped",
+                "severity": "warn",
+                "text": (
+                    "The verifier pass was requested but did not run — this answer was not checked "
+                    "against the tool outputs."
+                ),
+            }
+        )
+    return out
+
+
+def _observations_all_failed(cycle: Any) -> Optional[bool]:
+    """True when every observation of this cycle is a failure, None when the
+    cycle produced no observations at all (nothing to judge)."""
+    obs = cycle.get("observations") if isinstance(cycle, dict) else None
+    if not isinstance(obs, list) or not obs:
+        return None
+    seen = False
+    for o in obs:
+        if not isinstance(o, dict):
+            continue
+        seen = True
+        if o.get("success") is True:
+            body = o.get("output")
+            if not isinstance(body, str):
+                body = str(o.get("rendered") or "")
+            # Same rule as the diagnosis lane: an error sentence in the body
+            # is a failure even when the transport flag says otherwise.
+            if not output_reads_as_error(body):
+                return False
+    return True if seen else None
+
+
+def _streak_key(kind: str, fp_groups: Any) -> str:
+    """Stable identity for one stuck pattern (0017 nudge half).
+
+    The nudge fires ONCE per distinct pattern, not once per cycle: a model
+    that changes strategy and then gets stuck a DIFFERENT way earns a second
+    nudge, while a model that ignores the first one is not spammed with
+    copies of it. For an oscillation the identity is the unordered PAIR — the
+    "current" batch alternates every cycle, so keying on it alone would nudge
+    twice for one loop.
+    """
+    try:
+        raw = str(kind) + "|" + "|".join(",".join(map(str, g)) for g in fp_groups)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return f"{kind}_key_err"
+
+
 def _repeat_streak_verdict(
     cycles: Any,
     *,
     turn_fence: int,
     threshold: int,
+    max_span: int = 24,
 ) -> Optional[Dict[str, Any]]:
     """Detect a stuck tool-batch pattern ending at the CURRENT cycle (0017 work half).
 
@@ -323,8 +561,12 @@ def _repeat_streak_verdict(
     not progressing). Scan never crosses `turn_fence` (c2447 F5: repeating
     yesterday's search in a later visit turn is a relationship, not a loop).
 
-    Returns None, or {"kind": "repeat"|"oscillation", "span": N} where span
-    is the number of trailing tool-cycles in the pattern.
+    Returns None, or {"kind": "repeat"|"oscillation", "span": N, "key": K}
+    where span is the ACTUAL number of trailing tool-cycles in the pattern
+    (>= threshold, not clamped to it — the nudge/hard-stop escalation below
+    needs to know how far past the trigger the loop has gone) and key is a
+    stable identity for the pattern, so the same loop is nudged once rather
+    than once per cycle.
     """
     if threshold < 2 or not isinstance(cycles, list):
         return None
@@ -332,6 +574,8 @@ def _repeat_streak_verdict(
     # Ordered fingerprint lists of tool-proposing cycles, NEWEST FIRST,
     # current cycle included (it is already appended by parse_node).
     fps_newest_first: list[tuple[str, ...]] = []
+    obs_newest_first: list[Optional[str]] = []
+    obs_failed_newest_first: list[Optional[bool]] = []
     for idx in range(len(cycles) - 1, fence - 1, -1):
         c = cycles[idx]
         if not isinstance(c, dict):
@@ -346,23 +590,254 @@ def _repeat_streak_verdict(
                 if isinstance(tc, dict)
             )
         )
+        obs_newest_first.append(_observation_fingerprint(c))
+        obs_failed_newest_first.append(_observations_all_failed(c))
         # Enough history for either shape; stop scanning.
-        if len(fps_newest_first) >= max(threshold, 4):
+        if len(fps_newest_first) >= max(threshold, 4, int(max_span)):
             break
     if not fps_newest_first or not fps_newest_first[0]:
         return None
     current = fps_newest_first[0]
-    # REPEAT: current batch equals the previous (threshold - 1) batches.
-    if len(fps_newest_first) >= threshold and all(
-        fps == current for fps in fps_newest_first[:threshold]
+    # REPEAT: how many trailing batches are identical to the current one AND
+    # came back with the same answer. A cycle that returned NOTHING (the
+    # guard refused it) is transparent: it neither proves nor breaks the
+    # streak. Two executed cycles whose answers DIFFER break it — the loop is
+    # still producing new information, whatever the call looks like.
+    run = 1
+    seen_obs: Optional[str] = None
+    answers_differ = False
+    all_failed: Optional[bool] = None
+    for fps, obs_fp, obs_failed in zip(
+        fps_newest_first[1:], obs_newest_first[1:], obs_failed_newest_first[1:]
     ):
-        return {"kind": "repeat", "span": threshold}
-    # OSCILLATION: strict A-B-A-B over the last four tool-batches.
+        if fps != current:
+            break
+        if obs_fp is not None:
+            if seen_obs is None:
+                seen_obs = obs_fp
+            elif obs_fp != seen_obs:
+                answers_differ = True
+                break
+        if obs_failed is not None:
+            all_failed = obs_failed if all_failed is None else (all_failed and obs_failed)
+        run += 1
+    if run >= threshold and not answers_differ:
+        return {
+            "kind": "repeat",
+            "span": run,
+            "key": _streak_key("repeat", [current]),
+            # Did the identical batch ever come back with anything? A streak
+            # of refused proposals has no answer to echo in the nudge.
+            "answered": seen_obs is not None,
+            # Every answer was an ERROR. The model has already been handed a
+            # diagnosis of that error (observe_node's first-failure hint), so
+            # this streak trips one repeat earlier than an ambiguous one.
+            "failed": bool(all_failed),
+        }
+    # OSCILLATION: strict A-B-A-B… — the trailing alternation, full length.
     if len(fps_newest_first) >= 4:
-        b, a, b2, a2 = fps_newest_first[0], fps_newest_first[1], fps_newest_first[2], fps_newest_first[3]
-        if b == b2 and a == a2 and a != b and a and b:
-            return {"kind": "oscillation", "span": 4}
+        b, a = fps_newest_first[0], fps_newest_first[1]
+        if a and b and a != b:
+            span = 2
+            for idx in range(2, len(fps_newest_first)):
+                expected = b if idx % 2 == 0 else a
+                if fps_newest_first[idx] != expected:
+                    break
+                span += 1
+            if span >= 4:
+                return {"kind": "oscillation", "span": span, "key": _streak_key("oscillation", sorted([a, b]))}
     return None
+
+
+def _stuck_recent_tool_cycles(cycles: Any, *, turn_fence: int, count: int) -> list:
+    """The trailing tool-PROPOSING cycles of this turn, newest first."""
+    out: list = []
+    if not isinstance(cycles, list) or count <= 0:
+        return out
+    fence = max(0, turn_fence)
+    for idx in range(len(cycles) - 1, fence - 1, -1):
+        c = cycles[idx]
+        if not isinstance(c, dict):
+            continue
+        tcs = c.get("tool_calls")
+        if not isinstance(tcs, list) or not tcs:
+            continue
+        out.append(c)
+        if len(out) >= count:
+            break
+    return out
+
+
+def _stuck_nudge_message(
+    cycles: Any,
+    *,
+    verdict: Dict[str, Any],
+    turn_fence: int,
+    remaining: Optional[int],
+    suppressed: bool = False,
+    tool_specs: Any = None,
+    available_tools: Any = (),
+    evidence_text: str = "",
+) -> str:
+    """Tell the model it is looping WHILE it can still act on that (0017 nudge half).
+
+    The pre-2026-08-21 behaviour terminated the turn on the first detection, so
+    the only place the loop was ever named to the model was the conclusion
+    prompt — after its last chance to change course. This message carries the
+    three facts it cannot see for itself: the batch it keeps proposing, how
+    many times, and what that batch RETURNED each time (the observation text
+    was never summarised back at it), plus the consequence of ignoring this.
+    """
+    kind = str(verdict.get("kind") or "repeat")
+    span = int(verdict.get("span") or 0)
+    recent = _stuck_recent_tool_cycles(cycles, turn_fence=turn_fence, count=max(2, span))
+
+    if suppressed:
+        # Entity/visit lane (c2447 chrome class): the same correction with NO
+        # loop vocabulary, no cycle counts and no batch dump — this text rides
+        # the conversation the visitor's reply is written from, exactly like
+        # the suppressed conclude directive.
+        return (
+            "That attempt has already been made and returned the same result, so it was not "
+            "repeated. Try a different approach, or reply now with what you already have — in "
+            "your own words."
+        )
+
+    sigs: list[str] = []
+    for c in recent[: (1 if kind == "repeat" else 2)]:
+        calls = c.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for tc in calls:
+            if isinstance(tc, dict):
+                sig = _tool_call_signature(str(tc.get("name") or ""), tc.get("arguments"))
+                if sig not in sigs:
+                    sigs.append(sig)
+
+    # The DIAGNOSIS of the repeated batch, not just its echo: same builder the
+    # first failure used, so the escalation says something more than "you did
+    # it again" — it re-states which argument is wrong and what to run instead.
+    diagnoses: list[str] = []
+    seen_sigs: set = set()
+    for c in recent:
+        obs_here = c.get("observations")
+        calls_here = c.get("tool_calls")
+        if not isinstance(obs_here, list) or not isinstance(calls_here, list):
+            continue
+        for o in obs_here:
+            if not isinstance(o, dict) or o.get("success") is True:
+                continue
+            args = {}
+            for tc in calls_here:
+                if isinstance(tc, dict) and tc.get("call_id") == o.get("call_id"):
+                    args = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
+                    break
+            out = o.get("output")
+            err_text = str(o.get("error") or "")
+            if isinstance(out, dict) and str(out.get("rendered") or ""):
+                err_text = str(out.get("rendered"))
+            elif isinstance(out, str) and out.strip() and not err_text:
+                err_text = out
+            d = diagnose_tool_failure(
+                name=str(o.get("name") or ""),
+                arguments=args,
+                error_text=err_text,
+                tool_specs=tool_specs,
+                available_tools=available_tools or [],
+                transcript_text=evidence_text,
+            )
+            if d is None or d["signature"] in seen_sigs:
+                continue
+            seen_sigs.add(d["signature"])
+            diagnoses.append(str(d["text"]))
+
+    obs_lines: list[str] = []
+    seen: set = set()
+    for c in recent:
+        obs_list = c.get("observations")
+        if not isinstance(obs_list, list):
+            # Malformed scratchpad must not kill a run from inside a guard.
+            # Skipped, not swallowed: the nudge simply carries no observation
+            # echo, and the batch + count still reach the model.
+            continue
+        for o in obs_list:
+            if not isinstance(o, dict):
+                continue
+            ok = bool(o.get("success"))
+            text = str((o.get("output") if ok else (o.get("error") or o.get("output"))) or "").strip()
+            if len(text) > 800:
+                # 800, not 300: a tool's refusal often ENDS with the way out
+                # ("use read_file / web_search instead"), and clipping the
+                # advice out of the echo defeats the nudge. Long dumps are
+                # still bounded, and marked.
+                #[WARNING:TRUNCATION] bounded observation echo in the stuck nudge (full text stays in the transcript)
+                text = f"{text[:799]}… (truncated, {len(text):,} chars total — the full output is above in this conversation)"
+            line = f"- {str(o.get('name') or 'tool')}: {'ok' if ok else 'FAILED'} — {text or '(no output)'}"
+            if line in seen:
+                continue
+            seen.add(line)
+            obs_lines.append(line)
+    extra_obs = 0
+    if len(obs_lines) > 6:
+        extra_obs = len(obs_lines) - 6
+        obs_lines = obs_lines[:6]
+
+    shape = (
+        f"you proposed the EXACT SAME tool batch {span} times in a row"
+        if kind == "repeat"
+        else f"you alternated between the same two tool batches for {span} cycles"
+    )
+    parts = [
+        f"[loop guard] You are stuck: {shape}, and this last one was NOT executed.",
+        "",
+        "The batch you keep proposing:",
+    ]
+    parts.extend(f"- {sg}" for sg in (sigs or ["(unavailable)"]))
+    if diagnoses:
+        parts.append("")
+        parts.append("Why it keeps failing:")
+        parts.extend(diagnoses[:3])
+    elif obs_lines:
+        parts.append("")
+        parts.append("What it returned:")
+        parts.extend(obs_lines)
+        if extra_obs:
+            parts.append(f"- … and {extra_obs} more observation(s) of the same batch")
+    # NO UNPROVABLE CLAIMS. The first cut said "repeating it will not produce
+    # a different result", which is not something this guard can know — and
+    # for a poll-until-ready tool it is simply false. Live forensics
+    # (2026-08-21) caught a model weighing that sentence against its tool's
+    # own "poll again with the SAME job_id" and, correctly, believing the
+    # tool. State only what is true: the answers have been identical, and
+    # this loop has no wait in it.
+    lead = (
+        f"You have already received that same answer {span} times, and your calls are issued "
+        "back-to-back with no wait between them — an identical call now is answered from the "
+        "same state."
+        if verdict.get("answered")
+        else "That batch is not being executed any more."
+    )
+    parts.extend(
+        [
+            "",
+            f"{lead} Change strategy NOW — do exactly one of:",
+            "1) Use a DIFFERENT tool, or the same tool with materially different arguments, to reach the same goal.",
+            "2) If what you already have is enough, answer now with NO tool calls.",
+            "3) If you are WAITING on something external (a job, a build, a service that is down), STOP and say so "
+            "in your answer — repeating the call inside this turn does not make the wait shorter, and the operator "
+            "can re-run you later.",
+            "4) If the goal is unreachable with the tools available, say so plainly and give the best answer you can from the evidence.",
+        ]
+    )
+    parts.append("")
+    if remaining is not None and remaining > 0:
+        parts.append(
+            f"Do NOT propose that batch again: {remaining} more repetition(s) and this turn will be ended "
+            "for you and you will be forced to conclude with whatever you have."
+        )
+    else:
+        parts.append("Do NOT propose that batch again.")
+    return "\n".join(parts)
 
 
 _FINALISH_RE = re.compile(
@@ -568,6 +1043,54 @@ def _push_inbox(runtime_ns: Dict[str, Any], content: str) -> None:
         inbox = []
         runtime_ns["inbox"] = inbox
     inbox.append({"role": "system", "content": str(content or "")})
+
+
+# The operator's "wrap up now" arrives through the SAME durable lane as a
+# steer: `POST /commands {type: "conclude"}` -> gateway -> `Runtime.steer()`
+# -> steer sidecar -> the run's own tick drains it into `_runtime.inbox`
+# (exactly-once, watermarked, acked in the ledger). It is distinguished from
+# ordinary guidance by `kind` on the message, which the sidecar preserves
+# verbatim (`Runtime.steer` deep-copies the dict).
+#
+# Why a TYPED message and not just guidance text: every client must be able to
+# ask for this and get the same behaviour. Prose saying "please wrap up" is a
+# suggestion the model may ignore; this routes the loop into its existing
+# tool-free conclusion path, and the turn ends with the operator named as the
+# cause instead of a budget that was never spent.
+CONCLUDE_MESSAGE_KIND = "conclude"
+
+
+def _take_conclude_request(runtime_ns: Dict[str, Any]) -> Optional[str]:
+    """Remove any operator conclude request from the inbox; return its note.
+
+    Returns None when none is pending, or the operator's note (possibly an
+    empty string) when one is. Removed rather than left in place so the
+    directive is not also replayed as ordinary guidance.
+    """
+    if not isinstance(runtime_ns, dict):
+        return None
+    inbox = runtime_ns.get("inbox")
+    if not isinstance(inbox, list) or not inbox:
+        return None
+    note: Optional[str] = None
+    kept: list = []
+    for m in inbox:
+        if isinstance(m, dict) and str(m.get("kind") or "").strip().lower() == CONCLUDE_MESSAGE_KIND:
+            # Last one wins; every one is consumed. `note` is the OPERATOR's
+            # words: present-but-empty means they added nothing, and falling
+            # back to `content` there would quote the directive back to the
+            # model as if a human had typed it. `content` is used only when
+            # the sender declared no note key at all.
+            if "note" in m:
+                note = str(m.get("note") or "").strip()
+            else:
+                note = str(m.get("content") or "").strip()
+            continue
+        kept.append(m)
+    if note is None:
+        return None
+    runtime_ns["inbox"] = kept
+    return note
 
 
 def _drain_inbox(runtime_ns: Dict[str, Any]) -> str:
@@ -874,8 +1397,10 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
         # history keeps the record; report/output reflect the current turn.
         scratchpad.pop("review_skipped", None)
         # stuck_streak is per-turn verdict state (0017): a new turn starts
-        # with a clean slate exactly like the review bookkeeping.
+        # with a clean slate exactly like the review bookkeeping. The nudge
+        # ledger is the same class — a new turn earns its own nudge.
         scratchpad.pop("stuck_streak", None)
+        scratchpad.pop("stuck_nudged", None)
         # used_tools is the same per-turn latch class (wave-F P4): a toolless
         # turn 2 must not report turn 1's tool use.
         scratchpad["used_tools"] = False
@@ -1269,6 +1794,17 @@ def create_react_workflow(
         # drain point), so hook steer and gateway inject_guidance are one
         # mechanism observed by the same events.
         _fold_hook_steering(runtime_ns)
+        # OPERATOR CONCLUDE (2026-08-21). Checked BEFORE the guidance drain
+        # and before this iteration spends an LLM call: the operator asked for
+        # the best answer from what the run already has, so the honest thing
+        # is to stop reasoning now and go to the conclusion path the loop
+        # already owns.
+        conclude_note = _take_conclude_request(runtime_ns)
+        if conclude_note is not None:
+            scratchpad["concluded_by_operator"] = {"note": conclude_note, "cycle": iteration}
+            temp["conclude_note"] = conclude_note
+            emit("conclude_requested", {"cycle": iteration, "has_note": bool(conclude_note)})
+            return StepPlan(node_id="reason", next_node="max_iterations")
         guidance = _drain_inbox(runtime_ns)
         if guidance:
             # Drained guidance joins the durable transcript as a user interjection (maintainer
@@ -1531,25 +2067,188 @@ def create_react_workflow(
             # batches; read-only repeats used to spin until max_iterations).
             # `_runtime.stuck_streak_threshold`: 0/negative disables; absent
             # = 3; unparseable falls to the default.
+            #
+            # NUDGE-THEN-STOP (operator directive, 2026-08-21). The first
+            # detection used to END the turn, so the loop was named to the
+            # model only in the conclusion prompt — after its last chance to
+            # act on it. It now costs a nudge first: the batch, the count, the
+            # observations it keeps getting back, and what will happen if it
+            # does it again. The turn is ended only when the model repeats the
+            # pattern anyway.
+            #
+            # ESCALATION COUNTS DETECTIONS, NOT THE TRAILING SPAN. The first
+            # cut of this policy stopped at `nudge_span + 2`, and the trailing
+            # span is trivially resettable: a model that slips ONE different
+            # batch between repeats (A-A-A-B-A-A-A-B…) keeps the span pinned
+            # at 3 forever — adversarial review reproduced six such rounds:
+            # five nudges, no stop, the turn died on max_iterations with NO
+            # `conclusion_forced`, so the operator got the misleading "raise
+            # the budget" card this whole change exists to kill. A pattern's
+            # own detection count cannot be reset that way.
+            #
+            # `_runtime.stuck_streak_hard_threshold`:
+            #   absent      = default — stop on the pattern's 3rd detection
+            #                 (nudged once, ignored twice = the operator's
+            #                 X+2; for an uninterrupted repeat that is still
+            #                 exactly span 5 with the default threshold 3).
+            #   0/negative  = never hard-stop: nudge only, `max_iterations`
+            #                 is the real backstop.
+            #   >= 2        = ALSO stop as soon as the trailing span reaches
+            #                 this number (set it equal to
+            #                 `stuck_streak_threshold` to restore the
+            #                 pre-2026-08-21 stop-on-first-detection).
+            #
+            # `_runtime.stuck_nudge_max_per_turn` (default 3, <=0 disables):
+            # the cap for DISTINCT patterns. Argument drift (a retry carrying
+            # a fresh id) mints a new pattern key every time, so per-pattern
+            # counting alone never escalates — adversarial review drove 8
+            # nudges and 0 stops that way. After this many distinct nudges in
+            # one turn, the next stuck pattern ends the turn instead.
             try:
                 raw_thresh = runtime_ns.get("stuck_streak_threshold") if isinstance(runtime_ns, dict) else None
                 streak_threshold = 3 if raw_thresh is None else int(raw_thresh)
             except (TypeError, ValueError):
                 streak_threshold = 3
+            try:
+                raw_hard = runtime_ns.get("stuck_streak_hard_threshold") if isinstance(runtime_ns, dict) else None
+                hard_threshold = None if raw_hard is None else int(raw_hard)
+            except (TypeError, ValueError):
+                hard_threshold = None
+            try:
+                raw_cap = runtime_ns.get("stuck_nudge_max_per_turn") if isinstance(runtime_ns, dict) else None
+                max_nudges_per_turn = 3 if raw_cap is None else int(raw_cap)
+            except (TypeError, ValueError):
+                max_nudges_per_turn = 3
+            # A repeat whose every answer was an ERROR trips one repeat
+            # earlier: observe_node already handed the model a diagnosis of
+            # that exact failure (arguments, cause, alternative), so a second
+            # identical batch is a model ignoring an explanation, not a model
+            # that lacks one. Ambiguous or succeeding repeats keep the
+            # 3-strike threshold.
+            try:
+                raw_fail = runtime_ns.get("stuck_streak_failing_threshold") if isinstance(runtime_ns, dict) else None
+                failing_threshold = 2 if raw_fail is None else int(raw_fail)
+            except (TypeError, ValueError):
+                failing_threshold = 2
+            failing_threshold = max(2, failing_threshold)
             if streak_threshold >= 2:
                 turn_fence_raw = scratchpad.get("turn_first_cycle")
+                turn_fence = max(0, turn_fence_raw) if isinstance(turn_fence_raw, int) else 0
                 verdict = _repeat_streak_verdict(
                     scratchpad.get("cycles"),
-                    turn_fence=max(0, turn_fence_raw) if isinstance(turn_fence_raw, int) else 0,
-                    threshold=streak_threshold,
+                    turn_fence=turn_fence,
+                    # Scan at the LOWER of the two thresholds; the applicable
+                    # one is chosen below once the streak's failure class is
+                    # known.
+                    threshold=min(streak_threshold, failing_threshold),
+                    # An operator-set span threshold must be REACHABLE: the
+                    # scan stops collecting at `max_span`, so a
+                    # `stuck_streak_hard_threshold` of 100 against the default
+                    # depth of 24 could never fire (adversary: the nudge even
+                    # promised "97 more repetitions" that would never arrive).
+                    max_span=max(24, hard_threshold or 0),
                 )
                 if verdict is not None:
-                    scratchpad["stuck_streak"] = {**verdict, "cycle": cycle_i}
-                    # The hook event (0017's observability half): hosts see the
-                    # verdict the moment it forces the conclusion.
-                    emit("stuck_streak", {**verdict, "cycle": cycle_i})
+                    applicable = failing_threshold if verdict.get("failed") else streak_threshold
+                    if int(verdict.get("span") or 0) < applicable and verdict.get("kind") == "repeat":
+                        verdict = None
+                if verdict is not None:
+                    key = str(verdict.get("key") or "")
+                    span = int(verdict.get("span") or 0)
+                    nudged = scratchpad.get("stuck_nudged")
+                    if not isinstance(nudged, dict):
+                        nudged = {}
+                    prior = nudged.get(key)
+                    prior = prior if isinstance(prior, dict) else None
+                    hits = (int(prior.get("hits") or 0) if prior else 0) + 1
+                    already_nudged = prior is not None
+
+                    if hard_threshold is not None and hard_threshold <= 0:
+                        hard_span: Optional[int] = None
+                        hard_hits: Optional[int] = None
+                    elif hard_threshold is not None:
+                        # An explicit number means BOTH doors: the pattern may
+                        # run that many trailing cycles, or be caught that many
+                        # times — whichever comes first. Span alone would leave
+                        # the interleave evasion open at every setting.
+                        hard_span = max(2, hard_threshold)
+                        hard_hits = max(2, hard_threshold)
+                    else:
+                        hard_span = None
+                        hard_hits = 3  # nudged once, ignored twice
+
+                    stop = False
+                    if hard_hits is not None:
+                        if hits >= hard_hits:
+                            stop = True
+                        elif hard_span is not None and span >= hard_span:
+                            stop = True
+                        elif (
+                            not already_nudged
+                            and max_nudges_per_turn > 0
+                            and len(nudged) >= max_nudges_per_turn
+                        ):
+                            # A NEW pattern, and this turn has already spent
+                            # its nudges on others. Drifting arguments are not
+                            # a fresh chance, they are the same failure wearing
+                            # a new key.
+                            stop = True
+
+                    if stop:
+                        # It was told, and did it anyway. End the turn exactly
+                        # as before — the conclusion path is unchanged.
+                        scratchpad["stuck_streak"] = {
+                            **verdict,
+                            "cycle": cycle_i,
+                            "hits": hits,
+                            "nudged": already_nudged,
+                        }
+                        emit(
+                            "stuck_streak",
+                            {
+                                **verdict,
+                                "cycle": cycle_i,
+                                "action": "stopped",
+                                "hits": hits,
+                                "nudged": already_nudged,
+                            },
+                        )
+                        temp["pending_tool_calls"] = []
+                        return StepPlan(node_id="parse", next_node="max_iterations")
+
+                    nudged[key] = {"span": span, "hits": hits}
+                    scratchpad["stuck_nudged"] = nudged
+                    if not already_nudged:
+                        remaining = (hard_hits - hits) if hard_hits is not None else None
+                        _push_inbox(
+                            runtime_ns,
+                            _stuck_nudge_message(
+                                scratchpad.get("cycles"),
+                                verdict=verdict,
+                                turn_fence=turn_fence,
+                                remaining=remaining,
+                                suppressed=suppress_loop_tail(runtime_ns),
+                                tool_specs=getattr(logic, "tools", None),
+                                available_tools=_tool_names_of(logic),
+                                evidence_text=_evidence_text(context),
+                            ),
+                        )
+                        emit("stuck_streak", {**verdict, "cycle": cycle_i, "action": "nudged", "hits": hits})
+                    else:
+                        # Already nudged for THIS pattern and not yet at the
+                        # stop: keep the loop honest (do not execute the batch
+                        # again) but do not repeat the nudge.
+                        emit(
+                            "stuck_streak",
+                            {**verdict, "cycle": cycle_i, "action": "repeat_after_nudge", "hits": hits},
+                        )
+
+                    # The proposed batch is recorded but NOT executed, and the
+                    # cycle is marked so the guard below still judges against
+                    # cycles whose observations are real (0029 #7).
+                    cycle["repeat_skipped"] = True
                     temp["pending_tool_calls"] = []
-                    return StepPlan(node_id="parse", next_node="max_iterations")
+                    return StepPlan(node_id="parse", next_node="reason")
 
             # Loop guard: some models may repeat the exact same tool calls (including side effects)
             # even after receiving successful observations. Skip executing duplicates to avoid
@@ -1636,6 +2335,30 @@ def create_react_workflow(
                             cycle["repeat_skipped"] = True
                             temp["pending_tool_calls"] = []
                             return StepPlan(node_id="parse", next_node="reason")
+            except Exception:
+                pass
+
+            try:
+                read_hint = detect_nearby_same_file_staircase(
+                    scratchpad.get("last_successful_read_batch"),
+                    tool_calls,
+                    previously_warned_signature=str(scratchpad.get("read_orchestration_last_hint") or ""),
+                )
+                if read_hint is None:
+                    read_hint = detect_redundant_same_file_full_reread(
+                        scratchpad.get("last_successful_read_batch"),
+                        tool_calls,
+                        previously_warned_signature=str(scratchpad.get("read_orchestration_last_hint") or ""),
+                    )
+                if read_hint is not None:
+                    _push_inbox(runtime_ns, str(read_hint.get("message") or ""))
+                    scratchpad["read_orchestration_last_hint"] = str(read_hint.get("signature") or "")
+                    emit(
+                        "parse_read_orchestration_hint",
+                        {"cycle": cycle_i, "path": read_hint.get("path"), "mode": str(read_hint.get("mode") or "read_orchestration")},
+                    )
+                    temp["pending_tool_calls"] = []
+                    return StepPlan(node_id="parse", next_node="reason")
             except Exception:
                 pass
 
@@ -2200,6 +2923,7 @@ def create_react_workflow(
         # genuinely later identical batch gets a fresh seq (re-executes).
         act_seq = int(scratchpad.get("act_seq") or 0) + 1
         scratchpad["act_seq"] = act_seq
+        temp["current_tool_batch"] = list(formatted_calls)
 
         return StepPlan(
             node_id="act",
@@ -2212,7 +2936,7 @@ def create_react_workflow(
         )
 
     def observe_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, _, temp, _ = ensure_react_vars(run)
+        context, scratchpad, runtime_ns, temp, _ = ensure_react_vars(run)
         tool_results = temp.get("tool_results", {})
         if not isinstance(tool_results, dict):
             tool_results = {}
@@ -2234,6 +2958,18 @@ def create_react_workflow(
             # activity, which resets legitimately.
             if not temp.get("review_forced_batch"):
                 scratchpad["review_count"] = 0
+
+        read_batch = advance_last_successful_read_batch(
+            scratchpad.get("last_successful_read_batch"),
+            temp.get("current_tool_batch"),
+            results,
+        )
+        if read_batch is not None:
+            scratchpad["last_successful_read_batch"] = read_batch
+        else:
+            scratchpad.pop("last_successful_read_batch", None)
+        scratchpad.pop("read_orchestration_last_hint", None)
+        temp.pop("current_tool_batch", None)
 
         # Attach observations to the most recent cycle.
         cycles = scratchpad.get("cycles")
@@ -2262,6 +2998,10 @@ def create_react_workflow(
         obs_list: list[dict[str, Any]] = []
         ran_names: list[str] = []
         captured_media: list[Any] = []
+        # Captured BEFORE this batch's own tool messages are appended below: a
+        # failing call's error text usually echoes the very argument that was
+        # wrong, and an echo must never count as the value's provenance.
+        evidence_before_batch = _evidence_text(context)
         for r in results:
             if not isinstance(r, dict):
                 continue
@@ -2314,6 +3054,90 @@ def create_react_workflow(
                     "rendered": rendered,
                 }
             )
+
+        # FIRST-FAILURE DIAGNOSIS (operator directive, 2026-08-21). The loop
+        # used to say nothing when a call failed, and only scolded the model
+        # once it had failed the SAME way three times — by which point three
+        # iterations were gone and the message still named no parameter, no
+        # cause and no alternative. A failure the model can diagnose is a
+        # failure it can fix on the next cycle, so the diagnosis rides the
+        # FIRST one. Nothing is invented: the call's own arguments, the
+        # verbatim error, this run's toolset, and what the environment has
+        # actually said. `diagnose_tool_failure` returns None rather than pad.
+        try:
+            sent = scratchpad.get("tool_hint_sigs")
+            if not isinstance(sent, list):
+                sent = []
+            fresh: list[dict[str, str]] = []
+            skipped_dupes = 0
+            tool_names_here = _tool_names_of(logic)
+            for o in obs_list:
+                out = o.get("output")
+                err_text = str(o.get("error") or "")
+                if o.get("success") is True:
+                    # `success: True` with an error sentence in the body is
+                    # how a large share of this framework's tools report
+                    # failure (abstractcore's common_tools return
+                    # "Error: File ... does not exist" as a plain string).
+                    body = out if isinstance(out, str) else str(o.get("rendered") or "")
+                    if not output_reads_as_error(body):
+                        continue
+                    if not err_text:
+                        err_text = body
+                if isinstance(out, dict):
+                    rendered_err = str(out.get("rendered") or "")
+                    if rendered_err:
+                        err_text = rendered_err
+                elif isinstance(out, str) and out.strip() and not err_text:
+                    err_text = out
+                call_args = {}
+                for tc in (temp.get("current_tool_batch") or []) if isinstance(temp.get("current_tool_batch"), list) else []:
+                    if isinstance(tc, dict) and tc.get("call_id") == o.get("call_id"):
+                        call_args = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
+                        break
+                if not call_args and isinstance(last_cycle, dict):
+                    for tc in last_cycle.get("tool_calls") or []:
+                        if isinstance(tc, dict) and tc.get("call_id") == o.get("call_id"):
+                            call_args = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
+                            break
+                d = diagnose_tool_failure(
+                    name=str(o.get("name") or ""),
+                    arguments=call_args,
+                    error_text=err_text,
+                    tool_specs=getattr(logic, "tools", None),
+                    available_tools=tool_names_here,
+                    transcript_text=evidence_before_batch,
+                )
+                if d is None:
+                    continue
+                if d["signature"] in sent:
+                    skipped_dupes += 1
+                    continue
+                sent.append(d["signature"])
+                fresh.append(d)
+            if fresh:
+                scratchpad["tool_hint_sigs"] = sent
+                #[WARNING:TRUNCATION] at most 3 diagnoses ride one hint block; the remainder is COUNTED below, never dropped silently
+                block = render_hint_block(fresh[:3])
+                if len(fresh) > 3:
+                    block += f"\n- … and {len(fresh) - 3} further distinct failure(s) in this batch."
+                if skipped_dupes:
+                    block += (
+                        f"\nYou have now hit {skipped_dupes} failure(s) already diagnosed for you earlier "
+                        "in this turn — that diagnosis has not changed."
+                    )
+                if block:
+                    _push_inbox(runtime_ns, block)
+                    emit(
+                        "tool_failure_hint",
+                        {
+                            "count": len(fresh),
+                            "classes": [d["class"] for d in fresh],
+                            "tools": [str(o.get("name") or "") for o in obs_list if o.get("success") is not True][:6],
+                        },
+                    )
+        except Exception as exc:  # never let a HINT break a run
+            emit("tool_failure_hint_error", {"error": f"{type(exc).__name__}: {exc}"})
 
         # Export executed tool names into the turn-capture contract (c2447 F3):
         # the visit workflow's HARVEST folds `turn_captures.tools_ran` into the
@@ -2399,8 +3223,11 @@ def create_react_workflow(
         scratchpad.pop("review_skipped", None)
         # stuck_streak verdict state is per-interaction too (0017): the user's
         # reply may redirect the work — stale verdicts must not force a later
-        # conclusion.
+        # conclusion, and a stale nudge must not consume the next turn's.
         scratchpad.pop("stuck_streak", None)
+        scratchpad.pop("stuck_nudged", None)
+        scratchpad.pop("last_successful_read_batch", None)
+        scratchpad.pop("read_orchestration_last_hint", None)
         temp.pop("max_iterations_announced", None)
         # A user interaction starts a genuinely new claim — the forced-batch
         # marker must not survive it (an ask_user inside a forced batch would
@@ -2695,6 +3522,12 @@ def create_react_workflow(
             # stream and output.
             "outcome": "final_answer",
             "review_skipped": bool(scratchpad.get("review_skipped")),
+            # Host-facing verdict (2026-08-21). Thin clients render these; they
+            # do not re-derive them. See `_stop_reason`.
+            "stop_reason": _stop_reason(
+                code="final_answer", finished=True, budget_exhausted=False, iterations=iterations
+            ),
+            "notices": _turn_notices(scratchpad),
         }
         if final_next_node:
             # Composition handoff (visit TURN chain): the turn is finished but the RUN
@@ -2743,13 +3576,37 @@ def create_react_workflow(
             # wrap-up line with NO loop vocabulary and NO scratchpad dump
             # (the visit transcript already carries everything durable).
             _suppress_chrome = suppress_loop_tail(runtime_ns)
+            _operator_note = temp.get("conclude_note")
+            _by_operator = isinstance(scratchpad.get("concluded_by_operator"), dict)
             # Stuck-streak forcing (0017): the conclusion carries the NAMED
             # reason in the task lane so the synthesis addresses the loop
             # honestly. The visit-lane directive stays byte-unchanged (loop
             # vocabulary is the c2447 chrome class); the machine surfaces
             # (stuck_streak emit + terminal output key) name it in both lanes.
             _stuck = scratchpad.get("stuck_streak") if isinstance(scratchpad.get("stuck_streak"), dict) else None
-            if _suppress_chrome:
+            if _by_operator and not _suppress_chrome:
+                # The OPERATOR asked for this, mid-run, from whichever client
+                # they had open. Say so plainly: the model is not being
+                # punished for looping, it is being asked to land what it has.
+                _note_line = (
+                    f"\n\nThey added: {str(_operator_note).strip()}\n"
+                    if isinstance(_operator_note, str) and str(_operator_note).strip()
+                    else "\n"
+                )
+                conclude_directive = (
+                    "The operator has asked you to CONCLUDE NOW, on the basis of everything you "
+                    f"have done so far.{_note_line}"
+                    "\nStop using tools and answer with what you already have.\n\n"
+                    "In your response, include:\n"
+                    "1) The best answer you can give from the evidence gathered.\n"
+                    "2) What you completed, briefly.\n"
+                    "3) What remains unfinished, and the exact next steps to finish it.\n\n"
+                    "Rules:\n"
+                    "- Do NOT call tools.\n"
+                    "- Do NOT output tool-call markup (e.g. <tool_call>...</tool_call>).\n"
+                    "- Do not pretend the remaining work is done."
+                )
+            elif _suppress_chrome:
                 conclude_directive = (
                     "Please bring your reply to a close now: do not use tools "
                     "or tool-call markup — give your best answer from what you "
@@ -2971,10 +3828,25 @@ def create_react_workflow(
             # true cause in the ADDITIVE key below (0017: named, never silent).
             "outcome": "iteration_budget",
             "review_skipped": bool(scratchpad.get("review_skipped")),
+            "notices": _turn_notices(scratchpad),
         }
         _stuck_out = scratchpad.get("stuck_streak")
         if isinstance(_stuck_out, dict):
             output["conclusion_forced"] = dict(_stuck_out)
+        # Authored HERE, where the ceiling, the spend, the forcing and the
+        # nudge are all known — never in a host.
+        _by_op = scratchpad.get("concluded_by_operator")
+        if isinstance(_by_op, dict):
+            output["concluded_by_operator"] = dict(_by_op)
+        output["stop_reason"] = _stop_reason(
+            code="iteration_budget",
+            finished=False,
+            budget_exhausted=not isinstance(_stuck_out, dict) and not isinstance(_by_op, dict),
+            iterations=iterations,
+            forced=_stuck_out if isinstance(_stuck_out, dict) else None,
+            max_iterations=max_iterations,
+            by_operator=_by_op if isinstance(_by_op, dict) else None,
+        )
         # The turn ends HERE (0028 multi-emit fix): one turn_end per turn.
         emit("max_iterations", {"iterations": max_iterations, "outcome": "iteration_budget"})
         if final_next_node:

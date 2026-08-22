@@ -113,11 +113,15 @@ def _summarize_tool_usage(events: List[ToolCallEvent]) -> Dict[str, Any]:
     tool_counts: Dict[str, int] = {}
     full_reads = 0
     sliced_reads = 0
+    search_files_calls = 0
+    search_after_full_read_calls = 0
+    full_file_rereads_after_full_read = 0
     repeated_calls: Dict[str, int] = {}
     edit_pattern_sizes: List[int] = []
     failures: Dict[str, int] = {}
 
     seen_call_keys: Dict[str, int] = {}
+    seen_full_read_paths: Dict[str, int] = {}
 
     for e in events:
         tool_counts[e.name] = tool_counts.get(e.name, 0) + 1
@@ -128,6 +132,7 @@ def _summarize_tool_usage(events: List[ToolCallEvent]) -> Dict[str, Any]:
         seen_call_keys[key] = seen_call_keys.get(key, 0) + 1
 
         if e.name == "read_file":
+            path = e.arguments.get("path") if isinstance(e.arguments.get("path"), str) else e.arguments.get("file_path")
             should_entire = e.arguments.get("should_read_entire_file", True)
             start = (
                 e.arguments.get("start_line")
@@ -149,6 +154,16 @@ def _summarize_tool_usage(events: List[ToolCallEvent]) -> Dict[str, Any]:
                 sliced_reads += 1
             else:
                 full_reads += 1
+                if isinstance(path, str) and path:
+                    prior = seen_full_read_paths.get(path, 0)
+                    if prior > 0:
+                        full_file_rereads_after_full_read += 1
+                    seen_full_read_paths[path] = prior + 1
+
+        if e.name == "search_files":
+            search_files_calls += 1
+            if seen_full_read_paths:
+                search_after_full_read_calls += 1
 
         if e.name == "edit_file":
             pattern = e.arguments.get("pattern")
@@ -164,6 +179,9 @@ def _summarize_tool_usage(events: List[ToolCallEvent]) -> Dict[str, Any]:
         "failures": dict(sorted(failures.items(), key=lambda kv: (-kv[1], kv[0]))),
         "read_file_full": full_reads,
         "read_file_sliced": sliced_reads,
+        "search_files_calls": search_files_calls,
+        "search_after_full_read_calls": search_after_full_read_calls,
+        "full_file_rereads_after_full_read": full_file_rereads_after_full_read,
         "repeated_calls": dict(sorted(repeated_calls.items(), key=lambda kv: (-kv[1], kv[0]))),
         "edit_pattern_sizes": {
             "count": len(edit_pattern_sizes),
@@ -302,6 +320,40 @@ def _make_js_scenario() -> Scenario:
     return Scenario(name="js_reference_error", build=build, prompt=prompt, verify=verify)
 
 
+def _make_js_clustered_region_scenario() -> Scenario:
+    def build(root: Path) -> Dict[str, Any]:
+        path = root / "game.js"
+        prefix_filler = "\n".join([f"// prelude filler {i}" for i in range(1, 430)])
+        suffix_filler = "\n".join([f"// tail filler {i}" for i in range(1, 430)])
+        cluster = "\n".join(
+            [
+                "const REGION_CLUSTER = {",
+                '  meadow: { label: "MEADOW_EAST", fact: "Iris tends the sunflower arch." },',
+                '  forest: { label: "FOREST_GHOST", fact: "The ghost circles a moss lantern." },',
+                '  river: { label: "RIVER_FISHER", fact: "Old Tomas keeps a silver hook." },',
+                "};",
+            ]
+        )
+        path.write_text("\n".join([prefix_filler, cluster, suffix_filler, "export default REGION_CLUSTER;"]), encoding="utf-8")
+        return {"file_path": str(path)}
+
+    def prompt(ctx: Dict[str, Any]) -> str:
+        return (
+            f"Inspect `{ctx['file_path']}` and return three nearby facts from the clustered meadow/forest/river region.\n\n"
+            "Use these exact headings in the answer:\n"
+            "MEADOW_EAST\n"
+            "FOREST_GHOST\n"
+            "RIVER_FISHER\n\n"
+            "The headings are only output labels. Read the file and extract the facts from the file contents."
+        )
+
+    def verify(ctx: Dict[str, Any]) -> Tuple[bool, str]:
+        del ctx
+        return True, "Read-quality scenario is measurement-oriented; verify through tool metrics and answer inspection."
+
+    return Scenario(name="js_clustered_region_read_quality", build=build, prompt=prompt, verify=verify)
+
+
 def _print_heading(title: str) -> None:
     print("\n" + "=" * 80)
     print(title)
@@ -422,7 +474,7 @@ def _run_scenarios(*, scenarios: List[Scenario]) -> int:
 
 
 def main() -> int:
-    scenarios = [_make_python_scenario(), _make_js_scenario()]
+    scenarios = [_make_python_scenario(), _make_js_scenario(), _make_js_clustered_region_scenario()]
     return _run_scenarios(scenarios=scenarios)
 
 

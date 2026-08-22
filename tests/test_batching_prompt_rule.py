@@ -50,3 +50,9 @@ def test_blanket_rule_is_gone(logic_cls) -> None:
 def test_codeact_bans_its_own_executor_by_name() -> None:
     prompt = _system_prompt(CodeActLogic)
     assert "execute_python" in prompt
+
+
+@pytest.mark.parametrize("logic_cls", [ReActLogic, CodeActLogic, MemActLogic], ids=["react", "codeact", "memact"])
+def test_nearby_same_file_reads_prefer_one_wider_range(logic_cls) -> None:
+    prompt = _system_prompt(logic_cls)
+    assert "prefer ONE call with a wider range" in prompt

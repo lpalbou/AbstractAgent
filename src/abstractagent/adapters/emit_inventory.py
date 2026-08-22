@@ -77,10 +77,26 @@ REACT_STEPS = COMMON_STEPS | frozenset(
         "parse_retry_empty",
         "parse_retry_plan_only",
         "parse_retry_truncated",
-        # 0017 work half (2026-07-21): fires once when a consecutive-identical
-        # or A-B-A-B tool-batch streak forces the conclusion path; payload
-        # {kind: repeat|oscillation, span, cycle}.
+        # 0017 work half (2026-07-21), nudge-then-stop (2026-08-21): fires on
+        # every detection of a consecutive-identical or A-B-A-B tool-batch
+        # streak; payload {kind: repeat|oscillation, span, key, answered,
+        # cycle, hits, action: nudged|repeat_after_nudge|stopped}. Only
+        # `stopped` ends the turn.
         "stuck_streak",
+        # First-failure diagnosis (2026-08-21): a failed tool call was
+        # explained back to the model with its own arguments, the verbatim
+        # error, the likely cause and a concrete alternative — payload
+        # {count, classes, tools}. `tool_failure_hint_error` reports that the
+        # hint builder itself raised (the hint is skipped, the run continues;
+        # never silent).
+        "tool_failure_hint",
+        "tool_failure_hint_error",
+        # Operator conclude (2026-08-21): `POST /commands {type:"conclude"}`
+        # reached this run and the loop is going to its conclusion path
+        # instead of spending another iteration — payload {cycle, has_note}.
+        # The turn ends with `stop_reason.code = "operator_conclude"`, which
+        # is neither a failure nor a budget stop.
+        "conclude_requested",
         # Sight lane (c3969 shape A / c4089 ruling, 2026-07-21): a successful
         # tool result DECLARED media refs on its output dict — payload
         # {tool, count, call_id}. Fires at CAPTURE time; refs that survive

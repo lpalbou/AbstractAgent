@@ -194,6 +194,37 @@ same args, three consecutive) trips the 0017 stuck-streak guard like any
 other repeated batch — interleaved distinct work never counts, and hosts
 running deliberate watch loops own `_runtime.stuck_streak_threshold`.
 
+**Tool failures are explained back to the model on the FIRST one**
+(2026-08-21). When a call fails, `observe` is followed by
+`tool_failure_hint` (`{count, classes, tools}`) and the loop's inbox carries a
+diagnosis built only from information the run already holds: the call's own
+arguments, the verbatim error, the classified cause, and a concrete
+alternative drawn from THIS run's toolset. One diagnosis per distinct
+(tool, error-class, arguments) signature per turn; a repeat of an
+already-diagnosed failure is counted back to the model rather than restated.
+`tool_failure_hint_error` fires if the hint builder itself raises — the hint
+is skipped and the run continues, never silently.
+
+**The operator can end a turn well, from any client.**
+`POST /commands {type: "conclude", run_id}` rides the same durable lane as a
+steer (gateway → `Runtime.steer()` → steer sidecar → the run's own tick drains
+it into `_runtime.inbox`, watermarked and acked with `abstract.steer_seen`),
+carrying `kind: "conclude"` on the message. At its next boundary — BEFORE
+spending another LLM call — the loop emits `conclude_requested`
+(`{cycle, has_note}`) and routes into the conclusion path it already owns:
+tool-free, "answer with what you have, say what remains". The turn ends with
+`stop_reason.code = "operator_conclude"` and `budget_exhausted: false` — not a
+failure, not a truncation the agent caused. An optional `payload.note` is
+quoted to the model verbatim.
+
+The stuck-streak guard (0017) sits BEHIND that: it now fires on every
+detection with `action: nudged | repeat_after_nudge | stopped`, and only
+`stopped` ends the turn. A repeat whose answers all FAILED trips at 2
+identical batches (the model has already been given a diagnosis and ignored
+it); any other repeat trips at `_runtime.stuck_streak_threshold` (default 3).
+A repeat whose answers CHANGE is not a streak at all — a poll reporting
+10%, then 45%, then 80% is progress, not a loop.
+
 Budget exhaustion emits exactly ONCE per turn (0028 multi-emit fix): ReAct's
 conclusion node announces `max_iterations_reached` at first entry (before the
 conclusion call's latency) and fires `max_iterations` (canonical `turn_end`,

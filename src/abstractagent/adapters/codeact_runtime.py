@@ -30,6 +30,11 @@ from .generation_params import (
 from .media import extract_media_from_context
 from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, parse_content_preview, sanitize_transcript_messages
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
+from .read_orchestration import (
+    advance_last_successful_read_batch,
+    detect_nearby_same_file_staircase,
+    detect_redundant_same_file_full_reread,
+)
 from .tool_allowlist import note_pruned_grants
 from ..logic.codeact import CodeActLogic
 
@@ -76,6 +81,16 @@ def _new_assistant_message_with_tool_calls(
     if tc_payload:
         msg["tool_calls"] = tc_payload
     return msg
+
+
+def _push_inbox(runtime_ns: Dict[str, Any], content: str) -> None:
+    if not isinstance(runtime_ns, dict):
+        return
+    inbox = runtime_ns.get("inbox")
+    if not isinstance(inbox, list):
+        inbox = []
+        runtime_ns["inbox"] = inbox
+    inbox.append({"role": "system", "content": str(content or "")})
 
 
 def ensure_codeact_vars(run: RunState) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
@@ -685,6 +700,29 @@ def create_codeact_workflow(
         emit("parse", parse_payload)
 
         if tool_calls:
+            try:
+                read_hint = detect_nearby_same_file_staircase(
+                    scratchpad.get("last_successful_read_batch"),
+                    tool_calls,
+                    previously_warned_signature=str(scratchpad.get("read_orchestration_last_hint") or ""),
+                )
+                if read_hint is None:
+                    read_hint = detect_redundant_same_file_full_reread(
+                        scratchpad.get("last_successful_read_batch"),
+                        tool_calls,
+                        previously_warned_signature=str(scratchpad.get("read_orchestration_last_hint") or ""),
+                    )
+                if read_hint is not None:
+                    _push_inbox(runtime_ns, str(read_hint.get("message") or ""))
+                    scratchpad["read_orchestration_last_hint"] = str(read_hint.get("signature") or "")
+                    emit(
+                        "parse_read_orchestration_hint",
+                        {"path": read_hint.get("path"), "mode": str(read_hint.get("mode") or "read_orchestration")},
+                    )
+                    temp["pending_tool_calls"] = []
+                    return StepPlan(node_id="parse", next_node="reason")
+            except Exception:
+                pass
             # A non-empty reply ends the CONSECUTIVE-empty streak (fable5 P1
             # 2026-07-13: without the reset, two recovered empties early in a
             # run made every LATER single empty reply skip its retries and end
@@ -1206,6 +1244,7 @@ def create_codeact_workflow(
         scratchpad_ns = run.vars.get("scratchpad") if isinstance(run.vars.get("scratchpad"), dict) else {}
         act_seq = int(scratchpad_ns.get("act_seq") or 0) + 1
         scratchpad_ns["act_seq"] = act_seq
+        temp["current_tool_batch"] = list(formatted_calls)
 
         return StepPlan(
             node_id="act",
@@ -1236,6 +1275,13 @@ def create_codeact_workflow(
         # second run replayed the first run's ledger result.
         act_seq = int(scratchpad.get("act_seq") or 0) + 1
         scratchpad["act_seq"] = act_seq
+        temp["current_tool_batch"] = [
+            {
+                "name": "execute_python",
+                "arguments": {"code": code},
+                "call_id": "code",
+            }
+        ]
 
         return StepPlan(
             node_id="execute_code",
@@ -1266,6 +1312,18 @@ def create_codeact_workflow(
         results = tool_results.get("results", [])
         if not isinstance(results, list):
             results = []
+
+        read_batch = advance_last_successful_read_batch(
+            scratchpad.get("last_successful_read_batch"),
+            temp.get("current_tool_batch"),
+            results,
+        )
+        if read_batch is not None:
+            scratchpad["last_successful_read_batch"] = read_batch
+        else:
+            scratchpad.pop("last_successful_read_batch", None)
+        scratchpad.pop("read_orchestration_last_hint", None)
+        temp.pop("current_tool_batch", None)
 
         for r in results:
             if not isinstance(r, dict):
@@ -1338,6 +1396,8 @@ def create_codeact_workflow(
         # symmetry with ReAct, 2026-07-14): stale prior-turn review skips must
         # not pollute the next turn's output; ledger/emits keep the history.
         scratchpad.pop("review_skipped", None)
+        scratchpad.pop("last_successful_read_batch", None)
+        scratchpad.pop("read_orchestration_last_hint", None)
         # Forced-batch marker must not survive a user interaction (ReAct symmetry).
         temp.pop("review_forced_batch", None)
 
