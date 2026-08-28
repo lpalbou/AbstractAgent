@@ -1907,6 +1907,35 @@ def create_react_workflow(
         tail_parts: list[str] = []
         if not suppress_loop_tail(runtime_ns):
             tail_parts.append(f"[loop] iteration {int(iteration)} of {int(max_iterations)}.")
+            # BUDGET-AWARE TRIAGE (2026-08-22). The position line alone is not a
+            # steer: run 9ea71c55 read "[loop] iteration 19 of 20" and spent 19
+            # AND 20 on further diagnosis, ending with a correct one-character
+            # diagnosis it never applied. `_limits.warn_iterations_pct` (80 by
+            # default) already declares where "nearly out" begins — it just had
+            # no behavioural consequence. Say the remaining count plainly and
+            # ask for the landing, not more looking.
+            remaining = int(max_iterations) - int(iteration)
+            try:
+                _warn_pct = int(limits.get("warn_iterations_pct", 80))
+            except (TypeError, ValueError):
+                _warn_pct = 80
+            if 0 < _warn_pct <= 100 and int(max_iterations) > 0:
+                _warn_at = (int(max_iterations) * _warn_pct + 99) // 100
+                if int(iteration) >= _warn_at:
+                    if remaining <= 0:
+                        tail_parts.append(
+                            "[budget] This is your LAST iteration. Do not start new "
+                            "investigation. Apply the smallest change that makes real "
+                            "progress, or state your best answer now."
+                        )
+                    else:
+                        tail_parts.append(
+                            f"[budget] {remaining} iteration(s) left, then the turn ENDS "
+                            "whether or not the work is done.\n"
+                            "Prefer landing a change you can already justify over "
+                            "confirming a diagnosis you already have. If you know the fix, "
+                            "apply it now and verify with what remains."
+                        )
             plan_text = scratchpad.get("plan") if isinstance(scratchpad, dict) else None
             if isinstance(plan_text, str) and plan_text.strip():
                 # ADR-0026 (2026-08-02 purge): the plan the model wrote for ITSELF
@@ -2355,10 +2384,26 @@ def create_react_workflow(
                     scratchpad["read_orchestration_last_hint"] = str(read_hint.get("signature") or "")
                     emit(
                         "parse_read_orchestration_hint",
-                        {"cycle": cycle_i, "path": read_hint.get("path"), "mode": str(read_hint.get("mode") or "read_orchestration")},
+                        {
+                            "cycle": cycle_i,
+                            "path": read_hint.get("path"),
+                            "mode": str(read_hint.get("mode") or "read_orchestration"),
+                            "enforcement": str(read_hint.get("enforcement") or "advise"),
+                        },
                     )
-                    temp["pending_tool_calls"] = []
-                    return StepPlan(node_id="parse", next_node="reason")
+                    # ADVICE, NOT REFUSAL (2026-08-22). This used to drop the
+                    # batch and return to `reason`, which spends a full task
+                    # iteration and hands the model NOTHING — it asked for file
+                    # content and got a lecture. `read_file` has no side
+                    # effects, so there is nothing to protect by refusing it,
+                    # and the refusal was the bug: run
+                    # 9ea71c55-4405-4b6f-b387-3cc78629880b lost cycles 15/16/17
+                    # to exactly this and then died on the iteration budget.
+                    # The hint now rides the inbox to the NEXT reason step
+                    # while the read proceeds normally.
+                    if str(read_hint.get("enforcement") or "advise") != "advise":
+                        temp["pending_tool_calls"] = []
+                        return StepPlan(node_id="parse", next_node="reason")
             except Exception:
                 pass
 

@@ -73,6 +73,14 @@ REACT_STEPS = COMMON_STEPS | frozenset(
         # branch where the turn actually ends.
         "max_iterations_reached",
         "parse_final",
+        # Read-orchestration advice — payload {cycle, path, mode, enforcement}.
+        # `enforcement: "advise"` means the model was told how to read this
+        # file better AND its read still executed. Before 2026-08-22 this hint
+        # DROPPED the batch and cost a task iteration for zero observations;
+        # run 9ea71c55 lost 3 of 20 iterations to it. Emitted since the guard
+        # landed but never declared — the drift test caught it once the
+        # payload gained `enforcement`.
+        "parse_read_orchestration_hint",
         "parse_repeat_tool_calls",
         "parse_retry_empty",
         "parse_retry_plan_only",
@@ -118,6 +126,14 @@ REACT_STEPS = COMMON_STEPS | frozenset(
 CODEACT_STEPS = COMMON_STEPS | frozenset(
     {
         "parse_retry_empty",
+        # Read-orchestration advice — payload {path, mode, enforcement}.
+        # `enforcement: "advise"` means the model was told how to read this
+        # file better AND its read still executed; the loop must never spend
+        # a task iteration refusing a side-effect-free read (2026-08-22, run
+        # 9ea71c55). The react adapter emits the same name with a `cycle`.
+        # It was emitted here since the guard landed but never declared —
+        # the drift test caught it once the payload changed.
+        "parse_read_orchestration_hint",
         "plan",
         "plan_request",
         "review",

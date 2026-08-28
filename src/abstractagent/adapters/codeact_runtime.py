@@ -717,10 +717,19 @@ def create_codeact_workflow(
                     scratchpad["read_orchestration_last_hint"] = str(read_hint.get("signature") or "")
                     emit(
                         "parse_read_orchestration_hint",
-                        {"path": read_hint.get("path"), "mode": str(read_hint.get("mode") or "read_orchestration")},
+                        {
+                            "path": read_hint.get("path"),
+                            "mode": str(read_hint.get("mode") or "read_orchestration"),
+                            "enforcement": str(read_hint.get("enforcement") or "advise"),
+                        },
                     )
-                    temp["pending_tool_calls"] = []
-                    return StepPlan(node_id="parse", next_node="reason")
+                    # ADVICE, NOT REFUSAL — see the twin comment in
+                    # react_runtime.parse_node and the read_orchestration
+                    # module docstring. Dropping a side-effect-free read cost
+                    # a task iteration and returned the model no data.
+                    if str(read_hint.get("enforcement") or "advise") != "advise":
+                        temp["pending_tool_calls"] = []
+                        return StepPlan(node_id="parse", next_node="reason")
             except Exception:
                 pass
             # A non-empty reply ends the CONSECUTIVE-empty streak (fable5 P1

@@ -3,6 +3,29 @@
 This module stays intentionally policy-light. It only detects conservative
 same-file reread patterns where the package can nudge the model before it burns
 another turn on obviously inefficient read orchestration.
+
+A NUDGE IS ADVICE, NOT A REFUSAL (2026-08-22). The staircase detector below
+used to be wired so that firing it DROPPED the model's read batch and sent the
+loop back to `reason`, costing a full task iteration and returning no file
+content at all. Three properties made that a trap rather than a nudge:
+
+  1. the warned signature was keyed on the CURRENT range, so every adjustment
+     the model made — including the exact widening this module's own message
+     asks for — looked like a brand-new pattern and re-fired the guard;
+  2. `last_successful_read_batch` was never advanced (the read never ran), so
+     the comparison anchor stayed frozen and the next nearby slice fired too;
+  3. the only exit was a BYTE-IDENTICAL retry, which is precisely what the
+     repeat-tool-calls guard in the loop is built to punish.
+
+Observed in production run 9ea71c55-4405-4b6f-b387-3cc78629880b (session
+acode-f9dbf92e0814): cycles 15, 16 and 17 each requested a DIFFERENT slice of
+one file, each was swallowed with zero observations, and the run then died on
+"iteration budget after 20 iterations" having spent 15% of its budget here.
+
+`read_file` has no side effects, so refusing it buys nothing and costs the
+model the data it asked for. The signature is therefore keyed on the PATH
+(one standing piece of advice per file per turn) and the loop delivers the
+message ALONGSIDE the executed read instead of instead of it.
 """
 
 from __future__ import annotations
@@ -150,24 +173,33 @@ def detect_nearby_same_file_staircase(
     if not _ranges_are_nearby(prev, cur):
         return None
 
-    signature = f"{cur.get('path')}:{cur.get('start')}:{cur.get('end')}"
+    path = str(cur.get("path") or "")
+    # Keyed on the PATH, not the range. Keying it on `cur.start:cur.end` meant
+    # the message's own advice ("request ONE wider contiguous read_file range")
+    # produced a fresh signature every time and re-fired the guard forever —
+    # an obedient model could be nudged until the iteration budget was gone.
+    # One standing piece of read advice per file per turn is the whole point.
+    signature = f"{path}:staircase"
     if isinstance(previously_warned_signature, str) and previously_warned_signature == signature:
         return None
 
-    path = str(cur.get("path") or "")
     prev_start = int(prev.get("start") or 1)
     prev_end = _effective_end(prev)
     cur_start = int(cur.get("start") or 1)
     cur_end = _effective_end(cur)
     return {
         "mode": "wider_same_file_read",
+        # ADVISE, never refuse: the read runs and this rides with it. See the
+        # module docstring — refusing a side-effect-free read cost the model
+        # its data and the operator a task iteration, and bought nothing.
+        "enforcement": "advise",
         "signature": signature,
         "path": path,
         "message": (
-            "You just read a nearby slice of the same file successfully.\n"
-            f"For `{path}`, avoid walking the file in another narrow slice ({prev_start}-{prev_end} then {cur_start}-{cur_end}).\n"
-            "If you need more nearby context, request ONE wider contiguous read_file range.\n"
-            "If you actually need distant passages, batch the read_file calls in ONE response."
+            f"Read orchestration note (your read of `{path}` is running, this is for next time).\n"
+            f"You are walking this file in narrow slices ({prev_start}-{prev_end}, now {cur_start}-{cur_end}).\n"
+            "Prefer ONE wider contiguous read_file range up front when you need nearby context.\n"
+            "If you need distant passages, batch those read_file calls in ONE response."
         ),
     }
 
@@ -214,11 +246,16 @@ def detect_redundant_same_file_full_reread(
 
     return {
         "mode": "avoid_full_file_reread",
+        # Same rule as the staircase hint: advice, not a refusal. A model that
+        # insists on the re-read after being told costs one tool call; a
+        # swallowed call cost a whole iteration and returned nothing.
+        "enforcement": "advise",
         "signature": signature,
         "path": path,
         "message": (
-            "You already read this file successfully.\n"
-            f"For `{path}`, do not request another full-file read_file call right now.\n"
-            "Use the content already in context, or ask for ONE bounded range only if you need a precise confirmation."
+            f"Read orchestration note (your read of `{path}` is running, this is for next time).\n"
+            "You already read this file successfully, and its content is still in the conversation above.\n"
+            "Re-read the whole file only when you need to confirm a change you just made;\n"
+            "otherwise use what is already in context, or ask for ONE bounded range."
         ),
     }

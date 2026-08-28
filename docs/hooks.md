@@ -205,6 +205,41 @@ already-diagnosed failure is counted back to the model rather than restated.
 `tool_failure_hint_error` fires if the hint builder itself raises — the hint
 is skipped and the run continues, never silently.
 
+**Read orchestration is ADVICE, and never costs the model its data**
+(2026-08-22). When a batch walks one file in narrow adjacent slices, or
+re-reads in full a file it already read, `parse` emits
+`parse_read_orchestration_hint` (`{cycle, path, mode, enforcement}`) and puts
+a note in the inbox suggesting one wider contiguous range, or one batched set
+of distant ranges. **The batch still executes.** `enforcement: "advise"` is
+the only shape shipped; the call site keeps a refusal branch for a future
+mode that genuinely needs one.
+
+This used to be a refusal — the hint DROPPED the read batch and sent the loop
+back to `reason`, which spends a full iteration of the operator's task budget
+and returns the model zero bytes of the file it asked for. `read_file` has no
+side effects, so nothing was protected by refusing it. Three properties made
+it a compliance trap: the "already warned" key was the requested RANGE, so
+the widening the note itself asks for minted a fresh key and re-fired the
+guard; `last_successful_read_batch` only advances from executed results, so
+the comparison anchor froze; and the sole exit was a byte-identical retry —
+precisely what the stuck-streak guard above exists to punish. Run
+`9ea71c55-4405-4b6f-b387-3cc78629880b` lost cycles 15, 16 and 17 to it (three
+DIFFERENT ranges, zero observations each), then died on the iteration budget
+two cycles from a diagnosis it had already reached. The key is now the PATH:
+one standing piece of read advice per file per turn.
+
+**The loop tells the model when the budget is nearly gone** (2026-08-22).
+From `_limits.warn_iterations_pct` (default 80) onward, the reason tail
+carries a `[budget]` line beside `[loop] iteration N of M`: the remaining
+count, that the turn ENDS when it hits zero, and a preference for landing a
+justified change over confirming a diagnosis already in hand. The final
+iteration is told not to open new investigation. `warn_iterations_pct` had
+been declared in `_limits` since the beginning with no behavioural
+consequence anywhere; the position line alone is information, not a steer —
+run `9ea71c55` read "iteration 19 of 20" and spent both remaining iterations
+on further diagnosis. Suppressed with the rest of the loop chrome under
+`_runtime.suppress_loop_tail` (c2447).
+
 **The operator can end a turn well, from any client.**
 `POST /commands {type: "conclude", run_id}` rides the same durable lane as a
 steer (gateway → `Runtime.steer()` → steer sidecar → the run's own tick drains
