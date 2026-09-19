@@ -1,0 +1,31 @@
+ENVIRONMENT
+  abstractcore       2.13.38
+  abstractruntime    0.4.29
+  abstractmemory     0.3.0
+  abstractflow       NOT INSTALLED
+  abstractagent      0.3.12
+  python             3.12.13
+  scope              all
+
+src/ -> abstractcore: 15/15 resolve
+
+src/ -> abstractruntime: 20/20 resolve
+
+tests/ -> abstractcore: 6/6 resolve
+
+tests/ -> abstractruntime: 29/40 resolve
+      MISS abstractruntime.PHASES  <- AttributeError: symbol absent from module
+      MISS abstractruntime.resolve_tool_grant  <- AttributeError: symbol absent from module
+      MISS abstractruntime.write_policy_file  <- AttributeError: symbol absent from module
+      MISS abstractruntime.identity.entity_runtime.open_entity_runtime  <- ModuleNotFoundError: No module named 'abstractruntime.identity.entity_runtime'
+      MISS abstractruntime.identity.tools.TIER1_TOOL_NAMES  <- ModuleNotFoundError: No module named 'abstractruntime.identity.tools'
+      MISS abstractruntime.identity.tools.WORKSPACE_TOOL_NAMES  <- ModuleNotFoundError: No module named 'abstractruntime.identity.tools'
+      MISS abstractruntime.identity.visit_workflow.HARVEST_NODE  <- ModuleNotFoundError: No module named 'abstractruntime.identity.visit_workflow'
+      MISS abstractruntime.identity.visit_workflow.ReactMiddle  <- ModuleNotFoundError: No module named 'abstractruntime.identity.visit_workflow'
+      MISS abstractruntime.identity.visit_workflow.VISITOR_WAIT_KEY  <- ModuleNotFoundError: No module named 'abstractruntime.identity.visit_workflow'
+      MISS abstractruntime.identity.visit_workflow.VISIT_HISTORY_TOOL_RESULT_CAP_CHARS  <- ModuleNotFoundError: No module named 'abstractruntime.identity.visit_workflow'
+      MISS abstractruntime.identity.visit_workflow.build_visit_workflow  <- ModuleNotFoundError: No module named 'abstractruntime.identity.visit_workflow'
+
+tests/ -> abstractmemory: 7/7 resolve
+
+TOTAL (all): 77/88 references resolve

@@ -1,0 +1,20 @@
+ENVIRONMENT
+  abstractcore       2.13.39
+  abstractruntime    0.4.30
+  abstractmemory     0.3.0
+  abstractflow       NOT INSTALLED
+  abstractagent      0.3.12
+  python             3.12.13
+  scope              all
+
+src/ -> abstractcore: 15/15 resolve
+
+src/ -> abstractruntime: 20/20 resolve
+
+tests/ -> abstractcore: 6/6 resolve
+
+tests/ -> abstractruntime: 40/40 resolve
+
+tests/ -> abstractmemory: 7/7 resolve
+
+TOTAL (all): 88/88 references resolve
