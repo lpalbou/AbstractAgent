@@ -27,7 +27,8 @@ Additional system instructions:
 - **Cache stability**: both slots must be byte-stable for the duration of a
   run. The system prompt is the provider prompt-cache prefix — mutating a slot
   mid-run forces a full re-prefill on every subsequent call. Per-call state
-  (loop position, plans, guidance) rides the volatile message tail instead;
+  (loop position, plans, guidance) rides the loop tail at the end of the
+  transcript instead;
   never put it in these slots. If an upstream policy resolves skills per
   PHASE (summoned entities), a phase change means a new run/session or one
   accepted re-prefill — never a mid-run slot mutation inside one cached

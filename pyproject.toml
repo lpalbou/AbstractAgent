@@ -4,23 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abstractagent"
-version = "0.3.12"
+version = "0.3.13"
 description = "Agent implementations using AbstractRuntime and AbstractCore"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "abstractcore[tools]>=2.13.38",
-    "abstractruntime>=0.4.29",
+    "abstractcore[tools]>=2.13.41",
+    "abstractruntime>=0.4.32",
 ]
 
 [project.optional-dependencies]
 apple = [
-    "abstractcore[all-apple]>=2.13.38",
-    "abstractruntime[apple]>=0.4.29",
+    "abstractcore[all-apple]>=2.13.41",
+    "abstractruntime[apple]>=0.4.32",
 ]
 gpu = [
-    "abstractcore[all-gpu]>=2.13.38",
-    "abstractruntime[gpu]>=0.4.29",
+    "abstractcore[all-gpu]>=2.13.41",
+    "abstractruntime[gpu]>=0.4.32",
 ]
 dev = [
     "pytest>=7.0",

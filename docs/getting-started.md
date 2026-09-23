@@ -33,6 +33,9 @@ From PyPI:
 pip install abstractagent
 ```
 
+This pulls in `abstractcore[tools]>=2.13.41` and `AbstractRuntime>=0.4.32`.
+Hardware profiles: `pip install "abstractagent[apple]"` or `pip install "abstractagent[gpu]"`.
+
 From source (development):
 
 ```bash

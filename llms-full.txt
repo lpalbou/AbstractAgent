@@ -13,9 +13,11 @@ but is commonly used as a “bigger context window” companion.
 Important notes (source-of-truth hints):
 - Runtime behavior lives in workflow adapters: `src/abstractagent/adapters/*_runtime.py`
 - Keep prompting/parsing runtime-agnostic: `src/abstractagent/logic/*` (no `abstractruntime` imports)
-- `src/abstractagent/adapters/generation_params.py` is the shared LLM param normalizer for temperature, seed, media policy, prompt-cache identity, streaming passthrough, and Core `thinking`.
+- `src/abstractagent/adapters/generation_params.py` is the shared LLM param normalizer for temperature, seed, media policy, prompt-cache identity, streaming passthrough, Core `thinking` and `speculation` (MTP; inherited by delegated children).
 - `src/abstractagent/adapters/loop_hooks.py` is the shared loop-hook layer (listen/steer/capture); see `docs/hooks.md`.
 - Docs entrypoint: `README.md` → `docs/getting-started.md` → `docs/README.md`
+- Version 0.3.13 requires `abstractcore[tools]>=2.13.41` and `AbstractRuntime>=0.4.32`; extras: `apple`, `gpu`, `test`, `dev`.
+- The loops stamp the runtime turn-grounding envelope into the durable user turn once (`abstractruntime.turn_grounding`) and place the loop tail with `transcripts.place_loop_tail`, keeping prompts byte-prefix stable across iterations and turns.
 - MemAct is not re-exported at the package top-level; import from `abstractagent.agents.memact` (see `docs/api.md`).
 - After changes, run tests: `pytest -q`
 
@@ -64,6 +66,8 @@ Important notes (source-of-truth hints):
 - [MemAct workflow adapter](src/abstractagent/adapters/memact_runtime.py): `create_memact_workflow`
 
 - [LLM param normalization](src/abstractagent/adapters/generation_params.py): temperature/seed/audio policies, prompt-cache identity, streaming passthrough, Core `thinking`, `context_usage_warning`; verifier execution grounding (`EXECUTOR_TAGS`/`executor_tool_names`/`verifier_execution_preference` — tools declaring tags=["executor"] are named in verifier prompts with "unexecuted is unverified"); lane-honest guidance wrappers (`guidance_wrapper` — visit lanes under `suppress_loop_tail` get host-voiced attribution, task lane byte-unchanged)
+- [Transcripts](src/abstractagent/adapters/transcripts.py): provider-safe transcript sanitation, tool-call id stamping (`ensure_tool_call_ids`, `synthetic_call_id`), loop-tail placement (`place_loop_tail`)
+- [Native-loop registry](src/abstractagent/adapters/native_loop_registry.py): `audit_native_loop_manifest`, `materialize_native_loop_spec`, `build_native_loop_manifest`, `pack_native_loop_bundle` (gateway `.flow` bundles)
 - [Loop hooks](src/abstractagent/adapters/loop_hooks.py): `LoopHooks`, `HookEvent`, `DEFAULT_EVENT_MAP` (listen/steer/capture)
 - [Circling detection](src/abstractagent/adapters/progress.py): `circling_streak` — pure read-only near-restatement detector over recent outputs (0017 detector half; policy-free, host-consumable)
 - [Emit-step inventory](src/abstractagent/adapters/emit_inventory.py): declared per-adapter raw step names (drift-tested; stability contract in docs/hooks.md)

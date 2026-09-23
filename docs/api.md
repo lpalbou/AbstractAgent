@@ -127,7 +127,10 @@ Per-run controls (via `ReactAgent.start(...)`):
 Host-level `_runtime` slots (raw-workflow hosts; see `docs/skills-attachment.md`):
 - `skills_block`: skills attachment slot (composed before `system_prompt_extra`)
 - `system_prompt_extra`: behavioral-directive slot
-- `delegate_substrates`: `{name: {provider, model, description?, thinking?}}`
+- `speculation`: speculative decoding (MTP) control forwarded on every LLM call —
+  `False` (Off), `True`, or a Core dict such as `{"mode": "native_mtp", "num_draft_tokens": 2}`;
+  unset follows Core's route default. Delegated children inherit it.
+- `delegate_substrates`: `{name: {provider, model, description?, thinking?, speculation?}}`
   palette for the `delegate_agent` tool's optional `substrate` argument
   (unknown names fail as loud tool errors; the palette never propagates to
   grandchildren). A profile may pin the child's reasoning effort via
@@ -172,7 +175,9 @@ All agents inherit `BaseAgent` (`src/abstractagent/agents/base.py`).
 - `start(task: str, **kwargs) -> str`: starts a new run and returns a `run_id`
 - `step() -> RunState`: advances one runtime step
 - `run_to_completion() -> RunState`: ticks until the run completes or waits
-- `cancel(reason: str | None = None) -> RunState`
+- `cancel(reason: str | None = None) -> RunState`: calls `Runtime.cancel_run`; with
+  AbstractRuntime 0.4.32 this also stops the run's in-flight LLM/tool effect, and the
+  interrupted step is recorded in the ledger as `StepStatus.CANCELLED`
 
 ### Pause / resume
 

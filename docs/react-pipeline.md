@@ -67,8 +67,14 @@ Implemented in `reason_node` (`src/abstractagent/adapters/react_runtime.py`):
 - builds the base system prompt via `ReActLogic.build_request(...)` (`src/abstractagent/logic/react.py`);
   the system prompt is byte-stable across iterations (prompt-prefix cache stability, 0212) —
   the per-cycle scratchpad rendering was removed; reasoning stays in the transcript instead
-- volatile per-call state (`[loop]` counter, plan view) rides only the TRAILING message,
-  merging into a trailing user message when adjacency requires it
+- the current user turn is stamped once with the runtime grounding envelope
+  (`abstractruntime.turn_grounding.stamp_user_turn_grounding`), so the bytes a turn is sent
+  with are the bytes it is stored and replayed with
+- per-call loop state (`[loop]` position, `[budget]` warning, `[plan]` view) is placed by
+  `transcripts.place_loop_tail`: in a tool loop it is appended once to the durable transcript
+  (marked `_af_synthetic: "loop_tail"`), so each iteration's prompt is an exact prefix of the
+  next; when the payload ends with the user's message, the position line is dropped and only
+  `[budget]`/`[plan]` merge into that message
 - sends the durable transcript as provider-safe `messages` (`_sanitize_llm_messages`:
   orphan repair, adjacent-user merges, metadata dropped — only role/content/tool_call_id/tool_calls survive)
 - includes tool schemas (`_runtime.tool_specs`) so the model can emit structured tool calls

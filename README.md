@@ -43,7 +43,8 @@ flowchart LR
 - **Loop hooks**: listen/steer/capture on the running loop via `LoopHooks`
   (see [`docs/hooks.md`](docs/hooks.md)); the flat `on_step` callback remains
 - **Generation controls**: temperature, seed, media policy, prompt-cache
-  identity, streaming, and Core `thinking` are normalized before LLM calls
+  identity, streaming, Core `thinking` and `speculation` (MTP) are normalized
+  before LLM calls and inherited by delegated children
 - **Observability**: durable ledger of LLM calls, tool calls, and waits
 
 Where this lives in code (source of truth):
@@ -80,6 +81,10 @@ Native Python hardware profile cascades are available for deployment manifests:
 `abstractagent[apple]` and `abstractagent[gpu]`. These delegate to the matching
 AbstractCore and AbstractRuntime profiles; AbstractAgent itself remains
 provider/runtime agnostic.
+
+AbstractAgent 0.3.13 requires `abstractcore[tools]>=2.13.41` and
+`AbstractRuntime>=0.4.32` (the runtime release that provides turn grounding,
+in-flight cancellation and speculation inheritance).
 
 Note: the repository may be ahead of the latest published PyPI release. To verify what you installed:
 
