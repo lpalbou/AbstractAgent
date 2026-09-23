@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from abstractagent.agents.codeact import CodeActAgent
 from abstractagent.agents.react import ReactAgent
 from abstractruntime import RunState, RunStatus, Runtime
@@ -72,7 +74,9 @@ def test_react_adapter_does_not_truncate_in_loop_history() -> None:
     assert "system: SYS" in rendered
     assert "user: m1" in rendered
     assert "assistant: m2" in rendered
-    assert "user: m3" in rendered
+    # `m3` is the turn's current user message, so the reason boundary stamps the
+    # runtime grounding envelope into it, once and durably (mission A, 2026-09-22).
+    assert re.search(r"^user: (<runtime_metadata>.*</runtime_metadata>\n)?m3$", rendered, re.M)
     assert "assistant: m4" in rendered
 
 
@@ -89,7 +93,8 @@ def test_codeact_adapter_uses_runtime_active_context_policy() -> None:
     rendered = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in msgs if isinstance(m, dict))
 
     assert "system: SYS" in rendered
-    assert "user: m3" in rendered
+    # CodeAct stamps the turn's grounding envelope into `m3` too (mission A3).
+    assert re.search(r"^user: (<runtime_metadata>.*</runtime_metadata>\n)?m3$", rendered, re.M)
     assert "assistant: m4" in rendered
     assert "user: m1" not in rendered
     assert "assistant: m2" not in rendered

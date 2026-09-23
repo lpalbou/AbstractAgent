@@ -124,11 +124,11 @@ def test_react_loop_context_transcript_level_a_basic() -> None:
     assert isinstance(first_msgs, list) and first_msgs
     assert first_msgs[0].get("role") == "user"
     first_content = _strip_runtime_prefixes(str(first_msgs[0].get("content") or ""))
-    # Adjacency guard (2026-07-09): on a first turn the volatile [loop] tail MERGES into the
-    # trailing user message (alternation-strict templates reject user,user), so the task
-    # message carries task + tail rather than a second consecutive user message.
-    assert first_content.startswith("Create a project folder")
-    assert "[loop] iteration 1" in first_content
+    # Adjacency guard (2026-07-09) as amended by mission A (2026-09-22): a first turn
+    # still never produces user,user — the loop-POSITION line is simply dropped there
+    # instead of being merged into the user's own (durable) message.
+    assert first_content == "Create a project folder"
+    assert "[loop]" not in first_content
     roles_first = [m.get("role") for m in first_msgs]
     assert all(not (a == b == "user") for a, b in zip(roles_first, roles_first[1:]))
     params1 = first.get("params") if isinstance(first.get("params"), dict) else {}
@@ -369,11 +369,19 @@ def test_ask_user_orphaned_tool_calls_repaired_in_llm_payload() -> None:
 
 
 @pytest.mark.basic
-def test_loop_tail_merges_into_trailing_user_message() -> None:
-    """Adjacency guard (Critic-3, 2026-07-09): when the payload already ends with a user
-    message (first turn), the volatile [loop] tail merges INTO it — alternation-strict
-    templates reject user,user, and a separate banner steals the grounding envelope's
-    last-user-message slot from the real task."""
+def test_loop_chrome_never_merges_into_a_durable_user_message() -> None:
+    """Adjacency guard (Critic-3, 2026-07-09) + mission A (2026-09-22).
+
+    The adjacency rule stands: no payload may contain user,user, because
+    alternation-strict templates reject it with a 400. What changed is WHAT may
+    merge. The loop-POSITION line is chrome, and merging it into the user's own
+    message wrote bytes the transcript does not store — so one turn later that
+    message re-rendered differently and every prefix cache missed from there on
+    (185-388 tokens re-prefilled per turn, measured on the MLX native lane).
+    Chrome is therefore dropped in the shape where it would have to merge; only
+    ACTIONABLE tail content ([budget], [plan]) still merges, and the tool-loop
+    shape carries the whole tail on a trailing volatile message exactly as
+    before."""
     captured: list[dict[str, Any]] = []
 
     def llm_handler(run: RunState, effect: Effect, default_next_node: Optional[str]) -> EffectOutcome:
@@ -411,8 +419,8 @@ def test_loop_tail_merges_into_trailing_user_message() -> None:
     first_msgs = captured[0].get("messages") or []
     roles = [m.get("role") for m in first_msgs]
     assert all(not (a == b == "user") for a, b in zip(roles, roles[1:])), roles
-    assert "[loop] iteration 1" in str(first_msgs[-1].get("content") or "")
-    assert "list the files" in str(first_msgs[-1].get("content") or "")  # task + tail together
+    assert "[loop]" not in str(first_msgs[-1].get("content") or ""), "chrome must not decorate the task"
+    assert str(first_msgs[-1].get("content") or "").endswith("list the files")
 
     # SECOND call: ends with tool results -> tail is a separate trailing user message
     # (the grounding envelope may be prefixed into it — both are volatile per-call state).

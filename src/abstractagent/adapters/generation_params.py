@@ -9,6 +9,7 @@ backward compatibility with older runs that may not have these keys in
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any, Dict, Optional
 
 
@@ -262,7 +263,7 @@ PROMPT_SLOTS: tuple = (
 #: model. Absent thinking = the child keeps the inherited value (a sub-agent
 #: is not a different mind unless the host says so); present-but-invalid
 #: warns and falls back to inheritance (deny-safe, never a failed delegation).
-DELEGATE_SUBSTRATE_KEYS = frozenset({"provider", "model", "description", "thinking"})
+DELEGATE_SUBSTRATE_KEYS = frozenset({"provider", "model", "description", "thinking", "speculation"})
 
 
 def compose_prompt_slots(base: str, runtime_ns: Optional[Dict[str, Any]]) -> str:
@@ -596,6 +597,16 @@ def runtime_llm_params(
         out["thinking"] = thinking_norm
     else:
         out.pop("thinking", None)
+
+    # Core owns MTP support, depth defaults and validation. This layer only
+    # preserves explicit overrides (including Off) through every Agent loop.
+    speculation = out.get("speculation")
+    if speculation is None and isinstance(runtime_ns, dict):
+        speculation = runtime_ns.get("speculation")
+    if speculation is not None:
+        out["speculation"] = deepcopy(speculation)
+    else:
+        out.pop("speculation", None)
 
     # Pass-through media policies (runtime-owned defaults).
     #

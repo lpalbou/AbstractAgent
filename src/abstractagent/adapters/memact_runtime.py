@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractcore.tools import ToolCall
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
+from abstractruntime.turn_grounding import stamp_user_turn_grounding
 
 from .generation_params import (
     DELEGATE_SUBSTRATE_KEYS,
@@ -23,7 +25,15 @@ from .generation_params import (
     suppress_loop_tail,
 )
 from .media import extract_media_from_context
-from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, parse_content_preview, sanitize_transcript_messages
+from .transcripts import (
+    assistant_tool_calls_payload,
+    ensure_tool_call_ids,
+    extract_reasoning_text,
+    parse_content_preview,
+    place_loop_tail,
+    sanitize_transcript_messages,
+    synthetic_call_id,
+)
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .tool_allowlist import note_pruned_grants
 from ..logic.memact import MemActLogic
@@ -553,6 +563,13 @@ def create_memact_workflow(
                 )
             )
             emit("inbox_drained", {"chars": len(guidance)})
+        # STAMP THE TURN ONCE (mission A ported to MemAct by mission A3,
+        # 2026-09-22). See the identical note in react_runtime/codeact_runtime:
+        # the grounding envelope must be written into the DURABLE turn, once, so
+        # the bytes a turn is SENT with are the bytes it is STORED with and turn
+        # N's prompt stays an exact byte-prefix of turn N+1's. Idempotent, and it
+        # refuses payload-synthesized carriers.
+        stamp_user_turn_grounding(context.get("messages"))
         messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
         allow = _effective_allowlist(runtime_ns)
@@ -610,16 +627,20 @@ def create_memact_workflow(
         # busted the prefix cache every cycle). Adjacency guard mirrors ReAct.
         # `_runtime.suppress_loop_tail` (c2447): loop tails are task-agent
         # chrome — entity-lane hosts suppress the tail (ReAct/CodeAct parity).
-        tail_text = "" if suppress_loop_tail(runtime_ns) else f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}."
-        if tail_text and isinstance(payload.get("messages"), list):
-            msgs_out = list(payload["messages"])
-            if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
-                last = dict(msgs_out[-1])
-                last["content"] = f"{str(last.get('content') or '').rstrip()}\n\n{tail_text}"
-                msgs_out[-1] = last
-            else:
-                msgs_out.append({"role": "user", "content": tail_text, "volatile": True})
-            payload["messages"] = msgs_out
+        # Mission A3: one placement rule for all three loops
+        # (`transcripts.place_loop_tail`). The position line is chrome: dropped
+        # in the chat shape (it used to merge INTO the user's durable message —
+        # mission A's bug 1b), durable and marked in the tool-loop shape so
+        # iteration N's prompt stays an exact prefix of N+1's.
+        chrome_parts = [] if suppress_loop_tail(runtime_ns) else [f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}."]
+        if isinstance(payload.get("messages"), list) and chrome_parts:
+            payload["messages"] = place_loop_tail(
+                durable_messages=context.get("messages"),
+                payload_messages=payload["messages"],
+                chrome_parts=chrome_parts,
+                actionable_parts=[],
+                new_message=lambda **kw: _new_message(ctx, **kw),
+            )
 
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
         eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
@@ -667,6 +688,11 @@ def create_memact_workflow(
             # PROPOSED the batch must announce the ids its tool results answer
             # — content-only appends orphaned every tool message on strict
             # providers (native OpenAI 400s the request at iteration 2).
+            # Mission A3: stamp the fallback ids HERE, once, so the announcement
+            # and the batch `act_node` queues share one id namespace (they used to
+            # mint `call_{i+1}` and `str(idx)` independently, which orphaned every
+            # result into an `[unpaired tool result]` user carrier).
+            ensure_tool_call_ids(tool_calls)
             context["messages"].append(
                 _new_assistant_message_with_tool_calls(
                     ctx,
@@ -713,7 +739,11 @@ def create_memact_workflow(
             d = dict(item)
             call_id = str(d.get("call_id") or "").strip()
             if not call_id:
-                d["call_id"] = str(idx)
+                # Mission A3: one shared fallback formula (see
+                # `transcripts.synthetic_call_id`). `idx` is 1-based here, the
+                # formula is 0-based. `str(idx)` disagreed with the durable
+                # announcement and orphaned every result into a user carrier.
+                d["call_id"] = synthetic_call_id(idx - 1)
             tool_queue.append(d)
 
         if not tool_queue:
@@ -884,6 +914,7 @@ def create_memact_workflow(
                     # example-free tool prompts should not delegate a child
                     # that silently reverts to provider defaults.
                     "thinking",
+                    "speculation",
                     "max_output_tokens",
                     "tool_prompt_examples",
                     # Approval policy inherits monotonically (tool-tiers adversary
@@ -892,7 +923,7 @@ def create_memact_workflow(
                 ):
                     _v = runtime_ns.get(_k)
                     if _v is not None:
-                        sub_vars["_runtime"][_k] = _v
+                        sub_vars["_runtime"][_k] = deepcopy(_v) if _k == "speculation" else _v
 
                 # Host-gated substrate palette (0030 promoted 2026-07-13): the
                 # `substrate` arg names a profile the HOST granted via
@@ -968,6 +999,9 @@ def create_memact_workflow(
                                     "warning": "#FALLBACK substrate thinking value not recognized; child keeps the inherited value",
                                 },
                             )
+                    if isinstance(profile, dict) and profile.get("speculation") is not None:
+                        sub_vars["_runtime"]["speculation"] = deepcopy(profile["speculation"])
+                        substrate_emit["speculation"] = deepcopy(profile["speculation"])
                     emit("delegate_agent_substrate", substrate_emit)
 
                 payload = {

@@ -31,6 +31,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 from abstractcore.tools import ToolCall
 
+# The runtime owns this marker (it also strips it before the provider call) —
+# abstractagent declares what it synthesized, abstractruntime's grounding pass
+# refuses to treat a declared carrier as "the turn". See
+# `abstractruntime.turn_grounding` for the incident this closes (mission A3).
+from abstractruntime.turn_grounding import SYNTHETIC_MESSAGE_KEY, SYNTHETIC_TOOL_RESULT
+
 # Interactive builtins resolve through waits + user messages BY DESIGN; only their
 # unanswered ids may honestly be labeled "handled interactively". Anything else
 # unanswered is a genuinely lost result and must SAY so (a repair that papers over
@@ -122,6 +128,115 @@ def extract_reasoning_text(response: Any) -> str:
     return ""
 
 
+def synthetic_call_id(index: int) -> str:
+    """The ONE fallback id formula for a tool call the model announced without one.
+
+    MISSION A3 (2026-09-22). Two places used to invent this id independently and
+    disagreed: `assistant_tool_calls_payload` minted `call_{i+1}` for the DURABLE
+    assistant message, while the loops' `act_node` minted `str(idx)` for the batch
+    the executor answers (react_runtime ~2608, codeact_runtime ~890,
+    memact_runtime ~717). The tool results therefore came back with ids the
+    announced calls did not own, so EVERY announced id was "unanswered" and EVERY
+    real result was "foreign": `sanitize_transcript_messages` replaced the results
+    with `[tool result missing (host error): <name>]` placeholders and folded the
+    real output into one giant `[unpaired tool result]` USER message. Measured on
+    the operator's live run 081d8daa (2026-09-22 10:48): 3 announced `web_search`
+    calls -> 3 placeholders + one 13,585-char user carrier; 5 `fetch_url` calls ->
+    5 placeholders + one 8,423-char carrier. The model was told its tools failed
+    while their output rode a user turn, and that user turn then attracted the
+    runtime grounding envelope and broke the prompt cache (see
+    `abstractruntime.turn_grounding`).
+
+    `ensure_tool_call_ids` below stamps this ONCE, at parse time, onto the
+    ToolCall objects both consumers read.
+    """
+    return f"call_{int(index) + 1}"
+
+
+def ensure_tool_call_ids(tool_calls: Any) -> Any:
+    """Give every announced tool call a stable id, IN PLACE, once (mission A3).
+
+    Accepts the loops' two shapes (`ToolCall` objects and plain dicts) and fills
+    only the EMPTY ones, so a provider that supplies real ids is untouched. Must
+    be called at the parse boundary — before the durable assistant message is
+    built and before the pending batch is queued — so the announcement and the
+    answers share one id namespace.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    for i, tc in enumerate(tool_calls):
+        if isinstance(tc, ToolCall):
+            current = str(tc.call_id).strip() if tc.call_id is not None else ""
+            if not current:
+                tc.call_id = synthetic_call_id(i)
+        elif isinstance(tc, dict):
+            current = str(tc.get("call_id") or "").strip()
+            if not current:
+                tc["call_id"] = synthetic_call_id(i)
+    return tool_calls
+
+
+LOOP_TAIL_MARKER = "loop_tail"
+
+
+def place_loop_tail(
+    *,
+    durable_messages: Any,
+    payload_messages: List[Dict[str, Any]],
+    chrome_parts: List[str],
+    actionable_parts: List[str],
+    new_message: Callable[..., Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Place a loop's per-iteration tail so the prompt stays an EXACT prefix extension.
+
+    MISSION A3 (2026-09-22). The tail (`[loop] iteration N of M.`, plus the
+    actionable `[budget]` / `[plan]` parts) used to ride a trailing `volatile`
+    message that existed in iteration N's payload and was GONE from iteration
+    N+1's. So iteration N's end-of-prompt snapshot was never a prefix of N+1's
+    prompt, by construction. That used to be hidden by mlx-vlm's 256-token
+    intermediate checkpoints (~88 tokens lost per iteration). With one snapshot
+    per call (the shape that keeps a conversation's lineage alive across a tool
+    loop, see abstractcore `NativeSession.prompt_cache`), it cost the WHOLE
+    iteration. Measured on the hermetic gateway, basic-agent@0.0.5, real
+    `web_search`/`fetch_url`: iterations 3-4 restored only the run's first call
+    (2,703 of 5,867-8,556 tokens). And being the last user message, the tail
+    also attracted the grounding envelope on every iteration.
+
+    Rule, the same one mission A applied to the user's turn: the bytes sent are
+    the bytes stored. In the TOOL-LOOP shape (the payload ends with assistant/tool
+    messages), the tail is appended to the DURABLE transcript, once, as a user
+    message marked adapter-authored (`SYNTHETIC_MESSAGE_KEY = "loop_tail"`,
+    `metadata.kind = "loop_tail"`). The next iteration re-renders it byte for
+    byte where it was sent, so iteration N's prompt is an exact prefix of N+1's.
+    The marker keeps it from ever being taken for "the turn": the grounding stamp
+    and the runtime's grounding pass both skip it, and the runtime strips the
+    key before the provider call.
+
+    In the CHAT shape (the payload ends with the user's own durable message) the
+    mission A rule is unchanged: chrome is dropped, and only actionable content
+    merges into that message.
+    """
+    msgs_out = list(payload_messages or [])
+    chrome = [str(p).strip() for p in (chrome_parts or []) if str(p or "").strip()]
+    actionable = [str(p).strip() for p in (actionable_parts or []) if str(p or "").strip()]
+    if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
+        merge_text = "\n\n".join(actionable).strip()
+        if merge_text:
+            last = dict(msgs_out[-1])
+            last["content"] = f"{str(last.get('content') or '').rstrip()}\n\n{merge_text}"
+            msgs_out[-1] = last
+        return msgs_out
+    tail_text = "\n\n".join(chrome + actionable).strip()
+    if not tail_text:
+        return msgs_out
+    durable = new_message(role="user", content=tail_text, metadata={"kind": LOOP_TAIL_MARKER})
+    durable[SYNTHETIC_MESSAGE_KEY] = LOOP_TAIL_MARKER
+    if isinstance(durable_messages, list):
+        durable_messages.append(durable)
+    msgs_out.append({"role": "user", "content": tail_text, SYNTHETIC_MESSAGE_KEY: LOOP_TAIL_MARKER})
+    return msgs_out
+
+
 def assistant_tool_calls_payload(tool_calls: List[ToolCall]) -> list[dict[str, Any]]:
     """OpenAI-shaped `tool_calls` metadata for a durable assistant message."""
     tc_payload: list[dict[str, Any]] = []
@@ -134,7 +249,7 @@ def assistant_tool_calls_payload(tool_calls: List[ToolCall]) -> list[dict[str, A
         call_id = tc.call_id
         call_id_str = str(call_id).strip() if call_id is not None else ""
         if not call_id_str:
-            call_id_str = f"call_{i+1}"
+            call_id_str = synthetic_call_id(i)
         args = tc.arguments if isinstance(tc.arguments, dict) else {}
         tc_payload.append(
             {
@@ -160,7 +275,7 @@ def sanitize_tool_calls_field(raw: Any) -> Optional[list[dict[str, Any]]]:
         call_id = tc.get("id")
         call_id_str = str(call_id).strip() if call_id is not None else ""
         if not call_id_str:
-            call_id_str = f"call_{i+1}"
+            call_id_str = synthetic_call_id(i)
         fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
         name = str(fn.get("name") or "").strip()
         if not name:
@@ -218,6 +333,11 @@ def sanitize_transcript_messages(
         )
 
         entry: Dict[str, Any] = {"role": role, "content": content_str}
+        # An adapter-authored DURABLE message (the loop tail, mission A3) keeps
+        # its marker on the payload so the runtime's grounding pass never takes
+        # it for the turn; the runtime strips the key before the provider call.
+        if m.get(SYNTHETIC_MESSAGE_KEY):
+            entry[SYNTHETIC_MESSAGE_KEY] = m.get(SYNTHETIC_MESSAGE_KEY)
         if role == "tool":
             meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
             call_id = meta.get("call_id") if isinstance(meta, dict) else None
@@ -247,6 +367,7 @@ def sanitize_transcript_messages(
             repaired.append({
                 "role": "user",
                 "content": f"[unpaired tool result]: {str(entry.get('content') or '')}",
+                SYNTHETIC_MESSAGE_KEY: SYNTHETIC_TOOL_RESULT,
             })
             i += 1
             continue
@@ -286,6 +407,7 @@ def sanitize_transcript_messages(
             repaired.append({
                 "role": "user",
                 "content": f"[unpaired tool result]: {str(stray.get('content') or '')}",
+                SYNTHETIC_MESSAGE_KEY: SYNTHETIC_TOOL_RESULT,
             })
 
     # Adjacent USER turns (operator guidance drained before the first assistant reply, or
@@ -298,6 +420,14 @@ def sanitize_transcript_messages(
         if merged and entry.get("role") == "user" and merged[-1].get("role") == "user":
             prev = dict(merged[-1])
             prev["content"] = f"{str(prev.get('content') or '').rstrip()}\n\n{str(entry.get('content') or '')}"
+            # A merge that swallows a synthesized carrier yields a message that is
+            # still PART adapter-synthesized, and a synthesized part is re-derived
+            # from the durable transcript on every iteration. The marker therefore
+            # survives the merge (mission A3): the runtime's grounding pass must
+            # never choose such a message as "the turn", or the envelope hops onto
+            # it and every iteration diverges thousands of tokens before the end.
+            if entry.get(SYNTHETIC_MESSAGE_KEY) and not prev.get(SYNTHETIC_MESSAGE_KEY):
+                prev[SYNTHETIC_MESSAGE_KEY] = entry.get(SYNTHETIC_MESSAGE_KEY)
             merged[-1] = prev
             continue
         merged.append(entry)

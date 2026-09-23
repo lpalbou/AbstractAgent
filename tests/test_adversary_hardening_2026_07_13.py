@@ -113,32 +113,39 @@ def test_react_review_call_carries_explicit_output_cap() -> None:
     assert (plan.effect.payload.get("params") or {}).get("max_tokens") == 512
 
 
-def test_sibling_volatile_tail_flag_and_merge_branch() -> None:
-    """C-P2-3: the tail must carry `volatile: True` when appended (cache
-    fingerprint exclusion) and MERGE into a trailing user message when the
-    transcript ends with one (alternation-strict template safety)."""
+def test_sibling_loop_tail_is_durable_marked_and_never_merged_as_chrome() -> None:
+    """C-P2-3, re-pinned by mission A3 (2026-09-22). Tool-loop shape: the tail is
+    appended as a DURABLE user message marked `_af_synthetic: loop_tail` (it used
+    to be a per-call `volatile` message the next iteration dropped, so iteration
+    N's prompt was never a prefix of N+1's). Chat shape (transcript ends with the
+    user's own message): the position line is chrome and is DROPPED — merging it
+    into the durable task was mission A's bug 1b, which CodeAct still had; there
+    is still no user,user adjacency."""
     wf = create_codeact_workflow(logic=CodeActLogic(tools=[_EXEC]))
 
-    # Transcript ending in an ASSISTANT message -> appended volatile tail.
+    # Transcript ending in an ASSISTANT message -> durable, marked tail.
     vars_a = _codeact_vars()
     vars_a["context"]["messages"] = [
         {"role": "user", "content": "task"},
         {"role": "assistant", "content": "thinking"},
     ]
-    _, plan_a = _plan(wf, "reason", vars_a)
+    run_a, plan_a = _plan(wf, "reason", vars_a)
     msgs = plan_a.effect.payload["messages"]
     assert msgs[-1]["role"] == "user"
     assert "[loop] iteration" in msgs[-1]["content"]
-    assert msgs[-1].get("volatile") is True
+    assert msgs[-1].get("_af_synthetic") == "loop_tail"
+    assert "volatile" not in msgs[-1]
+    stored = run_a.vars["context"]["messages"][-1]
+    assert stored["content"] == msgs[-1]["content"] and stored.get("_af_synthetic") == "loop_tail"
 
-    # Transcript ending in a USER message -> merged, no volatile flag, no
+    # Transcript ending in a USER message -> chrome dropped, nothing merged, no
     # user,user adjacency.
     vars_b = _codeact_vars()
     vars_b["context"]["messages"] = [{"role": "user", "content": "task"}]
     _, plan_b = _plan(wf, "reason", vars_b)
     msgs_b = plan_b.effect.payload["messages"]
     assert msgs_b[-1]["role"] == "user"
-    assert "task" in msgs_b[-1]["content"] and "[loop] iteration" in msgs_b[-1]["content"]
+    assert "task" in msgs_b[-1]["content"] and "[loop] iteration" not in msgs_b[-1]["content"]
     assert sum(1 for m in msgs_b if m.get("role") == "user") == 1
 
 

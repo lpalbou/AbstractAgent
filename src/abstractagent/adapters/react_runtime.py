@@ -18,11 +18,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractcore.tools import ToolCall
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
+from abstractruntime.turn_grounding import stamp_user_turn_grounding, strip_turn_grounding
 
 from .generation_params import (
     DELEGATE_SUBSTRATE_KEYS,
@@ -60,9 +62,12 @@ from .tool_allowlist import note_pruned_grants
 from .transcripts import (
     assistant_tool_calls_payload,
     elide_oversized_content,
+    ensure_tool_call_ids,
     extract_reasoning_text,
     parse_content_preview,
+    place_loop_tail,
     sanitize_transcript_messages,
+    synthetic_call_id,
 )
 from ..logic.react import ReActLogic
 
@@ -1733,7 +1738,16 @@ def create_react_workflow(
             msgs = []
             context["messages"] = msgs
 
-        if task and (not msgs or msgs[-1].get("role") != "user" or msgs[-1].get("content") != task):
+        # The "already there" test compares the turn's TEXT, not its bytes: a host
+        # that replays its own transcript hands back the user turn as it was SENT,
+        # which since mission A (2026-09-22) carries the runtime grounding envelope
+        # the reason boundary stamped into it. A bytes comparison would read that
+        # stamped message as a different turn and append the task a second time.
+        if task and (
+            not msgs
+            or msgs[-1].get("role") != "user"
+            or strip_turn_grounding(msgs[-1].get("content")).strip() != task.strip()
+        ):
             msgs.append(_new_message(ctx, role="user", content=task))
 
         # Run-init emit (0026 follow-up, 2026-07-15): parity with CodeAct/
@@ -1828,6 +1842,21 @@ def create_react_workflow(
             # The in-loop "message received" listen point (fleet seam): fires
             # whenever the reason boundary consumes delivered guidance.
             emit("inbox_drained", {"chars": len(guidance), "iteration": iteration})
+        # STAMP THE TURN ONCE (mission A, 2026-09-22). The runtime grounds every
+        # LLM turn with a `<runtime_metadata>` envelope carrying the local time.
+        # It used to be injected at the PAYLOAD boundary and never stored, so the
+        # durable transcript held `identify yourself` while the model was sent
+        # `<runtime_metadata>{…}</runtime_metadata>\nidentify yourself` — and one
+        # turn later the same message was replayed WITHOUT the envelope. Turn N+1's
+        # prompt therefore diverged from turn N's at the first byte of the previous
+        # user message, and no prefix cache can restore past a divergence (measured
+        # on the MLX native lane: 185-388 tokens re-prefilled every turn, growing).
+        # Stamping the DURABLE message here makes the bytes we send the bytes we
+        # store; `_normalize_turn_grounding` keeps what it finds from now on, and
+        # the envelope's timestamp means "when this turn was sent", which is what
+        # it should have meant. Idempotent: an already-stamped message is untouched,
+        # so a tool loop stamps its turn exactly once.
+        stamp_user_turn_grounding(context.get("messages"))
         messages_view = list(context.get("messages") or [])
         req = logic.build_request(
             task=task,
@@ -1904,9 +1933,20 @@ def create_react_workflow(
         # `_runtime.suppress_loop_tail` (runtime's BRIDGE, their spelling from
         # c2453) and the whole tail block — iteration line AND [plan] render —
         # stays out of the payload. Absent/falsy = unchanged task-agent behavior.
+        #
+        # CHROME vs ACTIONABLE (mission A, 2026-09-22). The loop-position line is
+        # chrome: it tells the model where it is, which on the FIRST iteration of a
+        # turn ("iteration 1 of 20") is no information at all. The budget warning
+        # and the [plan] render are actionable. The split matters because the merge
+        # branch below writes the tail INTO a message the transcript stores without
+        # it — so whatever merges makes that turn un-replayable byte-for-byte and
+        # costs the whole rest of the conversation its prefix cache. Chrome never
+        # merges; actionable content still does, and pays that price on the rare
+        # turns where a user message is last AND the loop is near its budget.
+        chrome_parts: list[str] = []
         tail_parts: list[str] = []
         if not suppress_loop_tail(runtime_ns):
-            tail_parts.append(f"[loop] iteration {int(iteration)} of {int(max_iterations)}.")
+            chrome_parts.append(f"[loop] iteration {int(iteration)} of {int(max_iterations)}.")
             # BUDGET-AWARE TRIAGE (2026-08-22). The position line alone is not a
             # steer: run 9ea71c55 read "[loop] iteration 19 of 20" and spent 19
             # AND 20 on further diagnosis, ending with a correct one-character
@@ -1955,31 +1995,22 @@ def create_react_workflow(
                         f"_limits.plan_render_max_chars={_plan_cap} ({len(plan_text.strip()):,} chars total)"
                     )
                 tail_parts.append(f"[plan]\n{plan_render}")
-        tail_text = "\n\n".join(tail_parts).strip()
-        if tail_text and isinstance(payload.get("messages"), list):
-            msgs_out = list(payload["messages"])
-            # Adjacency guard (Critic-3, 2026-07-09): when the payload already ends with a USER
-            # message (first turn: the task; post-ask_user turns: the user's reply), MERGE the
-            # volatile tail into it instead of appending a second consecutive user message —
-            # alternation-strict chat templates (Mistral/Gemma-class) reject user,user with a
-            # 400, and a separate trailing banner also steals the grounding envelope's
-            # "last user message" slot from the real task. When the payload ends with
-            # assistant/tool turns (the common tool-loop shape), the tail stays a separate
-            # trailing message exactly as before (no adjacency, cache prefix untouched).
-            if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
-                last = dict(msgs_out[-1])
-                last["content"] = f"{str(last.get('content') or '').rstrip()}\n\n{tail_text}"
-                msgs_out[-1] = last
-            else:
-                # Structural volatile marker (B1 pair, code c971 → agent c978 →
-                # runtime c986): runtime's llm_client EXCLUDES flagged messages
-                # from the prompt-cache fingerprint sequence and STRIPS the key
-                # before any provider/SDK sees it — so the per-cycle tail no
-                # longer forces a full local-cache re-prefill. The merged branch
-                # above cannot carry the flag (it holds the real task); that leg
-                # dies with runtime's B3 boundary-merge.
-                msgs_out.append({"role": "user", "content": tail_text, "volatile": True})
-            payload["messages"] = msgs_out
+        # WHERE THE TAIL GOES (mission A3, 2026-09-22) — see
+        # `transcripts.place_loop_tail`. Chat shape: unchanged from mission A
+        # (chrome dropped, only actionable content merges into the user's
+        # message). Tool-loop shape: the tail is appended to the DURABLE
+        # transcript, marked adapter-authored, instead of riding a `volatile`
+        # message that the next iteration drops — the drop made iteration N's
+        # prompt never a prefix of N+1's, which cost a whole iteration of
+        # prefill on every tool round once the cache kept one snapshot per call.
+        if isinstance(payload.get("messages"), list) and (chrome_parts or tail_parts):
+            payload["messages"] = place_loop_tail(
+                durable_messages=context.get("messages"),
+                payload_messages=payload["messages"],
+                chrome_parts=chrome_parts,
+                actionable_parts=tail_parts,
+                new_message=lambda **kw: _new_message(ctx, **kw),
+            )
 
         eff_provider = provider if isinstance(provider, str) and provider.strip() else runtime_ns.get("provider")
         eff_model = model if isinstance(model, str) and model.strip() else runtime_ns.get("model")
@@ -2413,6 +2444,20 @@ def create_react_workflow(
             # copy via the system prompt. Providers accept assistant messages carrying BOTH content
             # and tool_calls; this preserves multi-step coherence across long runs. The durable
             # scratchpad.cycles record is kept for host-side observability only.
+            #
+            # ONE ID NAMESPACE (mission A3, 2026-09-22). A model that announces
+            # tool calls without ids used to get TWO different fallbacks: the
+            # durable assistant message below minted `call_1..call_N`, and
+            # `act_node` minted `str(idx)` for the batch the executor answers. The
+            # results therefore came back under ids the announcement did not own,
+            # so `sanitize_transcript_messages` declared every announced id
+            # unanswered (`[tool result missing (host error): <name>]`) and folded
+            # every real result into one giant `[unpaired tool result]` USER
+            # message. Live run 081d8daa, 2026-09-22 10:48: 3 announced
+            # `web_search` calls -> 3 "missing" placeholders + a 13,585-char user
+            # carrier holding the actual search results. Stamping the id HERE,
+            # once, before either consumer reads the list, is the whole fix.
+            ensure_tool_call_ids(tool_calls)
             context["messages"].append(
                 _new_assistant_message_with_tool_calls(
                     ctx,
@@ -2558,7 +2603,12 @@ def create_react_workflow(
             else:
                 continue
             if "call_id" not in d or not d.get("call_id"):
-                d["call_id"] = str(idx)
+                # Mission A3: ONE fallback formula, shared with the durable
+                # assistant message (`assistant_tool_calls_payload`). `str(idx)`
+                # here made every result "foreign" to every announced id — see
+                # `transcripts.synthetic_call_id`. Parse already stamps these, so
+                # this branch is now only the crash-resume / raw-host path.
+                d["call_id"] = synthetic_call_id(idx)
             tool_queue.append(d)
 
         if not tool_queue:
@@ -2820,6 +2870,7 @@ def create_react_workflow(
                     # example-free tool prompts should not delegate a child
                     # that silently reverts to provider defaults.
                     "thinking",
+                    "speculation",
                     "max_output_tokens",
                     "tool_prompt_examples",
                     # Approval policy inherits MONOTONICALLY (tool-tiers adversary
@@ -2832,7 +2883,7 @@ def create_react_workflow(
                 ):
                     _v = runtime_ns.get(_k)
                     if _v is not None:
-                        sub_vars["_runtime"][_k] = _v
+                        sub_vars["_runtime"][_k] = deepcopy(_v) if _k == "speculation" else _v
 
                 # Host-gated substrate palette (0030 promoted 2026-07-13): the
                 # `substrate` arg names a profile the HOST granted via
@@ -2909,6 +2960,9 @@ def create_react_workflow(
                                     "warning": "#FALLBACK substrate thinking value not recognized; child keeps the inherited value",
                                 },
                             )
+                    if isinstance(profile, dict) and profile.get("speculation") is not None:
+                        sub_vars["_runtime"]["speculation"] = deepcopy(profile["speculation"])
+                        substrate_emit["speculation"] = deepcopy(profile["speculation"])
                     emit("delegate_agent_substrate", substrate_emit)
 
                 payload = {

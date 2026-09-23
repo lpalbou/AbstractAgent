@@ -122,12 +122,12 @@ def test_measured_over_real_adapter_loop() -> None:
 
     # Agrees with the pinned byte-discipline: heads identical across the run.
     assert report["heads_identical"] is True
-    # Known trade, MEASURED (adjacency guard, pinned in the prefix-stability suite):
-    # iteration 1's task message merges the volatile tail, so iteration 2 reuses the
-    # HEAD but zero messages — the measurement sees exactly what the cache would.
+    # The trade is GONE, MEASURED (mission A, 2026-09-22: loop chrome no longer
+    # merges into the durable task message, so iteration 1's message is reusable
+    # immediately). The measurement sees exactly what the cache would.
     assert per[1]["head_identical"] is True
-    assert per[1]["reused_message_count"] == 0
-    assert per[1]["reused_bytes"] == per[1]["head_bytes"] > 0
+    assert per[1]["reused_message_count"] == 1
+    assert per[1]["reused_bytes"] > per[1]["head_bytes"] > 0
     # From iteration 3 the transcript prefix is reusable and growing; the ratio is high.
     assert per[2]["reused_message_count"] > 0
     assert per[2]["reused_bytes"] > per[1]["reused_bytes"]

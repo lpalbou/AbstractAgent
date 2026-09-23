@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
 
 from abstractcore.tools import ToolCall, ToolDefinition
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
 from abstractruntime.memory.active_context import ActiveContextPolicy
+from abstractruntime.turn_grounding import stamp_user_turn_grounding
 
 from .generation_params import (
     DELEGATE_SUBSTRATE_KEYS,
@@ -28,7 +30,15 @@ from .generation_params import (
     verifier_response_schema,
 )
 from .media import extract_media_from_context
-from .transcripts import assistant_tool_calls_payload, extract_reasoning_text, parse_content_preview, sanitize_transcript_messages
+from .transcripts import (
+    assistant_tool_calls_payload,
+    ensure_tool_call_ids,
+    extract_reasoning_text,
+    parse_content_preview,
+    place_loop_tail,
+    sanitize_transcript_messages,
+    synthetic_call_id,
+)
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .read_orchestration import (
     advance_last_successful_read_batch,
@@ -549,6 +559,18 @@ def create_codeact_workflow(
             )
             emit("inbox_drained", {"chars": len(guidance)})
 
+        # STAMP THE TURN ONCE (mission A ported to CodeAct by mission A3,
+        # 2026-09-22). The runtime grounds every LLM turn with a
+        # `<runtime_metadata>` envelope carrying the local time. Injected at the
+        # PAYLOAD boundary and never stored, it made the durable transcript hold
+        # `do X` while the model was sent `<runtime_metadata>{…}</runtime_metadata>\ndo X`,
+        # so the same turn re-rendered differently one call later and no prefix
+        # cache could restore past it. Stamping the DURABLE message here makes the
+        # bytes we send the bytes we store; `_normalize_turn_grounding` keeps what
+        # it finds. Idempotent, so a tool loop stamps its turn exactly once, and it
+        # refuses payload-synthesized carriers.
+        stamp_user_turn_grounding(context.get("messages"))
+
         messages_view = ActiveContextPolicy.select_active_messages_for_llm_from_run(run)
 
         # Refresh tool metadata BEFORE rendering Active Memory so token fitting stays accurate
@@ -605,9 +627,10 @@ def create_codeact_workflow(
         # flagged messages from the cache fingerprint and strips the key).
         # `_runtime.suppress_loop_tail` (c2447): loop tails are task-agent
         # chrome — entity-lane hosts suppress the whole block (ReAct parity).
+        chrome_parts: list[str] = []
         tail_parts: list[str] = []
         if not suppress_loop_tail(runtime_ns):
-            tail_parts.append(f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}.")
+            chrome_parts.append(f"[loop] iteration {int(iteration + 1)} of {int(max_iterations)}.")
             if _flag(runtime_ns, "plan_mode", default=False):
                 plan_text = scratchpad.get("plan")
                 if isinstance(plan_text, str) and plan_text.strip():
@@ -625,16 +648,20 @@ def create_codeact_workflow(
                             f"_limits.plan_render_max_chars={_plan_cap} ({len(plan_text.strip()):,} chars total)"
                         )
                     tail_parts.append(f"[plan]\n{plan_render}")
-        tail_text = "\n\n".join(tail_parts).strip()
-        if tail_text and isinstance(payload.get("messages"), list):
-            msgs_out = list(payload["messages"])
-            if msgs_out and isinstance(msgs_out[-1], dict) and msgs_out[-1].get("role") == "user":
-                last = dict(msgs_out[-1])
-                last["content"] = f"{str(last.get('content') or '').rstrip()}\n\n{tail_text}"
-                msgs_out[-1] = last
-            else:
-                msgs_out.append({"role": "user", "content": tail_text, "volatile": True})
-            payload["messages"] = msgs_out
+        # Mission A3: one placement rule for all three loops
+        # (`transcripts.place_loop_tail`). Chat shape: chrome is dropped and
+        # only the actionable plan merges (this loop used to merge the position
+        # line INTO the user's durable message — mission A's bug 1b, never ported
+        # here). Tool-loop shape: the tail becomes a durable, marked message, so
+        # iteration N's prompt stays an exact prefix of N+1's.
+        if isinstance(payload.get("messages"), list) and (chrome_parts or tail_parts):
+            payload["messages"] = place_loop_tail(
+                durable_messages=context.get("messages"),
+                payload_messages=payload["messages"],
+                chrome_parts=chrome_parts,
+                actionable_parts=tail_parts,
+                new_message=lambda **kw: _new_message(ctx, **kw),
+            )
 
         # Per-run substrate override honesty (fable5 B-F10 2026-07-13): ReAct
         # and MemAct honor `_runtime.provider/model` (the gateway's per-run
@@ -741,6 +768,11 @@ def create_codeact_workflow(
             # PROPOSED the batch must announce the ids its tool results answer
             # — content-only appends orphaned every tool message on strict
             # providers (native OpenAI 400s the request at iteration 2).
+            # Mission A3: stamp the fallback ids HERE, once, so the announcement
+            # and the batch `act_node` queues share one id namespace (they used to
+            # mint `call_{i+1}` and `str(idx)` independently, which orphaned every
+            # result into an `[unpaired tool result]` user carrier).
+            ensure_tool_call_ids(tool_calls)
             context["messages"].append(
                 _new_assistant_message_with_tool_calls(
                     ctx,
@@ -886,7 +918,10 @@ def create_codeact_workflow(
                 continue
             call_id = str(d.get("call_id") or "").strip()
             if not call_id:
-                d["call_id"] = str(idx)
+                # Mission A3: one shared fallback formula (see
+                # `transcripts.synthetic_call_id`); `str(idx)` disagreed with the
+                # durable announcement and orphaned every result.
+                d["call_id"] = synthetic_call_id(idx)
             tool_queue.append(d)
 
         if not tool_queue:
@@ -1058,6 +1093,7 @@ def create_codeact_workflow(
                     # example-free tool prompts should not delegate a child
                     # that silently reverts to provider defaults.
                     "thinking",
+                    "speculation",
                     "max_output_tokens",
                     "tool_prompt_examples",
                     # Approval policy inherits monotonically (tool-tiers adversary
@@ -1066,7 +1102,7 @@ def create_codeact_workflow(
                 ):
                     _v = runtime_ns.get(_k)
                     if _v is not None:
-                        sub_vars["_runtime"][_k] = _v
+                        sub_vars["_runtime"][_k] = deepcopy(_v) if _k == "speculation" else _v
 
                 # Host-gated substrate palette (0030 promoted 2026-07-13): the
                 # `substrate` arg names a profile the HOST granted via
@@ -1142,6 +1178,9 @@ def create_codeact_workflow(
                                     "warning": "#FALLBACK substrate thinking value not recognized; child keeps the inherited value",
                                 },
                             )
+                    if isinstance(profile, dict) and profile.get("speculation") is not None:
+                        sub_vars["_runtime"]["speculation"] = deepcopy(profile["speculation"])
+                        substrate_emit["speculation"] = deepcopy(profile["speculation"])
                     emit("delegate_agent_substrate", substrate_emit)
 
                 payload = {

@@ -24,13 +24,32 @@ class _Ctx:
 _READ = ToolDefinition(name="read_file", description="read", parameters={})
 
 
-def _run(*, iteration_done: int, max_iterations: int, warn_pct: int = 80) -> RunState:
+def _run(*, iteration_done: int, max_iterations: int, warn_pct: int = 80, tool_loop: bool = False) -> RunState:
     """A run poised to enter `reason` for iteration `iteration_done + 1`.
 
     `context.messages` is seeded so the payload is message-shaped — the loop
     tail only rides a `messages` payload, which is the shape every real
     tool-calling turn has (verified in the incident ledger).
+
+    `tool_loop=True` seeds the transcript PAST the user turn (assistant
+    tool_calls + tool result), which is the shape a real iteration >1 has. It
+    matters since mission A (2026-09-22): the loop-POSITION line is chrome and
+    no longer merges into a durable user message, so it only appears where it
+    can ride a trailing volatile message — i.e. in this shape. The [budget]
+    steer this file exists to protect is ACTIONABLE and still merges either way.
     """
+    messages = [{"role": "user", "content": "fix the parse error"}]
+    if tool_loop:
+        messages += [
+            {
+                "role": "assistant",
+                "content": "reading",
+                "tool_calls": [
+                    {"type": "function", "id": "c1", "function": {"name": "read_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "content": "[read_file]: ok", "metadata": {"call_id": "c1"}},
+        ]
     return RunState(
         run_id="budget-tail",
         workflow_id="wf",
@@ -39,7 +58,7 @@ def _run(*, iteration_done: int, max_iterations: int, warn_pct: int = 80) -> Run
         vars={
             "context": {
                 "task": "fix the parse error",
-                "messages": [{"role": "user", "content": "fix the parse error"}],
+                "messages": messages,
             },
             "scratchpad": {"iteration": iteration_done, "cycles": []},
             "_runtime": {"inbox": [], "allowed_tools": ["read_file"]},
@@ -70,9 +89,17 @@ def _tail_of(run: RunState) -> str:
 
 
 def test_no_budget_line_while_the_budget_is_comfortable() -> None:
-    tail = _tail_of(_run(iteration_done=4, max_iterations=20))
+    tail = _tail_of(_run(iteration_done=4, max_iterations=20, tool_loop=True))
     assert "[loop] iteration 5 of 20" in tail
     assert "[budget]" not in tail, "an early iteration must not be nagged"
+
+
+def test_the_position_line_never_decorates_the_durable_user_turn() -> None:
+    """Mission A: chrome must not enter a message the transcript stores without
+    it — that is what made every conversational turn re-prefill."""
+    chat_shape = _tail_of(_run(iteration_done=4, max_iterations=20))
+    assert "[loop]" not in chat_shape
+    assert "fix the parse error" in chat_shape
 
 
 def test_budget_line_appears_at_the_declared_warn_threshold() -> None:
@@ -80,7 +107,7 @@ def test_budget_line_appears_at_the_declared_warn_threshold() -> None:
     comfortable = _tail_of(_run(iteration_done=14, max_iterations=20))
     assert "[budget]" not in comfortable
 
-    warned = _tail_of(_run(iteration_done=15, max_iterations=20))
+    warned = _tail_of(_run(iteration_done=15, max_iterations=20, tool_loop=True))
     assert "[loop] iteration 16 of 20" in warned
     assert "[budget] 4 iteration(s) left" in warned
     assert "apply it now" in warned
@@ -88,14 +115,14 @@ def test_budget_line_appears_at_the_declared_warn_threshold() -> None:
 
 def test_the_exact_shape_of_the_incident_iteration_19_of_20() -> None:
     """The iteration that had a correct diagnosis and no instruction to land it."""
-    tail = _tail_of(_run(iteration_done=18, max_iterations=20))
+    tail = _tail_of(_run(iteration_done=18, max_iterations=20, tool_loop=True))
     assert "[loop] iteration 19 of 20" in tail
     assert "[budget] 1 iteration(s) left" in tail
     assert "the turn ENDS" in tail
 
 
 def test_last_iteration_is_told_to_stop_investigating() -> None:
-    tail = _tail_of(_run(iteration_done=19, max_iterations=20))
+    tail = _tail_of(_run(iteration_done=19, max_iterations=20, tool_loop=True))
     assert "[loop] iteration 20 of 20" in tail
     assert "This is your LAST iteration" in tail
     assert "Do not start new investigation" in tail

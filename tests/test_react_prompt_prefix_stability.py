@@ -135,6 +135,13 @@ def test_react_request_prefix_is_byte_identical_across_iterations() -> None:
         # The transcript grew (assistant tool-call + tool observation + trailing turn).
         assert len(msgs_b) > len(msgs_a)
 
+    # Mission A (2026-09-22) strengthens the first pair: iteration 1 no longer
+    # decorates the task message with loop chrome, so ALL of iteration 1's
+    # messages — not just all-but-last — reappear byte-identical in iteration 2.
+    assert _dumps((payloads[1].get("messages") or [])[: len(payloads[0].get("messages") or [])]) == _dumps(
+        payloads[0].get("messages") or []
+    )
+
     # (4) Structural metric: the stable prefix grows monotonically (append-only lane).
     prefix_chars = [len(_dumps((p.get("messages") or [])[:-1])) for p in payloads]
     assert prefix_chars[0] < prefix_chars[1] < prefix_chars[2]
@@ -147,28 +154,42 @@ def test_react_volatile_state_rides_only_the_trailing_message() -> None:
         msgs = p.get("messages")
         assert isinstance(msgs, list) and msgs
 
-        # The grounding envelope (per-second timestamp) and the loop counter land ONLY in
-        # the trailing message; message[0] (the task) stays clean and byte-stable.
+        # The loop counter lands ONLY in the trailing message. The grounding
+        # envelope no longer moves at all: since mission A it is STAMPED once into
+        # the durable task message (that is what makes the message replayable
+        # byte-for-byte), and the per-call clock rides the trailing volatile
+        # message with the counter.
+        # Mission A3: earlier iterations' tails are now DURABLE (sent bytes ==
+        # stored bytes) and reappear where they were sent; every one of them is a
+        # marked, adapter-authored message — never folded into another message.
         for m in msgs[:-1]:
-            content = str(m.get("content") or "")
-            assert "<runtime_metadata>" not in content
-            assert "[loop]" not in content
+            if "[loop]" in str(m.get("content") or ""):
+                assert m.get("_af_synthetic") == "loop_tail"
+                assert str(m.get("content") or "").startswith("[loop] iteration ")
+
+        task_msg = str(msgs[0].get("content") or "")
+        assert task_msg.startswith("<runtime_metadata>")
+        assert task_msg.endswith("Create a project folder")
 
         tail = str(msgs[-1].get("content") or "")
         assert msgs[-1].get("role") == "user"
-        assert "<runtime_metadata>" in tail
-        assert f"[loop] iteration {i}" in tail
+        if i == 1:
+            # Iteration 1 is chat-shaped: the durable task IS the trailing message,
+            # so it carries no chrome at all — nothing volatile is sent.
+            assert tail is task_msg or tail == task_msg
+            assert "[loop]" not in tail
+        else:
+            assert f"[loop] iteration {i}" in tail
 
-    # Adjacency guard trade (2026-07-09): on iteration 1 the task message is ALSO the trailing
-    # user message, so the volatile tail merges into it (alternation-strict templates reject
-    # user,user). Cost: the task message is not prefix-reusable between iteration 1 and 2 (one
-    # small message, once per run). From iteration 2 onward the task message is pure and
-    # byte-identical — the growing prefix stays cache-stable for the rest of the run.
+    # The adjacency-guard TRADE is gone (mission A, 2026-09-22). On iteration 1 the
+    # task message is also the trailing user message, but the loop-position line is
+    # chrome and is dropped there instead of merged in — so the task message is
+    # byte-identical from iteration 1 onward and the whole prefix is reusable for
+    # the entire run, not from iteration 2.
     firsts = [_dumps((p.get("messages") or [])[0]) for p in payloads]
-    assert "[loop] iteration 1" in firsts[0]  # merged volatile tail on the first call
-    assert firsts[1] == firsts[2]  # stable from iteration 2 onward
+    assert firsts[0] == firsts[1] == firsts[2]
     assert "Create a project folder" in firsts[0]
-    assert "[loop]" not in firsts[1]  # later iterations carry the pure task message
+    assert "[loop]" not in firsts[0]
 
     # Structural volatile marker (B1 pair, code c971 → runtime c986): when the
     # tail rides as a SEPARATE trailing message (iterations 2+, the tool-loop
@@ -176,11 +197,22 @@ def test_react_volatile_state_rides_only_the_trailing_message() -> None:
     # excludes it from the prompt-cache fingerprint sequence and strips the
     # key before any provider sees it. The merged first-turn message must NOT
     # carry the flag (it holds the real task).
+    # Mission A3 supersedes the `volatile` flag here: the tail is durable and
+    # marked `_af_synthetic: loop_tail` (runtime skips it when locating the turn
+    # and strips the key before the provider), so iteration N's payload is an
+    # EXACT prefix of N+1's instead of all-but-its-last-message.
     for p in payloads[1:]:
         tail_msg = (p.get("messages") or [])[-1]
-        assert tail_msg.get("volatile") is True
+        assert tail_msg.get("_af_synthetic") == "loop_tail"
+        assert "volatile" not in tail_msg
+    for a, b in zip(payloads, payloads[1:]):
+        ma, mb = a.get("messages") or [], b.get("messages") or []
+        assert _dumps(mb[: len(ma)]) == _dumps(ma)
     first_msg = (payloads[0].get("messages") or [])[0]
     assert "volatile" not in first_msg
+    # Iteration 1 now carries NO volatile message at all: the only message is the
+    # durable task, stamped once.
+    assert len(payloads[0].get("messages") or []) == 1
 
 
 def test_react_assistant_tool_call_messages_retain_reasoning_content() -> None:
