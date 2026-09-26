@@ -282,3 +282,81 @@ def test_substrate_profile_thinking_is_a_known_key_not_skew() -> None:
     )
     for skew in _events_named(events, "delegate_agent_substrate_skew"):
         assert "thinking" not in (skew.get("ignored_keys") or [])
+
+
+# ---------------------------------------------------------------------------
+# 4. CodeAct / MemAct: the same thinking profile must not crash (NameError)
+# ---------------------------------------------------------------------------
+# Until 2026-09-26 both adapters called `normalize_thinking` in their
+# delegate_agent substrate branch without importing it, so a host-granted
+# profile carrying `thinking` raised NameError and failed the parent run.
+
+
+@pytest.mark.parametrize(
+    "factory,logic_cls,workflow_id",
+    [
+        (create_codeact_workflow, CodeActLogic, "codeact_agent"),
+        (create_memact_workflow, MemActLogic, "memact_agent"),
+    ],
+    ids=["codeact", "memact"],
+)
+def test_sibling_substrate_profile_thinking_pins_the_child_without_crashing(factory, logic_cls, workflow_id) -> None:
+    events: List[Tuple[str, Dict[str, Any]]] = []
+    delegated = {"done": False}
+
+    def llm_handler(run: RunState, effect: Effect, default_next_node: Optional[str]) -> EffectOutcome:
+        del effect, default_next_node
+        if getattr(run, "parent_run_id", None):
+            return EffectOutcome.completed({"content": "FINAL: child done", "tool_calls": [], "finish_reason": "stop"})
+        if not delegated["done"]:
+            delegated["done"] = True
+            return EffectOutcome.completed(
+                {
+                    "content": "Delegating.",
+                    "tool_calls": [
+                        {
+                            "name": "delegate_agent",
+                            "arguments": {"task": "Draft it.", "substrate": "drafting"},
+                            "call_id": "d1",
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                }
+            )
+        return EffectOutcome.completed({"content": "FINAL: parent done", "tool_calls": [], "finish_reason": "stop"})
+
+    runtime = Runtime(
+        run_store=InMemoryRunStore(),
+        ledger_store=InMemoryLedgerStore(),
+        effect_handlers={EffectType.LLM_CALL: llm_handler},
+        workflow_registry=WorkflowRegistry(),
+    )
+    workflow = factory(
+        logic=logic_cls(tools=[DELEGATE_AGENT_TOOL]),
+        workflow_id=workflow_id,
+        on_step=lambda s, d: events.append((s, dict(d))),
+    )
+    runtime.workflow_registry.register(workflow)
+    run_id = runtime.start(
+        workflow=workflow,
+        vars={
+            "context": {"task": "Delegate the task.", "messages": []},
+            "_runtime": {
+                "inbox": [],
+                "thinking": "high",
+                "delegate_substrates": {"drafting": {**PALETTE_BASE, "thinking": "low"}},
+            },
+        },
+        actor_id=None,
+        session_id=None,
+    )
+    for _ in range(300):
+        state = runtime.tick(workflow=workflow, run_id=run_id, max_steps=1)
+        if state.status in (RunStatus.COMPLETED, RunStatus.FAILED):
+            break
+    final = runtime.get_state(run_id)
+    assert final.status == RunStatus.COMPLETED, final.error
+    assert _child_runtime_ns(runtime, run_id).get("thinking") == "low"
+    assert runtime.get_state(run_id).vars["_runtime"].get("thinking") == "high"
+    applied = _events_named(events, "delegate_agent_substrate")
+    assert applied and applied[0].get("thinking") == "low"

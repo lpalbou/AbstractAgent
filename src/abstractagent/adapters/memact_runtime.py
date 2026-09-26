@@ -19,6 +19,7 @@ from .generation_params import (
     compose_prompt_slots,
     context_usage_warning,
     guidance_wrapper,
+    normalize_thinking,
     prompt_cache_capture,
     resolve_max_iterations,
     runtime_llm_params,

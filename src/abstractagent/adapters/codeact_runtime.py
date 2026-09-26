@@ -21,6 +21,7 @@ from .generation_params import (
     context_usage_warning,
     executor_tool_names,
     guidance_wrapper,
+    normalize_thinking,
     prompt_cache_capture,
     resolve_max_iterations,
     runtime_llm_params,

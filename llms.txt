@@ -13,6 +13,7 @@ Important notes (source-of-truth hints):
 - `src/abstractagent/adapters/loop_hooks.py` is the shared loop-hook layer (listen/steer/capture); see `docs/hooks.md`.
 - Version 0.3.14 requires `abstractcore[tools]>=2.13.41` and `AbstractRuntime>=0.5.0`; extras: `apple`, `gpu`, `test`, `dev`.
 - The loops stamp the runtime turn-grounding envelope into the durable user turn once (`abstractruntime.turn_grounding`) and place the loop tail with `transcripts.place_loop_tail`, keeping prompts byte-prefix stable across iterations and turns.
+- A reply with no tool call that only announces tool use ("Let me verify …") or carries tool calls that could not run (unknown tool, cut-off call, calls left in the thinking block) is not an answer: ReAct, CodeAct and MemAct re-prompt ONCE with the reply appended verbatim (reasoning included); a second failure ends the step with a visible error (ReAct: `stop_reason.code = "no_tool_call"`). Neither is ever published as the answer. See `src/abstractagent/adapters/announced_calls.py` and `docs/agents.md`.
 - MemAct is not re-exported at the package top-level; import from `abstractagent.agents.memact` (see `docs/api.md`).
 - After changes, run tests: `pytest -q` (`python -P -m pytest -q` from a folder with sibling checkouts)
 
