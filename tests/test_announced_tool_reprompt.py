@@ -19,7 +19,12 @@ These tests drive the real workflows with a fake provider.
 
 from __future__ import annotations
 
+import glob
 import json
+import logging
+import os
+import types
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -65,8 +70,30 @@ XP_ANNOUNCEMENTS = [
     "I have strong material across all five areas. Let me verify a couple of the highest-impact claims (oil price level, the Hormuz/Iran war status, and gold) before writing the digest.",
 ]
 
-# Realistic final answers that must NOT be re-prompted.
+# Review 28 D7 positives (English) that the first cut missed.
+EXTRA_ANNOUNCEMENTS = [
+    "I'm going to grep the codebase for the remaining TODO markers.",
+    "Checking the remaining two sources now.",
+    "Proceeding to fetch the two primary sources.",
+    "One more search to confirm the oil figure, then the digest.",
+    "First, a quick search for the ECB decision.",
+    "I need a bit more data on the Hormuz situation.",
+]
+
+# Realistic final answers that must NOT be re-prompted: review 28's 23-final
+# set (its 4 false positives included) plus earlier cases.
 GENUINE_FINALS = [
+    "Let me summarize: the build passed and all tests are green.",
+    "I'll use the default settings unless you say otherwise.",
+    "Next, I recommend you review the diff yourself.",
+    "I will write the report once you confirm the scope.",
+    "Here is the digest: oil $98, gold at a record, ECB on hold.",
+    "Let me explain: the cache misses because the system prompt changes every turn.",
+    "I'll update the docs after you approve the wording.",
+    "The tests pass. I'd suggest merging.",
+    "Running the tests shows everything green.",
+    "I fetched both pages; they agree on the $98 figure.",
+    "No changes needed.",
     "Done.",
     "Done. The folder `project/` now contains main.py and a README.",
     "The capital of France is Paris.",
@@ -94,8 +121,20 @@ GENUINE_FINALS = [
 
 
 def test_every_xp_announcement_is_detected() -> None:
-    for text in XP_ANNOUNCEMENTS:
+    for text in XP_ANNOUNCEMENTS + EXTRA_ANNOUNCEMENTS:
         assert looks_like_tool_announcement(text), text
+
+
+def test_genuine_final_set_has_zero_false_positives() -> None:
+    assert len(GENUINE_FINALS) >= 23
+    flagged = [t for t in GENUINE_FINALS if looks_like_tool_announcement(t)]
+    assert flagged == []
+
+
+def test_announcement_must_be_the_last_sentence() -> None:
+    # Intent early, delivery last: an answer.
+    assert looks_like_tool_announcement("Let me check. The value is 42, from config.yaml line 12.") is False
+    assert looks_like_tool_announcement("The value is probably 42. Let me check config.yaml to confirm.") is True
 
 
 @pytest.mark.parametrize("text", GENUINE_FINALS)
@@ -115,6 +154,53 @@ def test_reasoning_markup_behind_a_visible_answer_is_an_answer() -> None:
         "reasoning": "Maybe <tool_call>{\"name\": \"web_search\"}</tool_call> — no, I know this.",
     }
     assert classify_no_call_reply(resp, "Paris.", tools_offered=True) == ("", "")
+
+
+def test_markup_in_thinking_with_no_metadata_is_unrunnable() -> None:
+    """Fallback for providers that return reasoning with markup and NO core
+    metadata (older core, remote servers): review 28 D6."""
+    resp = {"content": "", "reasoning": "<tool_call>\n<function=fetch_url>\n<parameter=url>\nhttps://x\n"}
+    reason, detail = classify_no_call_reply(resp, resp["reasoning"], tools_offered=True)
+    assert reason == REASON_UNRUNNABLE and "thinking" in detail
+
+
+def test_core_warning_contract() -> None:
+    """The warnings are produced by abstractcore ITSELF (no hand-copied sentence):
+    a core rewording turns this red instead of silently disabling detection.
+    Core (1190cf1) has no structured warning code; `unparsed_tool_call` is the
+    only structured field and is read first."""
+    from abstractcore.core.types import GenerateResponse
+    from abstractcore.providers.base import BaseProvider
+    from abstractcore.tools.handler import UniversalToolHandler
+
+    dummy = types.SimpleNamespace(logger=logging.getLogger("agx"), model="qwen3.6-27b")
+    unknown = GenerateResponse(content="", metadata={})
+    BaseProvider._warn_unrecognized_tool_syntax(
+        dummy, unknown, "<tool_call>\n<function=fetch_page>\n</function>\n</tool_call>",
+        dropped_names=["fetch_page"], allowed_names={"fetch_url"},
+    )
+    reason, detail = classify_no_call_reply({"content": "", "metadata": unknown.metadata}, "", tools_offered=True)
+    assert reason == REASON_UNRUNNABLE and "'fetch_page'" in detail and "not an available tool" in detail
+
+    dummy2 = types.SimpleNamespace(
+        logger=logging.getLogger("agx"),
+        model="qwen3.6-27b",
+        _TOOL_ENVELOPE_OPENER_RE=BaseProvider._TOOL_ENVELOPE_OPENER_RE,
+        _normalize_tool_calls_payload=lambda calls, allowed_tool_names=None: None,
+        _warn_unrecognized_tool_syntax=lambda *a, **k: BaseProvider._warn_unrecognized_tool_syntax(dummy, *a, **k),
+    )
+    drafted = (
+        "Plan: <tool_call>\n<function=fetch_url>\n<parameter=url>\nhttps://x\n</parameter>\n</function>\n"
+        "</tool_call>\nActually, let me think more about this first."
+    )
+    mid = GenerateResponse(content="", metadata={"reasoning": drafted})
+    BaseProvider._recover_tool_calls_from_reasoning(
+        dummy2, mid, tool_handler=UniversalToolHandler("qwen3.6-27b"), allowed_names={"fetch_url"}
+    )
+    # Reasoning stripped from the dict so ONLY the core warning can match.
+    meta = {k: v for k, v in mid.metadata.items() if k != "reasoning"}
+    reason, detail = classify_no_call_reply({"content": "", "metadata": meta}, "", tools_offered=True)
+    assert reason == REASON_UNRUNNABLE and "inside the model's thinking" in detail
 
 
 def test_verbatim_reply_keeps_the_thinking_block() -> None:
@@ -287,12 +373,17 @@ def test_react_unknown_tool_in_thinking_is_reprompted_with_the_markup_visible() 
     assert reprompt["reason"] == REASON_UNRUNNABLE
     assert "fetch_page" in reprompt["detail"]
 
-    # The model sees its own think-held call — never the emptied record.
+    # The model sees its own think-held call QUOTED in the corrective user
+    # message (templates strip <think> from assistant history turns).
     msgs = payloads[1]["messages"]
-    shown = [m for m in msgs if m.get("role") == "assistant" and "<function=fetch_page>" in str(m.get("content") or "")]
-    assert len(shown) == 1
-    assert shown[0]["content"].startswith("<think>\n")
-    assert "cannot run" in msgs[msgs.index(shown[0]) + 1]["content"]
+    corrective = msgs[-1]
+    assert corrective["role"] == "user"
+    assert "Your previous reply was, verbatim:" in corrective["content"]
+    assert "<function=fetch_page>" in corrective["content"]
+    assert "cannot run" in corrective["content"]
+    # The assistant turn is the provider's visible content, unchanged.
+    history = [m for m in msgs if m.get("role") == "assistant"]
+    assert all("<think>" not in str(m.get("content") or "") for m in history)
 
     assert [tc["name"] for tc in executed] == ["fetch_url", "fetch_url"]
     assert "<tool_call>" not in _answer(state)
@@ -357,7 +448,7 @@ def test_react_unparsed_cut_off_call_is_reprompted() -> None:
     state, payloads, steps, executed, _ = _drive("react", [cut, VISIBLE_CALLS, DIGEST])
     reprompt = next(d for s, d in steps if s == "parse_reprompt")
     assert reprompt["reason"] == REASON_UNRUNNABLE and "cut off" in reprompt["detail"]
-    assert any("https://exa" in str(m.get("content") or "") for m in payloads[1]["messages"] if m.get("role") == "assistant")
+    assert "https://exa" in payloads[1]["messages"][-1]["content"]
     assert len(executed) == 2 and state.status == RunStatus.COMPLETED
 
 
@@ -393,7 +484,9 @@ def test_react_visit_lane_markup_reprompt_is_host_voiced() -> None:
     )
     assert "parse_reprompt" in _names(steps)
     corrective = payloads[1]["messages"][-1]["content"]
-    assert "tool" not in corrective.lower()
+    instruction = corrective.split("```\n\n", 1)[-1]
+    assert "tool" not in instruction.lower()
+    assert "<function=fetch_page>" in corrective
     assert "<tool_call>" not in _answer(state)
 
 
@@ -412,10 +505,57 @@ def test_react_recovered_thinking_calls_are_counted_on_every_host_surface() -> N
     assert notice["severity"] == "info" and "2 tool call(s)" in notice["text"]
 
 
-def test_react_check_plan_false_disables_both_checks() -> None:
+def test_react_check_plan_false_disables_only_the_announcement_check() -> None:
     state, payloads, steps, _, _ = _drive("react", [ANNOUNCE], runtime_vars={"check_plan": False})
     assert "parse_reprompt" not in _names(steps) and len(payloads) == 1
     assert _answer(state) == ANNOUNCE["content"]
+    # The unrunnable check is independent (review 28 Q4): still on.
+    state, _, steps, _, _ = _drive(
+        "react", [UNKNOWN_TOOL_IN_THINKING, VISIBLE_CALLS, DIGEST], runtime_vars={"check_plan": False}
+    )
+    assert "parse_reprompt" in _names(steps) and _answer(state).startswith("# Digest")
+
+
+def test_react_check_unrunnable_calls_false_is_its_own_switch() -> None:
+    markup_only = {
+        "content": '<tool_call>{"name": "fetch_page", "arguments": {}}</tool_call>',
+        "tool_calls": [],
+        "finish_reason": "stop",
+    }
+    state, payloads, steps, _, _ = _drive(
+        "react", [markup_only, DIGEST], runtime_vars={"check_unrunnable_calls": False}
+    )
+    assert "parse_reprompt" not in _names(steps) and len(payloads) == 1
+    # Control: the same reply IS re-prompted with the switch at its default.
+    _, _, steps_default, _, _ = _drive("react", [markup_only, DIGEST])
+    assert "parse_reprompt" in _names(steps_default)
+    # The announcement check stays on.
+    _, _, steps, _, _ = _drive(
+        "react", [ANNOUNCE, VISIBLE_CALLS, DIGEST], runtime_vars={"check_unrunnable_calls": False}
+    )
+    assert "parse_reprompt" in _names(steps)
+
+
+LONG_DIGEST = (
+    "## Daily digest\n\n"
+    + "Oil rose 6% after the Hormuz disruption; Brent settled near $98 while analysts split on whether the "
+    "spike holds. Gold printed a record on safe-haven flows. The ECB held rates and flagged energy-driven "
+    "inflation; the Fed kept its two-cut path. Germany's coalition talks stalled over the budget. "
+) * 2 + "Let me list the three risks worth watching: supply, rates, and the rare-earth export curbs."
+
+
+def test_react_long_answer_with_intent_words_is_never_an_error() -> None:
+    """Review 28 D4: an 800-char digest containing "Let me list ..." must not go
+    through the once-then-error path, even when sent twice."""
+    plain = LONG_DIGEST.replace("## Daily digest\n\n", "")
+    assert len(plain) > 600
+    reply = {"content": plain, "tool_calls": [], "finish_reason": "stop"}
+    state, _, steps, _, _ = _drive("react", [reply, reply, reply], max_iterations=3)
+    names = _names(steps)
+    assert "parse_reprompt" not in names and "parse_reprompt_failed" not in names
+    out = state.output or {}
+    assert out.get("stop_reason", {}).get("code") != "no_tool_call"
+    assert not any(n.get("code") == "no_tool_call" for n in out.get("notices") or [])
 
 
 # ---------------------------------------------------------------------------
@@ -453,3 +593,112 @@ def test_sibling_loops_genuine_final_is_not_reprompted(loop: str) -> None:
     state, payloads, steps, _, _ = _drive(loop, [{"content": "Done.", "tool_calls": []}])
     assert "parse_reprompt" not in _names(steps)
     assert "Done." in _answer(state)
+
+
+@pytest.mark.parametrize("loop", ["codeact", "memact"])
+def test_sibling_loops_announcement_on_the_last_iteration_is_a_named_stop(loop: str) -> None:
+    """Review 28 D3: no re-prompt on the last iteration, and never publish the
+    first turn's pre-call narration ("Searching.")."""
+    state, payloads, steps, _, _ = _drive(loop, [FIRST_BATCH, ANNOUNCE], max_iterations=2)
+    names = _names(steps)
+    assert "parse_reprompt" not in names and "parse_reprompt_skipped" in names
+    out = state.output or {}
+    assert out["answer"].startswith("Error: the model's reply announced tool use")
+    assert "no iteration was left" in out["answer"]
+    assert "Searching." not in out["answer"] and ANNOUNCE["content"] not in out["answer"]
+    assert out["stop_reason"]["code"] == "no_tool_call"
+    assert len(payloads) == 2
+
+
+@pytest.mark.parametrize("loop", ["codeact", "memact"])
+def test_sibling_loops_double_failure_names_the_stop(loop: str) -> None:
+    state, _, _, _, _ = _drive(loop, [ANNOUNCE, ANNOUNCE])
+    out = state.output or {}
+    assert out["stop_reason"]["code"] == "no_tool_call"
+    assert "after one re-prompt" in out["stop_reason"]["headline"]
+
+
+# ---------------------------------------------------------------------------
+# Real chat template: the quoted reply reaches the rendered prompt (D1)
+# ---------------------------------------------------------------------------
+
+_FIXTURE_TEMPLATE = Path(__file__).parent / "fixtures" / "chat_templates" / "qwen3_6.jinja"
+
+
+def _cached_qwen36_template() -> Optional[Path]:
+    hub = Path(os.environ.get("HF_HUB_CACHE") or Path.home() / ".cache" / "huggingface" / "hub")
+    # Read-only lookup; the scratch-HOME test run falls back to the real user cache path.
+    for root in {hub, Path("/Users") / os.environ.get("USER", "") / ".cache/huggingface/hub"}:
+        hits = sorted(glob.glob(str(root / "models--mlx-community--Qwen3.6-*" / "snapshots" / "*" / "chat_template.jinja")))
+        if hits:
+            return Path(hits[0])
+    return None
+
+
+def _render(template_text: str, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> str:
+    import jinja2  # a hard test dependency (the `test` extra): never skip this check
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    def raise_exception(msg: str) -> None:
+        raise jinja2.TemplateError(msg)
+
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    env.globals["raise_exception"] = raise_exception
+    clean = [{"role": m["role"], "content": m.get("content") or ""} for m in messages]
+    return env.from_string(template_text).render(messages=clean, tools=tools, add_generation_prompt=True)
+
+
+def _reprompt_payload() -> Dict[str, Any]:
+    _, payloads, steps, _, _ = _drive("react", [FIRST_BATCH, UNKNOWN_TOOL_IN_THINKING, VISIBLE_CALLS, DIGEST])
+    assert "parse_reprompt" in _names(steps)
+    payload = payloads[2]
+    msgs = [m for m in payload["messages"] if m.get("role") in ("user", "assistant")]
+    return {"messages": [{"role": "system", "content": payload.get("system_prompt") or ""}] + msgs,
+            "tools": payload.get("tools") or []}
+
+
+def _template_sources() -> List[Any]:
+    out = [pytest.param(_FIXTURE_TEMPLATE, id="fixture-qwen3.6")]
+    cached = _cached_qwen36_template()
+    out.append(
+        pytest.param(cached, id="hf-cache-qwen3.6")
+        if cached
+        else pytest.param(None, id="hf-cache-qwen3.6", marks=pytest.mark.skip(reason="Qwen3.6 not in the local HF cache"))
+    )
+    return out
+
+
+@pytest.mark.parametrize("template_path", _template_sources())
+def test_quoted_reply_survives_the_qwen36_template(template_path: Optional[Path]) -> None:
+    assert template_path is not None and template_path.is_file()
+    p = _reprompt_payload()
+    rendered = _render(template_path.read_text(), p["messages"], p["tools"])
+    # The think-held call reaches the prompt the model actually reads.
+    assert "<function=fetch_page>" in rendered
+    assert "Your previous reply was, verbatim:" in rendered
+
+
+def test_history_turn_alone_would_lose_the_markup_under_qwen36() -> None:
+    """Negative control (why the quote exists): the same reply carried ONLY as
+    a `<think>` assistant history turn before a later user message renders
+    empty under the Qwen3.6 template."""
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "<think>\n" + THINK_MARKUP + "\n</think>"},
+        {"role": "user", "content": "Your previous reply placed tool calls where they cannot run."},
+    ]
+    rendered = _render(_FIXTURE_TEMPLATE.read_text(), msgs, [])
+    assert "<function=fetch_page>" not in rendered
+    assert "<|im_start|>assistant\n<|im_end|>" in rendered
+
+
+@pytest.mark.parametrize("loop", ["codeact", "memact"])
+def test_sibling_budget_terminal_never_publishes_pre_call_narration(loop: str) -> None:
+    """Review 28 D3, second half: a turn that carried tool calls is narration,
+    not the agent's last words."""
+    state, _, _, executed, _ = _drive(loop, [FIRST_BATCH], max_iterations=1)
+    assert [tc["name"] for tc in executed] == ["web_search"]
+    answer = _answer(state)
+    assert answer != "Searching." and "Searching." not in answer
+    assert "iteration budget" in answer

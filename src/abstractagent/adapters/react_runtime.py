@@ -50,6 +50,9 @@ from .announced_calls import (
     has_negated_intent,
     looks_like_tool_announcement,
     no_call_error_text,
+    no_call_stop_reason,
+    resolve_checks,
+    visible_content as _visible_content,
     reprompt_text,
     tool_calls_from_reasoning,
     verbatim_reply,
@@ -455,40 +458,8 @@ def _stop_reason(
         }
 
     if no_call is not None:
-        # Mission AGX: a reply announced tool use (or wrote tool calls that
-        # could not run), and the one re-prompt got the same. Not a budget
-        # stop and not a loop: the model is not emitting the calls it means.
-        unrunnable = str(no_call.get("reason") or "") == REASON_UNRUNNABLE
-        detail = str(no_call.get("detail") or "").strip()
-        what = (
-            "wrote tool calls that could not run"
-            if unrunnable
-            else "announced tool use without calling any tool"
-        )
-        return {
-            "code": "no_tool_call",
-            "finished": False,
-            "budget_exhausted": False,
-            "iterations": iterations,
-            "label": (
-                f"stopped: tool call could not run{iters_txt}"
-                if unrunnable
-                else f"stopped: announced tools, made no call{iters_txt}"
-            ),
-            "headline": (
-                f"The agent stopped early{iters_txt}: the model {what}"
-                + (f" ({detail})" if detail else "")
-                + ", and did the same after one re-prompt, so nothing ran. The answer was "
-                "written from what the run already had."
-            ),
-            "remedy": (
-                "The iteration budget was not the limit. Check that the tool the model asked for is "
-                "enabled for this agent, then retry."
-                if unrunnable
-                else "The iteration budget was not the limit. Retry; if it recurs, use another model or "
-                "turn thinking off for this agent (the model announces calls it does not emit)."
-            ),
-        }
+        # Mission AGX: shared wording across the three loops.
+        return no_call_stop_reason(no_call, iterations=iterations)
 
     if kind:
         shape = (
@@ -2670,19 +2641,11 @@ def create_react_workflow(
         # goes to its conclusion path with the reason named (stop_reason,
         # notices, report). Neither reply is ever published as the answer.
         #
-        # Knobs: `_runtime.check_plan` (the announcement heuristic) keeps its
-        # historical defaults — ON in task lanes, OFF in visit lanes
-        # (suppress_loop_tail), where "I will read that entry again" is
-        # musing. The UNRUNNABLE check is not a guess about intent, so it
-        # defaults ON in every lane; an explicit `check_plan=false` turns both
-        # off.
-        raw_check_plan = runtime_ns.get("check_plan") if isinstance(runtime_ns, dict) else None
-        if raw_check_plan is None:
-            check_plan = not suppress_loop_tail(runtime_ns)
-            check_unrunnable = True
-        else:
-            check_plan = _boolish(raw_check_plan)
-            check_unrunnable = check_plan
+        # Knobs (independent, see announced_calls.resolve_checks):
+        # `_runtime.check_plan` = the announcement heuristic (ON in task
+        # lanes, OFF in visit lanes); `_runtime.check_unrunnable_calls` = the
+        # unrunnable-markup check (ON everywhere).
+        check_plan, check_unrunnable = resolve_checks(runtime_ns, suppressed=suppress_loop_tail(runtime_ns))
         tool_specs_now = runtime_ns.get("tool_specs") if isinstance(runtime_ns, dict) else None
         tools_offered = isinstance(tool_specs_now, list) and bool(tool_specs_now)
         no_call_reason, no_call_detail = classify_no_call_reply(
@@ -2692,18 +2655,6 @@ def create_react_workflow(
             check_announcement=check_plan,
             check_unrunnable=check_unrunnable,
         )
-        if (
-            not no_call_reason
-            and check_plan
-            and tools_offered
-            and _looks_like_deferred_action(content)
-            and not has_negated_intent(content)
-        ):
-            # The historical long-reply followthrough heuristic (any length),
-            # now bounded by the same once-per-step rule.
-            no_call_reason = "announced_tool_use"
-            no_call_detail = "the reply announced tool use but contained no tool call"
-
         if no_call_reason:
             suppressed = suppress_loop_tail(runtime_ns)
             raw_reply = verbatim_reply(response, fallback=str(content or ""))
@@ -2717,7 +2668,7 @@ def create_react_workflow(
                     _new_message(
                         ctx,
                         role="assistant",
-                        content=raw_reply,
+                        content=_visible_content(response),
                         metadata={"kind": "reprompt_failed_reply", "cycle": cycle_i, "reason": no_call_reason},
                     )
                 )
@@ -2743,14 +2694,16 @@ def create_react_workflow(
                 )
                 return StepPlan(node_id="parse", next_node="max_iterations")
 
-            # FIRST failure: the verbatim reply joins the durable transcript,
-            # then the corrective message. Both are what the model is shown on
-            # the re-prompt call; the durable record keeps what really happened.
+            # FIRST failure: the assistant turn is kept as the provider
+            # returned its visible content; the verbatim reply (reasoning
+            # included) is QUOTED inside the corrective user message, because
+            # Qwen3.5/3.6 templates strip `<think>` from assistant turns before
+            # the last user message (review 28 D1).
             context["messages"].append(
                 _new_message(
                     ctx,
                     role="assistant",
-                    content=raw_reply,
+                    content=_visible_content(response),
                     metadata={"kind": "reprompted_reply", "cycle": cycle_i, "reason": no_call_reason},
                 )
             )
@@ -2758,7 +2711,9 @@ def create_react_workflow(
                 _new_message(
                     ctx,
                     role="user",
-                    content=reprompt_text(no_call_reason, tools_offered=tools_offered, suppressed=suppressed),
+                    content=reprompt_text(
+                        no_call_reason, tools_offered=tools_offered, suppressed=suppressed, reply=raw_reply
+                    ),
                     metadata={"kind": "reprompt", "cycle": cycle_i, "reason": no_call_reason},
                 )
             )
@@ -2768,6 +2723,28 @@ def create_react_workflow(
             if no_call_reason == "announced_tool_use":
                 # Compat: the followthrough lane's historical event name.
                 emit("parse_retry_plan_only", {"cycle": cycle_i})
+            if last_call_media:
+                temp["pending_media"] = last_call_media
+            return StepPlan(node_id="parse", next_node="reason")
+
+        # The historical followthrough heuristic (`_looks_like_deferred_action`,
+        # any length) stays a SOFT nudge, separate from the once-then-error
+        # path above: it can match a real 800-char answer that happens to say
+        # "Let me list the three risks", so it never ends a step with an error.
+        if (
+            check_plan
+            and tools_offered
+            and cycle_i < max_iterations
+            and _looks_like_deferred_action(content)
+            and not has_negated_intent(content)
+        ):
+            _push_inbox(
+                runtime_ns,
+                "You said you would take an action, but you did not call any tools.\n"
+                "If you need to act, call the next tool now (emit ONLY the next tool call(s)).\n"
+                "If you are already done, provide the final answer with NO tool calls.",
+            )
+            emit("parse_retry_plan_only", {"cycle": cycle_i, "soft": True})
             if last_call_media:
                 temp["pending_media"] = last_call_media
             return StepPlan(node_id="parse", next_node="reason")

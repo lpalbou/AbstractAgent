@@ -195,9 +195,9 @@ Adapters merge these values into LLM params via `runtime_llm_params(...)` in `sr
 ## Why does the agent “retry” when the model says “I will do X” but calls no tools?
 
 A reply that only announces tool use ("Let me verify …") or carries tool-call markup that could not run is not an
-answer. ReAct, CodeAct and MemAct re-prompt once, showing the model its reply verbatim; if the second reply fails the
+answer. ReAct, CodeAct and MemAct re-prompt once, quoting the model's reply verbatim; if the second reply fails the
 same way, the step ends with a visible error and the reply is never published. The announcement check can be
-disabled with `_runtime.check_plan=false` (see [`docs/agents.md`](agents.md#replies-that-announce-tools-without-calling-them-all-three-loops)).
+disabled with `_runtime.check_plan=false`; the tool-markup check has its own switch, `_runtime.check_unrunnable_calls` (see [`docs/agents.md`](agents.md#replies-that-announce-tools-without-calling-them-all-three-loops)).
 
 Source of truth: `src/abstractagent/adapters/announced_calls.py` and the `parse` nodes of the three adapters.
 

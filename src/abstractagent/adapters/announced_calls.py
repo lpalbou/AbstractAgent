@@ -43,9 +43,12 @@ __all__ = [
     "resolve_checks",
     "looks_like_tool_announcement",
     "no_call_error_text",
+    "no_call_stop_reason",
+    "quote_reply",
     "reprompt_text",
     "tool_calls_from_reasoning",
     "verbatim_reply",
+    "visible_content",
 ]
 
 REASON_ANNOUNCED = "announced_tool_use"
@@ -98,7 +101,7 @@ _TOOL_VERB_RE = re.compile(
     r"(?i)\b("
     r"read|open|search|list|skim|inspect|explore|scan|run|execute|edit|fetch|download|creat(?:e|ing)|"
     r"verify|check|double-check|confirm|validate|get|gather|grab|pull|look(?:\s+up|\s+into|\s+at)?|find|"
-    r"research|dig|fill|collect|query|call|use|try|test|browse|visit|retrieve|load|review|investigate|"
+    r"research|dig|fill|collect|query|call|test|browse|visit|retrieve|load|review|investigate|grep|"
     r"examine|analy[sz]e|compare|write|save|update|modify|patch|install|build|compile|apply|"
     r"do (?:one|a|another|two|some)"
     r")\b"
@@ -106,8 +109,31 @@ _TOOL_VERB_RE = re.compile(
 # The model waiting on the user is a legitimate final reply.
 _WAITING_RE = re.compile(
     r"(?i)\b(let me know|what would you like|would you like|do you want|tell me|shall i|should i|"
-    r"i['’]ll wait|i will wait|waiting for|if you (?:want|need|like|prefer))\b"
+    r"i['’]ll wait|i will wait|waiting for|if you (?:want|need|like|prefer)|"
+    r"once you|when you|after you|unless you|until you|if you say|your (?:go|confirmation|approval))\b"
 )
+# Intent followed by a verb that TALKS rather than acts: "Let me summarize:",
+# "Next, I recommend ...". Never an announcement of tool work.
+_NON_ACTION_AFTER_INTENT_RE = re.compile(
+    r"(?i)\b(?:let me|let['’]s|i will|i['’]ll|i am going to|i['’]m going to|i should|next,? i|now i)\s+"
+    r"(?:also\s+|briefly\s+|just\s+)?"
+    r"(?:summari[sz]e|explain|recommend|suggest|mention|note|clarify|add|point out|conclude|answer|say|"
+    r"be (?:clear|brief|honest)|start by saying|wrap up)\b"
+)
+# Present-progressive or elliptical action statements with no first person:
+# "Checking the remaining two sources now.", "Proceeding to fetch ...",
+# "One more search to confirm ..., then the digest.", "First, a quick search for ...".
+_ACTION_STATEMENT_RE = re.compile(
+    r"(?i)^(?:"
+    r"proceeding to \w+|"
+    r"(?:checking|fetching|searching|looking up|reading|running|verifying|pulling|gathering|grabbing|opening|"
+    r"loading|querying|downloading|inspecting|scanning|grepping|confirming|retrieving)\b.*\b(?:now|next|then|first)\b|"
+    r"(?:one|two|a few) more (?:search|searches|check|checks|lookup|lookups|fetch|fetches|pass|read|reads)\b|"
+    r"first,? (?:a|one) (?:quick )?(?:search|check|lookup|fetch|pass|read)\b|"
+    r"i need (?:a bit |a little |some )?more (?:data|info|information|detail|details|context|evidence|sources)\b"
+    r")"
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!])\s+")
 # A reply that STARTS by delivering is a final answer, whatever intent words follow.
 _DELIVERY_START_RE = re.compile(
     r"(?i)^\s*(done|finished|completed|all set|all done|here (?:is|are)|here['’]s|final answer|in summary|"
@@ -127,21 +153,28 @@ def is_not_an_answer(message: Any) -> bool:
     return isinstance(meta, dict) and meta.get("kind") in NOT_AN_ANSWER_KINDS
 
 
-def resolve_checks(runtime_ns: Any, *, suppressed: bool) -> Tuple[bool, bool]:
-    """(check_announcement, check_unrunnable) from `_runtime.check_plan`.
-
-    Absent: the announcement heuristic is ON in task lanes and OFF in visit
-    lanes (musing is not a defect there); the unrunnable check is a fact about
-    the reply, not a guess, so it is ON everywhere. An explicit value sets both.
-    """
-    raw = runtime_ns.get("check_plan") if isinstance(runtime_ns, dict) else None
-    if raw is None:
-        return (not suppressed), True
+def _flag(raw: Any) -> bool:
     if isinstance(raw, str):
-        on = raw.strip().lower() in {"1", "true", "yes", "on"}
-    else:
-        on = bool(raw)
-    return on, on
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(raw)
+
+
+def resolve_checks(runtime_ns: Any, *, suppressed: bool) -> Tuple[bool, bool]:
+    """(check_announcement, check_unrunnable), two independent switches.
+
+    - `_runtime.check_plan` controls ONLY the announcement heuristic (a guess
+      about intent): absent = ON in task lanes, OFF in visit lanes, where
+      "I will read that entry again" is musing.
+    - `_runtime.check_unrunnable_calls` controls the unrunnable-markup check
+      (a fact about the reply): absent = ON in every lane. Turning the
+      heuristic off must never re-enable publishing raw tool markup.
+    """
+    ns = runtime_ns if isinstance(runtime_ns, dict) else {}
+    raw_plan = ns.get("check_plan")
+    check_announcement = (not suppressed) if raw_plan is None else _flag(raw_plan)
+    raw_unrunnable = ns.get("check_unrunnable_calls")
+    check_unrunnable = True if raw_unrunnable is None else _flag(raw_unrunnable)
+    return check_announcement, check_unrunnable
 
 
 def _prose(text: Any) -> str:
@@ -176,29 +209,46 @@ def has_negated_intent(text: Any) -> bool:
     return bool(_NEGATED_INTENT_RE.search(_prose(text)))
 
 
-def looks_like_tool_announcement(text: Any) -> bool:
-    """True when a SHORT reply only announces work a tool would do.
+def _last_sentence(prose: str) -> str:
+    lines = [ln.strip() for ln in prose.splitlines() if ln.strip()]
+    last_line = lines[-1] if lines else prose
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(last_line) if p.strip()]
+    return parts[-1] if parts else last_line
 
-    Conservative on purpose — a false positive costs a model turn, and a second
-    one ends the step. It fires only when the prose (fences removed) is shorter
-    than `ANNOUNCEMENT_MAX_CHARS` and either ends with a colon (the list of
-    calls that should follow never came) or carries first-person intent plus a
-    tool verb. Questions, waiting-on-the-user replies, negated intent ("I will
-    not run that"), replies that start by delivering ("Done.", "Here is ...")
-    and structured answers are never announcements.
+
+def looks_like_tool_announcement(text: Any) -> bool:
+    """True when a SHORT reply ENDS on an announcement of tool work.
+
+    Conservative on purpose — a false positive costs a model turn and, twice,
+    the answer. It fires only when the prose (fences and markup removed) is
+    shorter than `ANNOUNCEMENT_MAX_CHARS` and its LAST sentence is the
+    announcement: first-person intent followed by a tool verb ("Let me verify
+    ..."), or an action statement ("Checking the remaining two sources now.").
+    Every XP failure ends that way. Never an announcement: questions,
+    replies waiting on the user ("... unless you say otherwise", "once you
+    confirm"), intent that talks rather than acts ("Let me summarize: ..."),
+    refusals ("I will not run that"), replies that start by delivering
+    ("Done.", "Here is ..."), structured answers. English only (documented
+    limit: docs/agents.md, backlog 0033).
     """
     prose = _strip_markup(_prose(text))
     if not prose or len(prose) >= ANNOUNCEMENT_MAX_CHARS:
         return False
-    if prose.endswith("?"):
+    if prose.rstrip().endswith("?"):
         return False
     if _WAITING_RE.search(prose) or _DELIVERY_START_RE.search(prose) or _HEADING_RE.search(prose):
         return False
     if _NEGATED_INTENT_RE.search(prose):
         return False
-    if prose.endswith(":"):
+    last = _last_sentence(prose)
+    if _ACTION_STATEMENT_RE.search(last):
         return True
-    return bool(_INTENT_RE.search(prose) and _TOOL_VERB_RE.search(prose))
+    intent = _INTENT_RE.search(last)
+    if not intent:
+        return False
+    if _NON_ACTION_AFTER_INTENT_RE.search(last):
+        return False
+    return bool(_TOOL_VERB_RE.search(last[intent.end():]))
 
 
 def _unrunnable_detail(response: Any, content: str) -> Optional[str]:
@@ -264,6 +314,11 @@ def classify_no_call_reply(
     return "", ""
 
 
+def visible_content(response: Any) -> str:
+    """The reply's visible content exactly as the provider returned it (may be "")."""
+    return str(response.get("content") or "") if isinstance(response, dict) else ""
+
+
 def verbatim_reply(response: Any, *, fallback: str = "") -> str:
     """The assistant's reply as the provider returned it: reasoning AND content.
 
@@ -289,44 +344,110 @@ def verbatim_reply(response: Any, *, fallback: str = "") -> str:
     return out or str(fallback or "").strip()
 
 
-def reprompt_text(reason: str, *, tools_offered: bool, suppressed: bool = False) -> str:
-    """The corrective message that follows the verbatim reply (XP config C wording)."""
+def quote_reply(reply: str) -> str:
+    """Fence `reply` so it survives as quoted DATA inside a user message."""
+    longest = max((len(m) for m in re.findall(r"`+", reply or "")), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{reply}\n{fence}"
+
+
+def reprompt_text(
+    reason: str,
+    *,
+    tools_offered: bool,
+    suppressed: bool = False,
+    reply: str = "",
+) -> str:
+    """The corrective user message, with the failed reply QUOTED inside it.
+
+    The reply rides here, not (only) in the assistant history turn: Qwen3.5 /
+    Qwen3.6 chat templates strip `<think>…</think>` from every assistant turn
+    before the last user message, so a think-held call carried by the history
+    turn reaches the model as an EMPTY reply — the XP "as recorded" case that
+    made the model believe its tools had run (5/5). User content is rendered
+    verbatim by every template.
+    """
+    quoted = f"Your previous reply was, verbatim:\n{quote_reply(reply)}\n\n" if reply else ""
     if suppressed and reason == REASON_UNRUNNABLE:
         # Visit lanes: host-voiced, no loop vocabulary (c2447 lane honesty).
         # (The announcement check only runs there on an EXPLICIT
         # `check_plan=true`, which asks for the task-lane wording.)
-        return (
-            "Your previous reply didn't come through as words — part of it was in a form that "
-            "can't be carried out here, so nothing happened. Say it again: do what you meant "
-            "to do now, or reply in plain words."
+        quoted = f"This is what came through:\n{quote_reply(reply)}\n\n" if reply else ""
+        return quoted + (
+            "It didn't come through as words — part of it was in a form that can't be carried "
+            "out here, so nothing happened. Say it again: do what you meant to do now, or "
+            "reply in plain words."
         )
     if not tools_offered:
-        return (
-            "Your previous reply contained tool-call markup, but no tools are available here, "
-            "so nothing ran. Reply again with a direct answer, without tool-call markup."
+        return quoted + (
+            "That reply contained tool-call markup, but no tools are available here, so nothing "
+            "ran. Reply again with a direct answer, without tool-call markup."
         )
     if reason == REASON_UNRUNNABLE:
-        return (
-            "Your previous reply placed tool calls where they cannot run (inside your thinking, "
-            "with an unknown tool name, or cut off), so none ran. Reply again: call the tools "
-            "now in the required format as your visible reply, or answer directly."
+        return quoted + (
+            "That reply placed tool calls where they cannot run (inside your thinking, with an "
+            "unknown tool name, or cut off), so none ran. Reply again: call the tools now in the "
+            "required format as your visible reply, or answer directly."
         )
-    return (
-        "Your previous reply announced tool calls but none ran: it contained no tool call. "
-        "Reply again: call the tools now in the required format as your visible reply, "
-        "or answer directly."
+    return quoted + (
+        "That reply announced tool calls but none ran: it contained no tool call. Reply again: "
+        "call the tools now in the required format as your visible reply, or answer directly."
     )
 
 
-def no_call_error_text(reason: str, detail: str) -> str:
-    """The visible error that ends a step after the re-prompt also failed."""
+def no_call_error_text(reason: str, detail: str, *, reprompted: bool = True) -> str:
+    """The visible error that ends a step whose no-call reply could not be recovered."""
     what = (
         "tool calls it could not run"
         if reason == REASON_UNRUNNABLE
         else "tool use without calling any tool"
     )
     tail = f" ({detail})" if detail else ""
-    return (
-        f"Error: the model's reply announced {what}{tail}, and it did the same again after "
-        "one re-prompt. Nothing ran, and the reply was not used as an answer."
+    how = (
+        "and it did the same again after one re-prompt"
+        if reprompted
+        else "and no iteration was left to re-prompt it"
     )
+    return (
+        f"Error: the model's reply announced {what}{tail}, {how}. "
+        "Nothing ran, and the reply was not used as an answer."
+    )
+
+
+def no_call_stop_reason(no_call: Dict[str, Any], *, iterations: int) -> Dict[str, Any]:
+    """Host-facing `stop_reason` for a turn ended by an unrecovered no-call reply.
+
+    One wording for all three loops (hosts render it; they never re-derive it).
+    """
+    unrunnable = str(no_call.get("reason") or "") == REASON_UNRUNNABLE
+    reprompted = bool(no_call.get("reprompted", True))
+    detail = str(no_call.get("detail") or "").strip()
+    iters_txt = f" after {iterations} iterations" if iterations > 0 else ""
+    what = "wrote tool calls that could not run" if unrunnable else "announced tool use without calling any tool"
+    again = (
+        ", and did the same after one re-prompt, so nothing ran."
+        if reprompted
+        else ", with no iteration left to re-prompt it, so nothing ran."
+    )
+    return {
+        "code": "no_tool_call",
+        "finished": False,
+        "budget_exhausted": False,
+        "iterations": iterations,
+        "label": (
+            f"stopped: tool call could not run{iters_txt}"
+            if unrunnable
+            else f"stopped: announced tools, made no call{iters_txt}"
+        ),
+        "headline": (
+            f"The agent stopped early{iters_txt}: the model {what}"
+            + (f" ({detail})" if detail else "")
+            + again
+        ),
+        "remedy": (
+            "Check that the tool the model asked for is enabled for this agent, then retry."
+            if unrunnable
+            else "Retry; if it recurs, use another model or turn thinking off for this agent "
+            "(the model announces calls it does not emit)."
+        ),
+    }

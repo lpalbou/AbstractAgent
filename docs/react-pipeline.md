@@ -95,7 +95,7 @@ Important behavior (code reality):
   content and `tool_calls` (context fidelity, 0213) and stores the cycle entry in the scratchpad.
 - When tool calls do not exist, the adapter usually treats `content` as the final answer and moves to `done`.
   A reply that only announces tool use (“Let me verify …”), or carries tool-call markup that could not run, is instead
-  re-prompted ONCE with the reply appended verbatim; a second failure ends the step with a visible error and goes to
+  re-prompted ONCE with the reply quoted verbatim in the corrective user message; a second failure ends the step with a visible error and goes to
   the conclusion path (`stop_reason.code = "no_tool_call"`). See [`docs/agents.md`](agents.md#replies-that-announce-tools-without-calling-them-all-three-loops)
   (announcement check enabled by default; disable with `_runtime.check_plan=false`).
 - The followthrough heuristic is **fence-blind** (frozen visit seam spec §4 line 6): all prose

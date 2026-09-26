@@ -144,6 +144,7 @@ CODEACT_STEPS = COMMON_STEPS | frozenset(
         # (see REACT_STEPS for the payloads).
         "parse_reprompt",
         "parse_reprompt_failed",
+        "parse_reprompt_skipped",
         "parse_retry_empty",
         # Read-orchestration advice — payload {path, mode, enforcement}.
         # `enforcement: "advise"` means the model was told how to read this
@@ -168,6 +169,7 @@ MEMACT_STEPS = COMMON_STEPS | frozenset(
         # (see REACT_STEPS for the payloads).
         "parse_reprompt",
         "parse_reprompt_failed",
+        "parse_reprompt_skipped",
         "compose",
         "compose_query",
         "finalize",

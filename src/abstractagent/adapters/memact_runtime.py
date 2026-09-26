@@ -30,10 +30,12 @@ from .announced_calls import (
     classify_no_call_reply,
     is_not_an_answer,
     no_call_error_text,
+    no_call_stop_reason,
     reprompt_text,
     resolve_checks,
     tool_calls_from_reasoning,
     verbatim_reply,
+    visible_content,
 )
 from .transcripts import (
     assistant_tool_calls_payload,
@@ -752,15 +754,24 @@ def create_memact_workflow(
         )
         if no_call_reason:
             _cycle_i = int(scratchpad.get("iteration", 0) or 0)
+            _limits_ns = run.vars.get("_limits") if isinstance(run.vars.get("_limits"), dict) else {}
+            _max_it = max(1, resolve_max_iterations(_limits_ns, scratchpad))
             raw_reply = verbatim_reply(response, fallback=str(content or ""))
             temp["pending_tool_calls"] = []
-            if prior_reprompt is not None:
-                error_text = no_call_error_text(no_call_reason, no_call_detail)
+            last_iteration = _cycle_i >= _max_it
+            if prior_reprompt is not None or last_iteration:
+                # Second failure, or no iteration left to re-prompt in: end the
+                # step with a visible error and go to the budget terminal (this
+                # loop's conclusion), which answers with the error and a
+                # `stop_reason.code = "no_tool_call"` — never with this reply,
+                # nor with an earlier turn's pre-call narration.
+                reprompted = prior_reprompt is not None
+                error_text = no_call_error_text(no_call_reason, no_call_detail, reprompted=reprompted)
                 context["messages"].append(
                     _new_message(
                         ctx,
                         role="assistant",
-                        content=raw_reply,
+                        content=visible_content(response),
                         metadata={"kind": "reprompt_failed_reply", "cycle": _cycle_i, "reason": no_call_reason},
                     )
                 )
@@ -769,21 +780,26 @@ def create_memact_workflow(
                     "detail": no_call_detail,
                     "cycle": _cycle_i,
                     "error": error_text,
+                    "reprompted": reprompted,
                 }
-                emit(
-                    "parse_reprompt_failed",
-                    {"cycle": _cycle_i, "reason": no_call_reason, "detail": no_call_detail, "error": error_text},
-                )
-                context["messages"].append(
-                    _new_message(ctx, role="assistant", content=error_text, metadata={"kind": "error"})
-                )
-                temp["final_answer"] = error_text
-                return StepPlan(node_id="parse", next_node="done")
+                if reprompted:
+                    emit(
+                        "parse_reprompt_failed",
+                        {"cycle": _cycle_i, "reason": no_call_reason, "detail": no_call_detail, "error": error_text},
+                    )
+                else:
+                    emit(
+                        "parse_reprompt_skipped",
+                        {"cycle": _cycle_i, "reason": no_call_reason, "detail": no_call_detail, "why": "iteration_budget"},
+                    )
+                return StepPlan(node_id="parse", next_node="max_iterations")
+            # Visible content stays the assistant turn; the verbatim reply is
+            # QUOTED in the corrective (templates strip `<think>` from history).
             context["messages"].append(
                 _new_message(
                     ctx,
                     role="assistant",
-                    content=raw_reply,
+                    content=visible_content(response),
                     metadata={"kind": "reprompted_reply", "cycle": _cycle_i, "reason": no_call_reason},
                 )
             )
@@ -792,7 +808,10 @@ def create_memact_workflow(
                     ctx,
                     role="user",
                     content=reprompt_text(
-                        no_call_reason, tools_offered=_tools_offered, suppressed=suppress_loop_tail(runtime_ns)
+                        no_call_reason,
+                        tools_offered=_tools_offered,
+                        suppressed=suppress_loop_tail(runtime_ns),
+                        reply=raw_reply,
                     ),
                     metadata={"kind": "reprompt", "cycle": _cycle_i, "reason": no_call_reason},
                 )
@@ -1460,11 +1479,20 @@ def create_memact_workflow(
         # finalize path would have polished). `.get`, not [] (fable5
         # 2026-07-13): content-less messages raised here.
         temp_ns = run.vars.get("_temp") if isinstance(run.vars.get("_temp"), dict) else {}
-        answer = str(temp_ns.get("draft_answer") or "").strip()
+        _no_call = scratchpad.get("no_tool_call_stop") if isinstance(scratchpad.get("no_tool_call_stop"), dict) else None
+        # An unrecovered no-call reply (mission AGX) ends with its visible error.
+        answer = str(_no_call.get("error") or "") if _no_call else str(temp_ns.get("draft_answer") or "").strip()
         if not answer:
             for msg in reversed(messages):
                 # A re-prompted (failed) reply is never "last words" (mission AGX).
-                if isinstance(msg, dict) and msg.get("role") == "assistant" and not is_not_an_answer(msg):
+                # A turn that carried tool calls is pre-call narration, not an
+                # answer (review 28 D3: "Searching." was published).
+                if (
+                    isinstance(msg, dict)
+                    and msg.get("role") == "assistant"
+                    and not is_not_an_answer(msg)
+                    and not msg.get("tool_calls")
+                ):
                     text = str(msg.get("content") or "")
                     if text.strip():
                         answer = text
@@ -1486,6 +1514,14 @@ def create_memact_workflow(
                 "outcome": "iteration_budget",
                 # Always-present at BOTH terminals (wave-F P3 shape parity).
                 "finalize_skipped": bool(scratchpad.get("finalize_skipped")),
+                **(
+                    {
+                        "no_tool_call_stop": dict(_no_call),
+                        "stop_reason": no_call_stop_reason(_no_call, iterations=max_iterations),
+                    }
+                    if _no_call
+                    else {}
+                ),
             },
         )
 
