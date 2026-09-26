@@ -1094,6 +1094,10 @@ def create_codeact_workflow(
                     # that silently reverts to provider defaults.
                     "thinking",
                     "speculation",
+                    # Live token streaming (2026-09-26): a delegated child
+                    # streams its LLM calls to the same live view as the
+                    # parent; False (explicit off) is inherited too.
+                    "stream",
                     "max_output_tokens",
                     "tool_prompt_examples",
                     # Approval policy inherits monotonically (tool-tiers adversary

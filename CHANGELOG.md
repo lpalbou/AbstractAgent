@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- **Delegated children stream too.** `delegate_agent` children in ReAct, CodeAct and MemAct inherit the parent's `_runtime.stream`, so a run that streams its replies to a live view keeps streaming when the agent delegates. An explicit `False` is inherited as well; an unset value stays unset. Needs the AbstractRuntime release that adds live token deltas.
+
 ## [0.3.13] - 2026-09-23
 
 ### Changed
