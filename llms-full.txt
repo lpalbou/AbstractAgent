@@ -16,7 +16,7 @@ Important notes (source-of-truth hints):
 - `src/abstractagent/adapters/generation_params.py` is the shared LLM param normalizer for temperature, seed, media policy, prompt-cache identity, streaming passthrough (`_runtime.stream`), Core `thinking` and `speculation` (MTP). Delegated children in ReAct, CodeAct and MemAct inherit `stream`, `speculation`, `thinking`, provider/model, sampling, `max_output_tokens`, `tool_prompt_examples` and `tool_policy` (see `docs/architecture.md`).
 - `src/abstractagent/adapters/loop_hooks.py` is the shared loop-hook layer (listen/steer/capture); see `docs/hooks.md`.
 - Docs entrypoint: `README.md` → `docs/getting-started.md` → `docs/README.md`
-- Version 0.3.13 requires `abstractcore[tools]>=2.13.41` and `AbstractRuntime>=0.4.32`; extras: `apple`, `gpu`, `test`, `dev`.
+- Version 0.3.14 requires `abstractcore[tools]>=2.13.41` and `AbstractRuntime>=0.5.0`; extras: `apple`, `gpu`, `test`, `dev`.
 - The loops stamp the runtime turn-grounding envelope into the durable user turn once (`abstractruntime.turn_grounding`) and place the loop tail with `transcripts.place_loop_tail`, keeping prompts byte-prefix stable across iterations and turns.
 - MemAct is not re-exported at the package top-level; import from `abstractagent.agents.memact` (see `docs/api.md`).
 - After changes, run tests: `pytest -q` (`python -P -m pytest -q` from a folder with sibling checkouts)

@@ -84,9 +84,10 @@ Native Python hardware profile cascades are available for deployment manifests:
 AbstractCore and AbstractRuntime profiles; AbstractAgent itself remains
 provider/runtime agnostic.
 
-AbstractAgent 0.3.13 requires `abstractcore[tools]>=2.13.41` and
-`AbstractRuntime>=0.4.32` (the runtime release that provides turn grounding,
-in-flight cancellation and speculation inheritance).
+AbstractAgent 0.3.14 requires `abstractcore[tools]>=2.13.41` and
+`AbstractRuntime>=0.5.0` (the runtime release that provides live token
+streaming, on top of turn grounding, in-flight cancellation and speculation
+inheritance). AbstractRuntime 0.5.0 itself requires AbstractCore 2.16.0 or newer.
 
 Note: the repository may be ahead of the latest published PyPI release. To verify what you installed:
 

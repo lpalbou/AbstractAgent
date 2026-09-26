@@ -1,9 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.14] - 2026-09-26
+
+### Changed
+- Raised the AbstractRuntime floor to `AbstractRuntime>=0.5.0` across the base, `apple` and `gpu` install profiles (the runtime release with live token deltas). AbstractRuntime 0.5.0 brings AbstractCore 2.16.0 or newer with it; the direct `abstractcore[tools]>=2.13.41` floor is unchanged.
 
 ### Added
-- **Delegated children stream too.** `delegate_agent` children in ReAct, CodeAct and MemAct inherit the parent's `_runtime.stream`, so a run that streams its replies to a live view keeps streaming when the agent delegates. An explicit `False` is inherited as well; an unset value stays unset. Needs the AbstractRuntime release that adds live token deltas.
+- **Delegated children stream too.** `delegate_agent` children in ReAct, CodeAct and MemAct inherit the parent's `_runtime.stream`, so a run that streams its replies to a live view keeps streaming when the agent delegates. An explicit `False` is inherited as well; an unset value stays unset. Needs AbstractRuntime 0.5.0 (live token deltas).
 
 ### Documentation
 - `docs/troubleshooting.md` collects symptom-first fixes; `docs/architecture.md` shows the full ReAct graph (review nodes included) and the `_runtime` controls delegated sub-agents inherit; `docs/api.md` documents the `stream` slot.

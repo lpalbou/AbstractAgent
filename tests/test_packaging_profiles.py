@@ -19,7 +19,7 @@ def test_base_dependency_floors_match_gateway_alignment() -> None:
     deps = set(_project()["dependencies"])
 
     assert "abstractcore[tools]>=2.13.41" in deps
-    assert "abstractruntime>=0.4.32" in deps
+    assert "abstractruntime>=0.5.0" in deps
 
 
 def test_hardware_profile_extras_are_core_runtime_cascades() -> None:
@@ -27,11 +27,11 @@ def test_hardware_profile_extras_are_core_runtime_cascades() -> None:
 
     assert set(extras["apple"]) == {
         "abstractcore[all-apple]>=2.13.41",
-        "abstractruntime[apple]>=0.4.32",
+        "abstractruntime[apple]>=0.5.0",
     }
     assert set(extras["gpu"]) == {
         "abstractcore[all-gpu]>=2.13.41",
-        "abstractruntime[gpu]>=0.4.32",
+        "abstractruntime[gpu]>=0.5.0",
     }
     assert "all-apple" not in extras
     assert "all-gpu" not in extras
