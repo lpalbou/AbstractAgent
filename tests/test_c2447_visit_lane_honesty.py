@@ -444,7 +444,7 @@ def test_visit_lane_followthrough_nudge_defaults_off() -> None:
         [dict(_MUSING_REPLY)],
         runtime_vars={"suppress_loop_tail": True},
     )
-    assert "you did not call any tools" not in _all_payload_text(payloads)
+    assert "announced tool calls but none ran" not in _all_payload_text(payloads)
     assert (state.output or {}).get("answer", "").startswith("I will read that diary entry")
 
 
@@ -457,7 +457,7 @@ def test_visit_lane_explicit_check_plan_still_wins() -> None:
         [dict(_MUSING_REPLY), _FINAL_REPLY],
         runtime_vars={"suppress_loop_tail": True, "check_plan": True},
     )
-    assert "you did not call any tools" in _all_payload_text(payloads)
+    assert "announced tool calls but none ran" in _all_payload_text(payloads)
 
 
 def test_visit_lane_truncation_retry_is_host_voiced() -> None:

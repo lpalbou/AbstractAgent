@@ -53,7 +53,10 @@ server rejects the call.
 
 See `stream` under host-level `_runtime` slots in [`docs/api.md`](api.md).
 
-## ReAct retries when the model says “I will do X” but calls no tools
+## The agent retries when the model says “I will do X” but calls no tools
 
-This is the followthrough check, not a failure. Disable it with `_runtime.check_plan=false`
-(see [`docs/faq.md`](faq.md)).
+This is the announced-tool check, not a failure: the model is shown its reply verbatim and asked once to call the
+tools or answer. If a run then stops with `stop_reason.code = "no_tool_call"`, the model announced tools (or wrote
+tool calls that could not run) twice. Retry, check that the tool it asked for is enabled, or try another model or
+thinking off. Disable the announcement check with `_runtime.check_plan=false`
+(see [`docs/agents.md`](agents.md#replies-that-announce-tools-without-calling-them-all-three-loops)).

@@ -88,6 +88,52 @@ MemAct relies on the runtime’s active memory subsystem:
   future release. A MemAct verifier is a deliberate non-goal while
   MemAct stays experimental.
 
+## Replies that announce tools without calling them (all three loops)
+
+A reply with no tool call used to be the final answer. Two kinds of such replies are not answers, and
+ReAct, CodeAct and MemAct now handle them the same way
+(`src/abstractagent/adapters/announced_calls.py`):
+
+- **Announced**: a short reply (under 300 characters of prose) that only announces work a tool would do,
+  for example "I have strong material. Let me verify a couple of key specifics before writing the digest."
+  Qwen3.x on MLX often ends a step this way. Questions, replies that wait on the user ("Let me know if…"),
+  refusals ("I will not run that…"), replies that start by delivering ("Done.", "Here is…") and structured
+  answers are never treated as announcements. ReAct also keeps its older check for longer replies
+  (`_looks_like_deferred_action`).
+- **Unrunnable**: tool-call markup that did not become a call: a tool name that was not offered, a call cut off
+  mid-parameter (`metadata.unparsed_tool_call`), or calls written inside the thinking block that AbstractCore
+  could not recover (its unknown-tool / tool-syntax warnings). This check only applies when there is no visible
+  answer, or when the visible answer is shorter than 300 characters.
+
+What happens:
+
+1. **One re-prompt.** The model's reply is appended to the transcript **verbatim** (its reasoning included,
+   wrapped in `<think>…</think>`), then a user message asks it to call the tools now, in the required format,
+   as its visible reply, or to answer directly. The re-prompt call carries
+   `_runtime_observability: {"reprompted": "<reason>", ...}` on its `LLM_CALL` effect payload, so the ledger
+   records it. Emits `parse_reprompt` (`reason`: `announced_tool_use` | `unrunnable_tool_call`).
+   The transcript messages are tagged `metadata.kind`: `reprompted_reply` and `reprompt`.
+2. **Second failure.** If the re-prompted reply fails the same way, the step ends with a visible error
+   (`parse_reprompt_failed`) and the reply is never published. ReAct goes to its conclusion path (a tool-free
+   call that answers from what the run already has), with `output.stop_reason.code = "no_tool_call"`, an
+   `error` notice, `output.no_tool_call_stop` and a report line. CodeAct and MemAct end the run with the error
+   text as `answer` and `output.no_tool_call_stop`.
+3. **No iteration left** (ReAct): no re-prompt; the conclusion path answers (`parse_reprompt_skipped`).
+   A conclusion reply that is itself an announcement is dropped (`conclusion_announcement_dropped`).
+
+Why verbatim: re-prompting with the reply as the runtime records it (content `""` when the calls sat in the
+thinking block) made the model believe its tools had already run; with the raw reply it re-issued the same
+calls as visible calls (framework mission XP, 2026-09-26).
+
+Controls: `_runtime.check_plan` keeps its defaults: the announcement check is on in task lanes and off in
+visit lanes (`suppress_loop_tail`), where "I will read that entry again" is musing. The unrunnable check
+defaults on everywhere. An explicit `check_plan=false` turns both off.
+
+Calls that AbstractCore **did** recover from the thinking block (`metadata.tool_calls_from_reasoning`, Core
+2.16.0+) run normally. ReAct shows the count in the `parse` (`tool_calls_from_reasoning`) and
+`parse_tool_calls` (`from_reasoning`) events, the cycle entry, the report, and an `info` notice
+(`code: "tool_calls_from_reasoning"`). CodeAct and MemAct add `from_reasoning` to `parse_tool_calls`.
+
 ## Common API and output contract
 
 All agents inherit `BaseAgent` (`src/abstractagent/agents/base.py`):

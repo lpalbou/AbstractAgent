@@ -44,6 +44,16 @@ from .generation_params import (
     verifier_execution_preference,
     verifier_response_schema,
 )
+from .announced_calls import (
+    REASON_UNRUNNABLE,
+    classify_no_call_reply,
+    has_negated_intent,
+    looks_like_tool_announcement,
+    no_call_error_text,
+    reprompt_text,
+    tool_calls_from_reasoning,
+    verbatim_reply,
+)
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
 from .media import (
     accumulate_media,
@@ -391,6 +401,7 @@ def _stop_reason(
     forced: Optional[Dict[str, Any]] = None,
     max_iterations: Optional[int] = None,
     by_operator: Optional[Dict[str, Any]] = None,
+    no_call: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The turn's verdict IN WORDS, authored where the facts are.
 
@@ -443,6 +454,42 @@ def _stop_reason(
             "remedy": "Anything left unfinished is listed in the answer — send it as a follow-up turn.",
         }
 
+    if no_call is not None:
+        # Mission AGX: a reply announced tool use (or wrote tool calls that
+        # could not run), and the one re-prompt got the same. Not a budget
+        # stop and not a loop: the model is not emitting the calls it means.
+        unrunnable = str(no_call.get("reason") or "") == REASON_UNRUNNABLE
+        detail = str(no_call.get("detail") or "").strip()
+        what = (
+            "wrote tool calls that could not run"
+            if unrunnable
+            else "announced tool use without calling any tool"
+        )
+        return {
+            "code": "no_tool_call",
+            "finished": False,
+            "budget_exhausted": False,
+            "iterations": iterations,
+            "label": (
+                f"stopped: tool call could not run{iters_txt}"
+                if unrunnable
+                else f"stopped: announced tools, made no call{iters_txt}"
+            ),
+            "headline": (
+                f"The agent stopped early{iters_txt}: the model {what}"
+                + (f" ({detail})" if detail else "")
+                + ", and did the same after one re-prompt, so nothing ran. The answer was "
+                "written from what the run already had."
+            ),
+            "remedy": (
+                "The iteration budget was not the limit. Check that the tool the model asked for is "
+                "enabled for this agent, then retry."
+                if unrunnable
+                else "The iteration budget was not the limit. Retry; if it recurs, use another model or "
+                "turn thinking off for this agent (the model announces calls it does not emit)."
+            ),
+        }
+
     if kind:
         shape = (
             "alternated between the same two tool batches"
@@ -488,6 +535,25 @@ def _turn_notices(scratchpad: Any) -> list:
     """Caveats about the ANSWER, authored here for the same reason as
     `_stop_reason`: every host shows the same sentence or none of them do."""
     out: list = []
+    if isinstance(scratchpad, dict):
+        stop = scratchpad.get("no_tool_call_stop")
+        if isinstance(stop, dict) and stop.get("error"):
+            out.append({"code": "no_tool_call", "severity": "error", "text": str(stop.get("error"))})
+        try:
+            recovered = int(scratchpad.get("tool_calls_from_reasoning", 0) or 0)
+        except (TypeError, ValueError):
+            recovered = 0
+        if recovered > 0:
+            out.append(
+                {
+                    "code": "tool_calls_from_reasoning",
+                    "severity": "info",
+                    "text": (
+                        f"{recovered} tool call(s) were recovered from the model's thinking block "
+                        "and executed like visible calls."
+                    ),
+                }
+            )
     if isinstance(scratchpad, dict) and scratchpad.get("review_skipped"):
         out.append(
             {
@@ -1348,6 +1414,9 @@ def _render_final_report(task: str, scratchpad: Dict[str, Any]) -> str:
             f"conclusion forced: {str(stuck.get('kind'))} streak "
             f"(span {int(stuck.get('span') or 0)}, cycle {int(stuck.get('cycle') or 0)})"
         )
+    no_call = scratchpad.get("no_tool_call_stop")
+    if isinstance(no_call, dict) and no_call.get("reason"):
+        lines.append(f"conclusion forced: {str(no_call.get('reason'))} (cycle {int(no_call.get('cycle') or 0)})")
     lines.append("")
     for c in cycles:
         if not isinstance(c, dict):
@@ -1357,6 +1426,13 @@ def _render_final_report(task: str, scratchpad: Dict[str, Any]) -> str:
         thought = str(c.get("thought") or "").strip()
         if thought:
             lines.append(f"- thought: {thought}")
+        if c.get("reprompted"):
+            lines.append(f"- re-prompted once: {str(c.get('reprompted'))} (no tool call ran)")
+        if c.get("error"):
+            lines.append(f"- error: {str(c.get('error'))}")
+        n_rec = c.get("tool_calls_from_reasoning")
+        if isinstance(n_rec, int) and n_rec > 0:
+            lines.append(f"- recovered {n_rec} tool call(s) from the model's thinking")
         tcs = c.get("tool_calls")
         if isinstance(tcs, list) and tcs:
             lines.append("- actions:")
@@ -1406,6 +1482,9 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
         # ledger is the same class — a new turn earns its own nudge.
         scratchpad.pop("stuck_streak", None)
         scratchpad.pop("stuck_nudged", None)
+        # Mission AGX per-turn verdict/counters: same class as stuck_streak.
+        scratchpad.pop("no_tool_call_stop", None)
+        scratchpad.pop("tool_calls_from_reasoning", None)
         # used_tools is the same per-turn latch class (wave-F P4): a toolless
         # turn 2 must not report turn 1's tool use.
         scratchpad["used_tools"] = False
@@ -1445,6 +1524,8 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
             # retry stash is the same lifecycle class.
             "pending_media",
             "last_call_media",
+            # One-re-prompt-per-step state (mission AGX).
+            "reprompt",
         ):
             temp.pop(key, None)
 
@@ -2020,6 +2101,16 @@ def create_react_workflow(
             payload["model"] = eff_model.strip()
 
         _apply_llm_payload_extras(runtime_ns, payload)
+        # Ledger record of a re-prompt (mission AGX): the runtime stores the
+        # LLM_CALL effect payload on the step record, so this key marks the
+        # re-prompt call itself — `_runtime_observability.reprompted: <reason>`.
+        _reprompt = temp.get("reprompt")
+        if isinstance(_reprompt, dict) and _reprompt.get("reason"):
+            payload["_runtime_observability"] = {
+                "reprompted": str(_reprompt.get("reason")),
+                "reprompt_detail": str(_reprompt.get("detail") or ""),
+                "reprompted_cycle": _reprompt.get("cycle"),
+            }
 
         params: Dict[str, Any] = {}
         max_out = _max_output_tokens(runtime_ns, limits)
@@ -2081,6 +2172,19 @@ def create_react_workflow(
         # Shared reader (reasoning-first-citizen plan): one implementation
         # across the three loops, byte-identical behavior here.
         reasoning_text = extract_reasoning_text(response)
+        # Calls abstractcore (>= 2.16.0) recovered from the model's thinking
+        # block (`metadata.tool_calls_from_reasoning`). They run like any other
+        # call; the count is surfaced on every host-rendered record of the step
+        # (parse / parse_tool_calls emits, the cycle, the report, the notices)
+        # so an operator can see WHY a run parked on an approval it never
+        # visibly asked for (XP report, recommendation 2).
+        from_reasoning = tool_calls_from_reasoning(response) if tool_calls else 0
+        # One re-prompt per step (mission AGX): the state the previous parse
+        # left when it re-prompted. Popped HERE so every branch below sees it
+        # exactly once and none can carry it past this step.
+        prior_reprompt = temp.pop("reprompt", None)
+        if not isinstance(prior_reprompt, dict):
+            prior_reprompt = None
         parse_payload: Dict[str, Any] = {
             "iteration": cycle_i,
             "max_iterations": max_iterations,
@@ -2103,8 +2207,17 @@ def create_react_workflow(
         cache_struct = prompt_cache_capture(response)
         if cache_struct is not None:
             parse_payload["prompt_cache"] = cache_struct
+        if from_reasoning:
+            parse_payload["tool_calls_from_reasoning"] = from_reasoning
         emit("parse", parse_payload)
         cycle: Dict[str, Any] = {"i": cycle_i, "thought": content, "tool_calls": [], "observations": []}
+        if from_reasoning:
+            cycle["tool_calls_from_reasoning"] = from_reasoning
+            scratchpad["tool_calls_from_reasoning"] = (
+                int(scratchpad.get("tool_calls_from_reasoning", 0) or 0) + from_reasoning
+            )
+        if prior_reprompt is not None:
+            cycle["after_reprompt"] = str(prior_reprompt.get("reason") or "")
         cycles = scratchpad.get("cycles")
         if isinstance(cycles, list):
             cycles.append(cycle)
@@ -2467,7 +2580,13 @@ def create_react_workflow(
                 )
             )
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
-            emit("parse_tool_calls", {"count": len(tool_calls)})
+            _ptc: Dict[str, Any] = {"count": len(tool_calls)}
+            if from_reasoning:
+                _ptc["from_reasoning"] = from_reasoning
+            if prior_reprompt is not None:
+                # The re-prompt worked: these calls answer it.
+                _ptc["after_reprompt"] = str(prior_reprompt.get("reason") or "")
+            emit("parse_tool_calls", _ptc)
             return StepPlan(node_id="parse", next_node="act")
 
         # If the model hit an output limit, treat the step as incomplete and continue.
@@ -2535,6 +2654,127 @@ def create_react_workflow(
                 temp["pending_media"] = last_call_media
             return StepPlan(node_id="parse", next_node="reason")
 
+        # A reply with NO tool call that is not an answer (mission AGX,
+        # 2026-09-26; backlog 0918). Two shapes, both of which used to become
+        # the run's final answer:
+        # - ANNOUNCED: "I have strong material. Let me verify ... before
+        #   writing the digest." and nothing else (XP report: 5/5 runs
+        #   "completed" that way with no digest);
+        # - UNRUNNABLE: tool-call markup no parser turned into a call (unknown
+        #   tool name, a cut-off envelope, calls drafted mid-thinking that core
+        #   could not recover) — publishing it shows the user raw markup.
+        # Policy: re-prompt ONCE with the reply VERBATIM (reasoning included —
+        # the recorded empty-content turn made the model believe its tools had
+        # run, 5/5) plus a corrective user message. If the re-prompted reply
+        # fails the same way, the step ends with a visible error and the loop
+        # goes to its conclusion path with the reason named (stop_reason,
+        # notices, report). Neither reply is ever published as the answer.
+        #
+        # Knobs: `_runtime.check_plan` (the announcement heuristic) keeps its
+        # historical defaults — ON in task lanes, OFF in visit lanes
+        # (suppress_loop_tail), where "I will read that entry again" is
+        # musing. The UNRUNNABLE check is not a guess about intent, so it
+        # defaults ON in every lane; an explicit `check_plan=false` turns both
+        # off.
+        raw_check_plan = runtime_ns.get("check_plan") if isinstance(runtime_ns, dict) else None
+        if raw_check_plan is None:
+            check_plan = not suppress_loop_tail(runtime_ns)
+            check_unrunnable = True
+        else:
+            check_plan = _boolish(raw_check_plan)
+            check_unrunnable = check_plan
+        tool_specs_now = runtime_ns.get("tool_specs") if isinstance(runtime_ns, dict) else None
+        tools_offered = isinstance(tool_specs_now, list) and bool(tool_specs_now)
+        no_call_reason, no_call_detail = classify_no_call_reply(
+            response,
+            content,
+            tools_offered=tools_offered,
+            check_announcement=check_plan,
+            check_unrunnable=check_unrunnable,
+        )
+        if (
+            not no_call_reason
+            and check_plan
+            and tools_offered
+            and _looks_like_deferred_action(content)
+            and not has_negated_intent(content)
+        ):
+            # The historical long-reply followthrough heuristic (any length),
+            # now bounded by the same once-per-step rule.
+            no_call_reason = "announced_tool_use"
+            no_call_detail = "the reply announced tool use but contained no tool call"
+
+        if no_call_reason:
+            suppressed = suppress_loop_tail(runtime_ns)
+            raw_reply = verbatim_reply(response, fallback=str(content or ""))
+            temp["pending_tool_calls"] = []
+            if prior_reprompt is not None:
+                # SECOND failure in this step: end it with a visible error.
+                error_text = no_call_error_text(no_call_reason, no_call_detail)
+                cycle["reprompt_failed"] = no_call_reason
+                cycle["error"] = error_text
+                context["messages"].append(
+                    _new_message(
+                        ctx,
+                        role="assistant",
+                        content=raw_reply,
+                        metadata={"kind": "reprompt_failed_reply", "cycle": cycle_i, "reason": no_call_reason},
+                    )
+                )
+                scratchpad["no_tool_call_stop"] = {
+                    "reason": no_call_reason,
+                    "detail": no_call_detail,
+                    "cycle": cycle_i,
+                    "error": error_text,
+                }
+                emit(
+                    "parse_reprompt_failed",
+                    {"cycle": cycle_i, "reason": no_call_reason, "detail": no_call_detail, "error": error_text},
+                )
+                return StepPlan(node_id="parse", next_node="max_iterations")
+
+            if cycle_i >= max_iterations:
+                # No iteration left to re-prompt in: the conclusion path
+                # answers instead (and never publishes this reply either).
+                cycle["no_call_at_budget"] = no_call_reason
+                emit(
+                    "parse_reprompt_skipped",
+                    {"cycle": cycle_i, "reason": no_call_reason, "detail": no_call_detail, "why": "iteration_budget"},
+                )
+                return StepPlan(node_id="parse", next_node="max_iterations")
+
+            # FIRST failure: the verbatim reply joins the durable transcript,
+            # then the corrective message. Both are what the model is shown on
+            # the re-prompt call; the durable record keeps what really happened.
+            context["messages"].append(
+                _new_message(
+                    ctx,
+                    role="assistant",
+                    content=raw_reply,
+                    metadata={"kind": "reprompted_reply", "cycle": cycle_i, "reason": no_call_reason},
+                )
+            )
+            context["messages"].append(
+                _new_message(
+                    ctx,
+                    role="user",
+                    content=reprompt_text(no_call_reason, tools_offered=tools_offered, suppressed=suppressed),
+                    metadata={"kind": "reprompt", "cycle": cycle_i, "reason": no_call_reason},
+                )
+            )
+            temp["reprompt"] = {"reason": no_call_reason, "detail": no_call_detail, "cycle": cycle_i}
+            cycle["reprompted"] = no_call_reason
+            emit("parse_reprompt", {"cycle": cycle_i, "reason": no_call_reason, "detail": no_call_detail})
+            if no_call_reason == "announced_tool_use":
+                # Compat: the followthrough lane's historical event name.
+                emit("parse_retry_plan_only", {"cycle": cycle_i})
+            if last_call_media:
+                temp["pending_media"] = last_call_media
+            return StepPlan(node_id="parse", next_node="reason")
+
+        # Empty reply (checked AFTER the no-call lane above, so an empty reply
+        # whose tool call the provider reported as unparsed is re-prompted
+        # with that call shown, not told "your response was empty").
         if not isinstance(content, str) or not content.strip():
             if suppress_loop_tail(runtime_ns):
                 _push_inbox(
@@ -2545,29 +2785,6 @@ def create_react_workflow(
             else:
                 _push_inbox(runtime_ns, "Your previous response was empty. Continue the task.")
             emit("parse_retry_empty", {"cycle": cycle_i})
-            if last_call_media:
-                temp["pending_media"] = last_call_media
-            return StepPlan(node_id="parse", next_node="reason")
-
-        # Followthrough heuristic: retry when the model claims it will take actions but emits no tool calls.
-        # Default ON (disable with `_runtime.check_plan=false`) — EXCEPT in
-        # visit lanes (suppress_loop_tail), where it defaults OFF: musing "I
-        # will read that entry again" is legitimate visit behavior, not a
-        # defect to correct (highways-not-prompts; an EXPLICIT
-        # `_runtime.check_plan` still wins in either lane).
-        raw_check_plan = runtime_ns.get("check_plan") if isinstance(runtime_ns, dict) else None
-        if raw_check_plan is None:
-            check_plan = not suppress_loop_tail(runtime_ns)
-        else:
-            check_plan = _boolish(raw_check_plan)
-        if check_plan and cycle_i < max_iterations and _looks_like_deferred_action(content):
-            _push_inbox(
-                runtime_ns,
-                "You said you would take an action, but you did not call any tools.\n"
-                "If you need to act, call the next tool now (emit ONLY the next tool call(s)).\n"
-                "If you are already done, provide the final answer with NO tool calls.",
-            )
-            emit("parse_retry_plan_only", {"cycle": cycle_i})
             if last_call_media:
                 temp["pending_media"] = last_call_media
             return StepPlan(node_id="parse", next_node="reason")
@@ -3687,6 +3904,11 @@ def create_react_workflow(
             # vocabulary is the c2447 chrome class); the machine surfaces
             # (stuck_streak emit + terminal output key) name it in both lanes.
             _stuck = scratchpad.get("stuck_streak") if isinstance(scratchpad.get("stuck_streak"), dict) else None
+            _no_call = (
+                scratchpad.get("no_tool_call_stop")
+                if isinstance(scratchpad.get("no_tool_call_stop"), dict)
+                else None
+            )
             if _by_operator and not _suppress_chrome:
                 # The OPERATOR asked for this, mid-run, from whichever client
                 # they had open. Say so plainly: the model is not being
@@ -3714,6 +3936,25 @@ def create_react_workflow(
                     "Please bring your reply to a close now: do not use tools "
                     "or tool-call markup — give your best answer from what you "
                     "already have, in your own words."
+                )
+            elif _no_call is not None:
+                _what = (
+                    "contained tool calls that could not run"
+                    if _no_call.get("reason") == REASON_UNRUNNABLE
+                    else "announced tool calls but contained none"
+                )
+                conclude_directive = (
+                    f"The loop was stopped: your last two replies {_what}, so nothing ran.\n"
+                    "Tool use is now disabled. Provide a best-effort answer from what you already have.\n\n"
+                    "In your response, include:\n"
+                    "1) The best current answer you can give based on the evidence gathered.\n"
+                    "2) What you completed, briefly.\n"
+                    "3) What you still meant to check, and why it matters.\n\n"
+                    "Rules:\n"
+                    "- Do NOT call tools.\n"
+                    "- Do NOT output tool-call markup (e.g. <tool_call>...</tool_call>).\n"
+                    "- Do NOT announce further work; write the answer itself.\n"
+                    "- Do not pretend the unchecked items were checked."
                 )
             elif _stuck is not None:
                 _shape = (
@@ -3882,6 +4123,13 @@ def create_react_workflow(
             # Last resort: strip any leaked tool markup so we don't persist it as the final answer.
             answer = _strip_tool_call_markup(answer).strip()
 
+        # Never publish an announcement as the conclusion (mission AGX): a
+        # tool-free "Let me verify ..." here is no answer at all.
+        _stop_no_call = scratchpad.get("no_tool_call_stop")
+        if answer and looks_like_tool_announcement(answer):
+            emit("conclusion_announcement_dropped", {"preview": parse_content_preview(answer)})
+            answer = ""
+
         if not answer:
             if suppress_loop_tail(runtime_ns):
                 # Entity-lane fallback (c2447/C3): this text becomes the reply
@@ -3892,11 +4140,17 @@ def create_react_workflow(
             else:
                 # Fallback: avoid returning the last tool observation as the "answer".
                 # Provide a deterministic report so users don't lose scratchpad context.
-                scratch_view = _render_cycles_for_conclusion_prompt(scratchpad, limits=limits)
-                parts = [
-                    "Max iterations reached.",
-                    "I could not produce a final assistant response in time.",
-                ]
+                # Never publish tool markup, even inside the progress render.
+                scratch_view = _strip_tool_call_markup(
+                    _render_cycles_for_conclusion_prompt(scratchpad, limits=limits)
+                ).strip()
+                if isinstance(_stop_no_call, dict) and _stop_no_call.get("error"):
+                    parts = [str(_stop_no_call.get("error")), "No final answer was produced."]
+                else:
+                    parts = [
+                        "Max iterations reached.",
+                        "I could not produce a final assistant response in time.",
+                    ]
                 if scratch_view:
                     parts.append("## Progress (from scratchpad)\n" + scratch_view)
                 parts.append(
@@ -3936,6 +4190,11 @@ def create_react_workflow(
         _stuck_out = scratchpad.get("stuck_streak")
         if isinstance(_stuck_out, dict):
             output["conclusion_forced"] = dict(_stuck_out)
+        _no_call_out = scratchpad.get("no_tool_call_stop")
+        if not isinstance(_no_call_out, dict):
+            _no_call_out = None
+        if _no_call_out is not None:
+            output["no_tool_call_stop"] = dict(_no_call_out)
         # Authored HERE, where the ceiling, the spend, the forcing and the
         # nudge are all known — never in a host.
         _by_op = scratchpad.get("concluded_by_operator")
@@ -3944,11 +4203,14 @@ def create_react_workflow(
         output["stop_reason"] = _stop_reason(
             code="iteration_budget",
             finished=False,
-            budget_exhausted=not isinstance(_stuck_out, dict) and not isinstance(_by_op, dict),
+            budget_exhausted=(
+                not isinstance(_stuck_out, dict) and not isinstance(_by_op, dict) and _no_call_out is None
+            ),
             iterations=iterations,
             forced=_stuck_out if isinstance(_stuck_out, dict) else None,
             max_iterations=max_iterations,
             by_operator=_by_op if isinstance(_by_op, dict) else None,
+            no_call=_no_call_out,
         )
         # The turn ends HERE (0028 multi-emit fix): one turn_end per turn.
         emit("max_iterations", {"iterations": max_iterations, "outcome": "iteration_budget"})

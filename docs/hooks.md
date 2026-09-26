@@ -174,7 +174,7 @@ results are the founding producer), ReAct's observe emits `media_captured`
 lands first), merged after context attachments and deduped by artifact
 id/path. Consumption is ONE-SHOT per successfully parsed answer — image
 tokens ride one model call, and the malformed-output retry paths
-(`parse_retry_truncated`/`_empty`/`_plan_only`, plus the bounded
+(`parse_retry_truncated`/`_empty`/`_plan_only`, `parse_reprompt`, plus the bounded
 conclude-retry) restore the same refs so a rewrite is never image-blind; the
 durable transcript keeps the tool's textual ref. Dict refs captured from
 tools are stamped `origin: "tool_capture"` (provenance for degrade-not-fail

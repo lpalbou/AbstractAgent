@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **A reply that announces tool use without calling a tool is no longer the final answer** (ReAct, CodeAct, MemAct). With Qwen3.x on MLX the model often ended a step with one sentence ("I have strong material. Let me verify … before writing the digest.") and the run completed without doing the work. Such a reply, and a reply whose tool calls could not run (unknown tool name, a call cut off mid-parameter, calls left in the thinking block that AbstractCore could not recover), is now re-prompted ONCE: the reply is appended to the transcript verbatim, reasoning included, followed by a request to call the tools now or answer directly. The re-prompt call is recorded in the ledger (`_runtime_observability.reprompted` on the `LLM_CALL` payload). If the second reply fails the same way, the step ends with a visible error: ReAct concludes from what the run already has with `stop_reason.code = "no_tool_call"` and an `error` notice; CodeAct and MemAct end with the error as the answer. Neither the announcement nor tool markup is ever published as the answer. Genuine short finals ("Done.", refusals, questions, "Here is …") are not re-prompted. `_runtime.check_plan=false` disables both checks.
+- The ReAct conclusion path no longer publishes an announcement or tool markup (including inside its progress report fallback), and the CodeAct/MemAct budget terminals skip re-prompted replies when picking the agent's last words.
+
+### Added
+- Tool calls AbstractCore recovered from the thinking block (`metadata.tool_calls_from_reasoning`) are counted in the ReAct `parse` / `parse_tool_calls` events, the cycle entry, the report and an `info` notice; CodeAct and MemAct add `from_reasoning` to `parse_tool_calls`.
+- New events: `parse_reprompt`, `parse_reprompt_failed` (all loops), `parse_reprompt_skipped`, `conclusion_announcement_dropped` (ReAct). `parse_retry_plan_only` still fires for announcements.
+
 ## [0.3.14] - 2026-09-26
 
 ### Changed

@@ -216,6 +216,12 @@ When a run completes, workflows return `state.output` with at least:
 ReAct also returns:
 - `report` (string)
 - `scratchpad` (dict, including `cycles`)
+- `stop_reason` (dict: `code`, `finished`, `budget_exhausted`, `label`, `headline`, `remedy`) and `notices`
+  (list of `{code, severity, text}`). `stop_reason.code = "no_tool_call"` means the model announced tool use,
+  or wrote tool calls that could not run, twice (once after a re-prompt); `output.no_tool_call_stop` then names
+  the reason. See [`docs/agents.md`](agents.md#replies-that-announce-tools-without-calling-them-all-three-loops).
+
+All three loops add `no_tool_call_stop` (`reason`, `detail`, `cycle`, `error`) when a step ended that way.
 
 Budget-exhausted terminals (`outcome: iteration_budget`): ReAct runs a tool-free
 conclusion call; CodeAct/MemAct answer with the agent's last assistant words
