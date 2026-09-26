@@ -78,6 +78,10 @@ EXTRA_ANNOUNCEMENTS = [
     "One more search to confirm the oil figure, then the digest.",
     "First, a quick search for the ECB decision.",
     "I need a bit more data on the Hormuz situation.",
+    # Review 29 L4: misses from a fresh set.
+    "Okay, fetching the Reuters article next.",
+    "Almost there — I just need to read one more page.",
+    "Time to check the CI logs.",
 ]
 
 # Realistic final answers that must NOT be re-prompted: review 28's 23-final
@@ -476,6 +480,31 @@ def test_react_announcement_on_the_last_iteration_goes_to_the_conclusion() -> No
     assert "parse_reprompt" not in names and "parse_reprompt_skipped" in names
     assert _answer(state) == "Best effort digest."
     assert len(payloads) == 3
+    # Same stop as CodeAct/MemAct in this situation (review 29 L3).
+    sr = (state.output or {})["stop_reason"]
+    assert sr["code"] == "no_tool_call" and sr["budget_exhausted"] is True
+    assert "no iteration left to re-prompt it" in sr["headline"]
+
+
+def test_react_plain_budget_exhaustion_keeps_the_iteration_budget_stop() -> None:
+    conclusion = {"content": "Best effort digest.", "tool_calls": [], "finish_reason": "stop"}
+    state, _, steps, _, _ = _drive("react", [FIRST_BATCH, VISIBLE_CALLS, conclusion], max_iterations=2)
+    assert "parse_reprompt_skipped" not in _names(steps)
+    sr = (state.output or {})["stop_reason"]
+    assert sr["code"] == "iteration_budget" and sr["budget_exhausted"] is True
+
+
+def test_react_last_iteration_progress_report_omits_the_announcement() -> None:
+    """Review 29 L2: when the conclusion also fails, the fallback report lists
+    progress; an announcement that never ran is not progress."""
+    state, _, steps, _, _ = _drive("react", [FIRST_BATCH, ANNOUNCE], max_iterations=2)
+    assert "parse_reprompt_skipped" in _names(steps)
+    assert "conclusion_announcement_dropped" in _names(steps)
+    answer = _answer(state)
+    assert "## Progress (from scratchpad)" in answer
+    assert "web_search" in answer
+    assert ANNOUNCE["content"] not in answer
+    assert "Let me verify" not in answer
 
 
 def test_react_visit_lane_markup_reprompt_is_host_voiced() -> None:
@@ -544,6 +573,22 @@ LONG_DIGEST = (
 ) * 2 + "Let me list the three risks worth watching: supply, rates, and the rare-earth export curbs."
 
 
+def test_react_long_reply_nudge_is_bounded_to_once_per_step() -> None:
+    """Review 29 L1: a model repeating a legitimate long reply after the soft
+    nudge has answered; it used to be nudged every iteration (20 calls)."""
+    plain = LONG_DIGEST.replace("## Daily digest\n\n", "") + (
+        " Each of them can move the numbers above within a week, so the digest flags them first."
+    ) * 2
+    assert len(plain) >= 800
+    reply = {"content": plain, "tool_calls": [], "finish_reason": "stop"}
+    state, payloads, steps, _, _ = _drive("react", [reply], max_iterations=20)
+    names = _names(steps)
+    assert names.count("parse_retry_plan_only") == 1
+    assert len(payloads) == 2
+    assert _answer(state) == plain.strip()
+    assert (state.output or {})["stop_reason"]["code"] == "final_answer"
+
+
 def test_react_long_answer_with_intent_words_is_never_an_error() -> None:
     """Review 28 D4: an 800-char digest containing "Let me list ..." must not go
     through the once-then-error path, even when sent twice."""
@@ -607,6 +652,7 @@ def test_sibling_loops_announcement_on_the_last_iteration_is_a_named_stop(loop: 
     assert "no iteration was left" in out["answer"]
     assert "Searching." not in out["answer"] and ANNOUNCE["content"] not in out["answer"]
     assert out["stop_reason"]["code"] == "no_tool_call"
+    assert out["stop_reason"]["budget_exhausted"] is True
     assert len(payloads) == 2
 
 
@@ -615,6 +661,7 @@ def test_sibling_loops_double_failure_names_the_stop(loop: str) -> None:
     state, _, _, _, _ = _drive(loop, [ANNOUNCE, ANNOUNCE])
     out = state.output or {}
     assert out["stop_reason"]["code"] == "no_tool_call"
+    assert out["stop_reason"]["budget_exhausted"] is False
     assert "after one re-prompt" in out["stop_reason"]["headline"]
 
 

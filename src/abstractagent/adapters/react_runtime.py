@@ -1260,6 +1260,7 @@ def _render_cycles_for_conclusion_prompt(
     scratchpad: Dict[str, Any],
     *,
     limits: Optional[Dict[str, Any]] = None,
+    skip_not_an_answer_thoughts: bool = False,
 ) -> str:
     cycles = scratchpad.get("cycles")
     if not isinstance(cycles, list) or not cycles:
@@ -1304,7 +1305,11 @@ def _render_cycles_for_conclusion_prompt(
         lines.append(f"[cycle {i}]")
 
         thought = _truncate_preview(str(c.get("thought") or "").strip(), max_chars=max_thought_chars)
-        if thought:
+        # A cycle whose reply was not an answer (an announcement or tool markup
+        # that never ran) is no progress: the user-facing fallback report must
+        # not repeat it.
+        not_an_answer = bool(c.get("reprompted") or c.get("reprompt_failed") or c.get("no_call_at_budget"))
+        if thought and not (skip_not_an_answer_thoughts and not_an_answer):
             lines.append(f"thought: {thought}")
 
         tcs = c.get("tool_calls")
@@ -1455,6 +1460,7 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
         scratchpad.pop("stuck_nudged", None)
         # Mission AGX per-turn verdict/counters: same class as stuck_streak.
         scratchpad.pop("no_tool_call_stop", None)
+        scratchpad.pop("no_call_at_budget", None)
         scratchpad.pop("tool_calls_from_reasoning", None)
         # used_tools is the same per-turn latch class (wave-F P4): a toolless
         # turn 2 must not report turn 1's tool use.
@@ -1495,8 +1501,9 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
             # retry stash is the same lifecycle class.
             "pending_media",
             "last_call_media",
-            # One-re-prompt-per-step state (mission AGX).
+            # One-re-prompt-per-step state (mission AGX), and the soft nudge's.
             "reprompt",
+            "soft_nudge",
         ):
             temp.pop(key, None)
 
@@ -2156,6 +2163,9 @@ def create_react_workflow(
         prior_reprompt = temp.pop("reprompt", None)
         if not isinstance(prior_reprompt, dict):
             prior_reprompt = None
+        # The long-reply soft nudge is bounded the same way: once per step.
+        # A reply repeated after the nudge is accepted as the answer.
+        prior_soft_nudge = bool(temp.pop("soft_nudge", None))
         parse_payload: Dict[str, Any] = {
             "iteration": cycle_i,
             "max_iterations": max_iterations,
@@ -2688,6 +2698,14 @@ def create_react_workflow(
                 # No iteration left to re-prompt in: the conclusion path
                 # answers instead (and never publishes this reply either).
                 cycle["no_call_at_budget"] = no_call_reason
+                # Named in the turn's stop_reason (`no_tool_call`, budget
+                # exhausted), like CodeAct/MemAct in the same situation.
+                scratchpad["no_call_at_budget"] = {
+                    "reason": no_call_reason,
+                    "detail": no_call_detail,
+                    "cycle": cycle_i,
+                    "reprompted": False,
+                }
                 emit(
                     "parse_reprompt_skipped",
                     {"cycle": cycle_i, "reason": no_call_reason, "detail": no_call_detail, "why": "iteration_budget"},
@@ -2731,9 +2749,13 @@ def create_react_workflow(
         # any length) stays a SOFT nudge, separate from the once-then-error
         # path above: it can match a real 800-char answer that happens to say
         # "Let me list the three risks", so it never ends a step with an error.
+        # Once per step: after one nudge, the next no-call reply is the answer
+        # (a model repeating a legitimate long reply used to be nudged every
+        # iteration until the budget ran out).
         if (
             check_plan
             and tools_offered
+            and not prior_soft_nudge
             and cycle_i < max_iterations
             and _looks_like_deferred_action(content)
             and not has_negated_intent(content)
@@ -2744,6 +2766,7 @@ def create_react_workflow(
                 "If you need to act, call the next tool now (emit ONLY the next tool call(s)).\n"
                 "If you are already done, provide the final answer with NO tool calls.",
             )
+            temp["soft_nudge"] = True
             emit("parse_retry_plan_only", {"cycle": cycle_i, "soft": True})
             if last_call_media:
                 temp["pending_media"] = last_call_media
@@ -4119,7 +4142,9 @@ def create_react_workflow(
                 # Provide a deterministic report so users don't lose scratchpad context.
                 # Never publish tool markup, even inside the progress render.
                 scratch_view = _strip_tool_call_markup(
-                    _render_cycles_for_conclusion_prompt(scratchpad, limits=limits)
+                    _render_cycles_for_conclusion_prompt(
+                        scratchpad, limits=limits, skip_not_an_answer_thoughts=True
+                    )
                 ).strip()
                 if isinstance(_stop_no_call, dict) and _stop_no_call.get("error"):
                     parts = [str(_stop_no_call.get("error")), "No final answer was produced."]
@@ -4172,6 +4197,12 @@ def create_react_workflow(
             _no_call_out = None
         if _no_call_out is not None:
             output["no_tool_call_stop"] = dict(_no_call_out)
+        # The last iteration ended on a no-call reply with no iteration left to
+        # re-prompt it: the stop is `no_tool_call` with the budget exhausted.
+        _at_budget = scratchpad.get("no_call_at_budget")
+        _stop_no_call = _no_call_out
+        if _stop_no_call is None and isinstance(_at_budget, dict) and _at_budget.get("reason"):
+            _stop_no_call = dict(_at_budget)
         # Authored HERE, where the ceiling, the spend, the forcing and the
         # nudge are all known — never in a host.
         _by_op = scratchpad.get("concluded_by_operator")
@@ -4187,7 +4218,7 @@ def create_react_workflow(
             forced=_stuck_out if isinstance(_stuck_out, dict) else None,
             max_iterations=max_iterations,
             by_operator=_by_op if isinstance(_by_op, dict) else None,
-            no_call=_no_call_out,
+            no_call=_stop_no_call,
         )
         # The turn ends HERE (0028 multi-emit fix): one turn_end per turn.
         emit("max_iterations", {"iterations": max_iterations, "outcome": "iteration_budget"})

@@ -87,7 +87,7 @@ _UNKNOWN_NAMES_RE = re.compile(r"the model called ((?:'[^']*'(?:, )?)+)")
 # First-person, forward-looking intent. The apostrophe is REQUIRED in "I'll":
 # the optional-apostrophe spelling matches the word "ill".
 _INTENT_RE = re.compile(
-    r"(?i)\b(let me|let['’]s|i will|i['’]ll|i am going to|i['’]m going to|i need to|i should|next,? i|now i)\b"
+    r"(?i)\b(let me|let['’]s|i will|i['’]ll|i am going to|i['’]m going to|i (?:just )?need to|i should|next,? i|now i)\b"
 )
 _NEGATED_INTENT_RE = re.compile(
     r"(?i)\b(i will not|i won['’]t|i['’]ll not|i cannot|i can['’]t|i do not need to|i don['’]t need to|"
@@ -97,15 +97,14 @@ _NEGATED_INTENT_RE = re.compile(
 # in react_runtime (`_DEFERRED_ACTION_VERB_RE`) because it only applies to
 # SHORT replies: every XP failure used one of verify/get/gather/confirm/fill/
 # pull/do ... pass/check, none of which the old list knew.
-_TOOL_VERB_RE = re.compile(
-    r"(?i)\b("
+_TOOL_VERBS = (
     r"read|open|search|list|skim|inspect|explore|scan|run|execute|edit|fetch|download|creat(?:e|ing)|"
     r"verify|check|double-check|confirm|validate|get|gather|grab|pull|look(?:\s+up|\s+into|\s+at)?|find|"
     r"research|dig|fill|collect|query|call|test|browse|visit|retrieve|load|review|investigate|grep|"
     r"examine|analy[sz]e|compare|write|save|update|modify|patch|install|build|compile|apply|"
     r"do (?:one|a|another|two|some)"
-    r")\b"
 )
+_TOOL_VERB_RE = re.compile(r"(?i)\b(" + _TOOL_VERBS + r")\b")
 # The model waiting on the user is a legitimate final reply.
 _WAITING_RE = re.compile(
     r"(?i)\b(let me know|what would you like|would you like|do you want|tell me|shall i|should i|"
@@ -120,14 +119,21 @@ _NON_ACTION_AFTER_INTENT_RE = re.compile(
     r"(?:summari[sz]e|explain|recommend|suggest|mention|note|clarify|add|point out|conclude|answer|say|"
     r"be (?:clear|brief|honest)|start by saying|wrap up)\b"
 )
+_PROGRESSIVE_TOOL_VERBS = (
+    r"(?:checking|fetching|searching|looking up|reading|running|verifying|pulling|gathering|grabbing|opening|"
+    r"loading|querying|downloading|inspecting|scanning|grepping|confirming|retrieving)"
+)
 # Present-progressive or elliptical action statements with no first person:
 # "Checking the remaining two sources now.", "Proceeding to fetch ...",
-# "One more search to confirm ..., then the digest.", "First, a quick search for ...".
+# "One more search to confirm ..., then the digest.", "First, a quick search for ...",
+# "Okay, fetching the Reuters article next.", "Time to check the CI logs.".
 _ACTION_STATEMENT_RE = re.compile(
     r"(?i)^(?:"
     r"proceeding to \w+|"
-    r"(?:checking|fetching|searching|looking up|reading|running|verifying|pulling|gathering|grabbing|opening|"
-    r"loading|querying|downloading|inspecting|scanning|grepping|confirming|retrieving)\b.*\b(?:now|next|then|first)\b|"
+    + _PROGRESSIVE_TOOL_VERBS
+    + r"\b.*\b(?:now|next|then|first)\b|"
+    r"(?:okay|ok),?\s+" + _PROGRESSIVE_TOOL_VERBS + r"\b|"
+    r"time to (?:" + _TOOL_VERBS + r")\b|"
     r"(?:one|two|a few) more (?:search|searches|check|checks|lookup|lookups|fetch|fetches|pass|read|reads)\b|"
     r"first,? (?:a|one) (?:quick )?(?:search|check|lookup|fetch|pass|read)\b|"
     r"i need (?:a bit |a little |some )?more (?:data|info|information|detail|details|context|evidence|sources)\b"
@@ -418,6 +424,8 @@ def no_call_stop_reason(no_call: Dict[str, Any], *, iterations: int) -> Dict[str
     """Host-facing `stop_reason` for a turn ended by an unrecovered no-call reply.
 
     One wording for all three loops (hosts render it; they never re-derive it).
+    `reprompted: False` means the reply came on the last iteration, so
+    `budget_exhausted` is True as well.
     """
     unrunnable = str(no_call.get("reason") or "") == REASON_UNRUNNABLE
     reprompted = bool(no_call.get("reprompted", True))
@@ -432,7 +440,8 @@ def no_call_stop_reason(no_call: Dict[str, Any], *, iterations: int) -> Dict[str
     return {
         "code": "no_tool_call",
         "finished": False,
-        "budget_exhausted": False,
+        # Not re-prompted = the last iteration: the budget is spent too.
+        "budget_exhausted": not reprompted,
         "iterations": iterations,
         "label": (
             f"stopped: tool call could not run{iters_txt}"
@@ -440,7 +449,8 @@ def no_call_stop_reason(no_call: Dict[str, Any], *, iterations: int) -> Dict[str
             else f"stopped: announced tools, made no call{iters_txt}"
         ),
         "headline": (
-            f"The agent stopped early{iters_txt}: the model {what}"
+            (f"The agent stopped early{iters_txt}" if reprompted else f"The agent used its last iteration{iters_txt}")
+            + f": the model {what}"
             + (f" ({detail})" if detail else "")
             + again
         ),
