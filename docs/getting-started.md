@@ -62,7 +62,7 @@ from abstractagent import create_react_agent
 # provider/model resolve from AbstractCore config defaults when omitted
 # (`abstractcore --config`); pass explicitly to pin. On Ollama, raise the
 # context window to the model's MAXIMUM — the ~4k server default silently
-# truncates, and any fixed lower number is the same hidden ceiling relocated.
+# truncates, and any fixed lower number becomes a hidden context ceiling.
 agent = create_react_agent(
     provider="ollama",
     model="qwen3:4b-instruct-2507-q4_K_M",
@@ -170,6 +170,6 @@ More details: [`docs/persistence.md`](persistence.md)
 - `open_attachment` is a runtime-owned tool (executed by the runtime’s AbstractCore integration). If you pass `allowed_tools`,
   include `"open_attachment"` (see [`docs/tools.md`](tools.md) and [`docs/faq.md`](faq.md)).
 - `execute_python` uses a local subprocess with a timeout; it is not a hardened sandbox (`src/abstractagent/sandbox/local.py`).
-- ReAct’s `review_mode` IS applied (a verifier round on final answers, default **on** since 2026-07-13; failures degrade
+- ReAct’s `review_mode` IS applied (a verifier round on final answers, default **on**; failures degrade
   to accept-with-`#FALLBACK`, never a dead run). `plan_mode` is stored in `_runtime` but not read by the ReAct adapter —
   plan management rides the always-available `update_plan` tool instead (`src/abstractagent/adapters/react_runtime.py`).

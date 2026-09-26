@@ -106,18 +106,18 @@ The input dict is never mutated. Never apply it to a live run.
 File: `src/abstractagent/agents/react.py`
 
 Key parameters:
-- `provider`, `model`: optional since 2026-07-13 — when omitted, they resolve from
+- `provider`, `model`: optional — when omitted, they resolve from
   AbstractCore config global defaults (`abstractcore --config`); when nothing is
   configured, a packaged fallback pair applies with a loud `#FALLBACK`
   `UserWarning` (`src/abstractagent/agents/defaults.py`). Explicit values win untouched.
 - `llm_kwargs`: forwarded to the underlying AbstractCore client (e.g. base URL, timeouts,
-  and on Ollama `num_ctx` — forwarded per-call since 2026-07-13; set it to the model's
+  and on Ollama `num_ctx` — forwarded per call; set it to the model's
   maximum window, see the context-overflow FAQ)
 - `tools`: list of tool callables; defaults to `abstractagent.tools.ALL_TOOLS`
-- `review_mode`: verifier round on final answers — default **on** since 2026-07-13
+- `review_mode`: verifier round on final answers — default **on**
   (failures degrade to accept-with-`#FALLBACK`, never a dead run)
-- `max_output_tokens`: output-token cap (the honest name; `max_tokens` is kept as a
-  compat alias on ReAct and means the same knob there)
+- `max_output_tokens`: output-token cap (`max_tokens` is kept as a compatibility
+  alias on ReAct and means the same knob there)
 - `run_store`, `ledger_store`: pass persistent stores to enable resume across restarts
 
 Per-run controls (via `ReactAgent.start(...)`):
@@ -130,6 +130,14 @@ Host-level `_runtime` slots (raw-workflow hosts; see `docs/skills-attachment.md`
 - `speculation`: speculative decoding (MTP) control forwarded on every LLM call —
   `False` (Off), `True`, or a Core dict such as `{"mode": "native_mtp", "num_draft_tokens": 2}`;
   unset follows Core's route default. Delegated children inherit it.
+- `stream`: live token streaming for the run's LLM calls. `True` asks the runtime
+  to stream every LLM call to its live-delta sink (the value must be the boolean
+  `True`; anything else is treated as unset); `False` turns streaming off
+  explicitly; unset leaves the host's default. Delegated children in ReAct, CodeAct
+  and MemAct inherit the value, `False` included, so a streamed run keeps
+  streaming when it delegates. Live token deltas need an AbstractRuntime release
+  with live token streaming and a host that installs a delta sink (for example
+  AbstractGateway).
 - `delegate_substrates`: `{name: {provider, model, description?, thinking?, speculation?}}`
   palette for the `delegate_agent` tool's optional `substrate` argument
   (unknown names fail as loud tool errors; the palette never propagates to
@@ -145,7 +153,7 @@ Defaults:
 - `tools=None` defaults to `[execute_python]`
 - `provider`/`model` resolve like ReAct's (config defaults, loud fallback)
 
-Limits honesty (CodeAct and MemAct): `max_tokens` is the context ACCOUNTING
+Limits (CodeAct and MemAct): `max_tokens` is the context ACCOUNTING
 ceiling (drives `warn_tokens_pct` / the `context_warning` emit), not an output
 cap — use `max_output_tokens` for output capping.
 

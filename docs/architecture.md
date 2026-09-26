@@ -1,6 +1,6 @@
 # Architecture
 
-> Updated: 2026-02-04  
+> Updated: 2026-09-26  
 > Scope: describes **what is implemented in this repository** (no roadmap claims).
 
 Ecosystem context:
@@ -80,8 +80,15 @@ flowchart TD
   init --> reason --> parse
   parse -->|tool calls| act --> observe --> reason
   act -->|ASK_USER wait| handle_user_response --> reason
-  parse -->|no tool calls| done
-  reason -->|iteration > max| max_iterations
+  parse -->|retry: empty reply, plan followthrough, …| reason
+  parse -->|final answer| maybe_review
+  maybe_review -->|review off or skipped| done
+  maybe_review -->|review_mode on| review --> review_parse
+  review_parse -->|accepted| done
+  review_parse -->|revise| reason
+  review_parse -->|tool calls| act
+  reason -->|iteration budget reached| max_iterations
+  parse -->|iteration budget reached| max_iterations
 ```
 
 Highlights (code reality):
@@ -89,6 +96,31 @@ Highlights (code reality):
 - The ReAct loop trace is stored under `scratchpad["cycles"]` (each cycle records `thought`, `tool_calls`, `observations`).
 - Tool allowlists are computed/stored under `_runtime.allowed_tools`, and `TOOL_CALLS` effects include `allowed_tools` in payload.
 - The adapter has a loop guard that can skip repeating identical **side-effect** tool calls (write/edit/execute) after a success.
+- `review_mode` (default on) routes a final answer through `maybe_review` → `review` → `review_parse`; a failed verifier call accepts the held answer with a `#FALLBACK` marker.
+
+### Delegated sub-agents (`delegate_agent`)
+
+ReAct, CodeAct and MemAct map the schema-only `delegate_agent` built-in to a
+child run of the same loop. The child starts with its own task, allowlist and
+iteration budget, and inherits a fixed set of the parent's `_runtime` controls
+so it behaves like the parent unless the host says otherwise:
+
+```mermaid
+flowchart LR
+  Parent["Parent run<br/>_runtime: provider, model, temperature, seed,<br/>thinking, speculation, stream,<br/>max_output_tokens, tool_prompt_examples, tool_policy"]
+  Palette["_runtime.delegate_substrates<br/>(host-granted profiles)"]
+  Child["Child run<br/>same loop, own task + allowlist,<br/>_limits.max_iterations"]
+  Parent -->|"delegate_agent(task, substrate?)"| Child
+  Palette -. "substrate profile overrides<br/>provider, model, thinking, speculation" .-> Child
+```
+
+- Values the parent has set are copied; unset values stay unset, so the child
+  follows the same defaults as the parent. An explicit `False` (for example
+  `stream: False` or `speculation: False`) is inherited as `False`.
+- `stream` keeps a delegated child's LLM calls on the same live token stream as
+  the parent (see [`docs/api.md`](api.md)).
+- The substrate palette does not propagate to grandchildren; each level needs
+  its own grant.
 
 ### CodeAct workflow (`codeact_agent`)
 
@@ -97,8 +129,9 @@ Files:
 - Logic: `src/abstractagent/logic/codeact.py` (`CodeActLogic`)
 
 Behavior highlights:
-- If the model outputs a fenced ` ```python ... ``` ` block, the adapter executes it as `execute_python`
-  (`execute_code_node` in `src/abstractagent/adapters/codeact_runtime.py`).
+- On models without native tool calling, a fenced ` ```python ... ``` ` block in the reply is executed as
+  `execute_python` (`execute_code_node` in `src/abstractagent/adapters/codeact_runtime.py`); native-tools
+  models use tool calls only (see [`docs/agents.md`](agents.md)).
 - Optional `plan_mode` and `review_mode` are implemented for CodeAct (plan nodes + reviewer nodes in the same adapter).
 
 ### MemAct workflow (`memact_agent`)

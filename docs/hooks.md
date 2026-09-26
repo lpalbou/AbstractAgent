@@ -112,8 +112,8 @@ Canonical names come from `DEFAULT_EVENT_MAP` (pluggable per
 | canonical | raw step(s) | fires | loops |
 |---|---|---|---|
 | `cycle_start` | `reason` | each reasoning cycle begins | all three |
-| `tool_proposed` | `parse_tool_calls` | model proposed a tool batch (payload: `count`) | all three (since 2026-07-15; previously ReAct-only). CodeAct's fenced-code path deliberately does NOT fire it — no tool batch is proposed there; key on `parse`'s `has_code` |
-| `tool_executed` | `observe` | one tool result observed — payload carries `tool`, `success`, `result`, and `call_id` (since 2026-07-13; empty string when the batch carried none) so fleet controllers can correlate tool_call → approval → result | all three |
+| `tool_proposed` | `parse_tool_calls` | model proposed a tool batch (payload: `count`) | all three. CodeAct's fenced-code path deliberately does NOT fire it — no tool batch is proposed there; key on `parse`'s `has_code` |
+| `tool_executed` | `observe` | one tool result observed — payload carries `tool`, `success`, `result`, and `call_id` (empty string when the batch carried none) so fleet controllers can correlate tool_call → approval → result | all three |
 | `turn_end` | `done`, `max_iterations` | turn finished; `data.outcome` = `final_answer` \| `iteration_budget` | all three |
 | `user_wait` | `ask_user` | loop asked the user | all three |
 | `user_response` | `user_response` | user's answer resumed the loop | all three |
@@ -135,7 +135,7 @@ profile was applied to a delegated child), the review/verifier steps
 MemAct's finalize steps (`finalize_request`, `finalize`, `finalize_skipped`,
 `finalize_used_draft`).
 
-Parse payload common core (0028 contract wave, 2026-07-14): every adapter's
+Parse payload common core: every adapter's
 `parse` payload guarantees `has_tool_calls` (bool), `tool_calls`
 (list of `{name, arguments, call_id}`), and `content_preview` (≤200 chars of
 model text; the string `"(no content)"` when the reply was empty — a
@@ -144,7 +144,7 @@ when the reply exceeds the bound the preview carries a trailing
 `… [#TRUNCATION: 200 of N chars; full reply in the transcript]` marker, so a
 consumer can always tell a short reply from a clipped one. Built by
 `adapters.transcripts.parse_content_preview` — one helper, three loops.
-Since 2026-07-27 every adapter also carries `reasoning`: the
+Every adapter also carries `reasoning`: the
 model's separated thinking text when the provider reported one
 (`response.reasoning` / `reasoning_content`), `""` when absent — one shared
 reader across the three loops. Loop-specific extras (ReAct's full
@@ -156,7 +156,7 @@ block routes to execution. CodeAct's parse payload carries the additive
 inspection UI from parse payloads must treat `has_tool_calls || has_code`
 as "an action is coming" on CodeAct.
 
-Additive on the same payload (2026-07-15): `prompt_cache` — the provider's
+Additive on the same payload: `prompt_cache` — the provider's
 per-call prompt-cache telemetry struct (`mode`, `key`, `outcome`,
 `cached_tokens`, `fed_tokens`, `#FALLBACK`-prefixed `degraded_reason` when
 reuse degraded), lifted verbatim from the LLM result's
@@ -165,7 +165,7 @@ reuse degraded), lifted verbatim from the LLM result's
 never an empty placeholder. The struct's field vocabulary is core's contract,
 not this layer's — treat unknown fields as additive.
 
-Sight lane (2026-07-21, operator ruling c4089 over c3969 shape A): when a
+Sight lane: when a
 SUCCESSFUL tool result's dict output declares a `media` list (paths or
 `{"$artifact": id}` refs, authored by the producing tool — camera capture
 results are the founding producer), ReAct's observe emits `media_captured`
@@ -194,8 +194,8 @@ same args, three consecutive) trips the 0017 stuck-streak guard like any
 other repeated batch — interleaved distinct work never counts, and hosts
 running deliberate watch loops own `_runtime.stuck_streak_threshold`.
 
-**Tool failures are explained back to the model on the FIRST one**
-(2026-08-21). When a call fails, `observe` is followed by
+**Tool failures are explained back to the model on the FIRST one.**
+When a call fails, `observe` is followed by
 `tool_failure_hint` (`{count, classes, tools}`) and the loop's inbox carries a
 diagnosis built only from information the run already holds: the call's own
 arguments, the verbatim error, the classified cause, and a concrete
@@ -205,8 +205,8 @@ already-diagnosed failure is counted back to the model rather than restated.
 `tool_failure_hint_error` fires if the hint builder itself raises — the hint
 is skipped and the run continues, never silently.
 
-**Read orchestration is ADVICE, and never costs the model its data**
-(2026-08-22). When a batch walks one file in narrow adjacent slices, or
+**Read orchestration is ADVICE, and never costs the model its data.**
+When a batch walks one file in narrow adjacent slices, or
 re-reads in full a file it already read, `parse` emits
 `parse_read_orchestration_hint` (`{cycle, path, mode, enforcement}`) and puts
 a note in the inbox suggesting one wider contiguous range, or one batched set
@@ -214,31 +214,19 @@ of distant ranges. **The batch still executes.** `enforcement: "advise"` is
 the only shape shipped; the call site keeps a refusal branch for a future
 mode that genuinely needs one.
 
-This used to be a refusal — the hint DROPPED the read batch and sent the loop
-back to `reason`, which spends a full iteration of the operator's task budget
-and returns the model zero bytes of the file it asked for. `read_file` has no
-side effects, so nothing was protected by refusing it. Three properties made
-it a compliance trap: the "already warned" key was the requested RANGE, so
-the widening the note itself asks for minted a fresh key and re-fired the
-guard; `last_successful_read_batch` only advances from executed results, so
-the comparison anchor froze; and the sole exit was a byte-identical retry —
-precisely what the stuck-streak guard above exists to punish. Run
-`9ea71c55-4405-4b6f-b387-3cc78629880b` lost cycles 15, 16 and 17 to it (three
-DIFFERENT ranges, zero observations each), then died on the iteration budget
-two cycles from a diagnosis it had already reached. The key is now the PATH:
-one standing piece of read advice per file per turn.
+`read_file` has no side effects, so the advice never refuses the batch or
+spends an iteration. The advice is keyed by file PATH: one standing piece of
+read advice per file per turn, so widening the range as advised does not
+re-trigger it.
 
-**The loop tells the model when the budget is nearly gone** (2026-08-22).
+**The loop tells the model when the budget is nearly gone.**
 From `_limits.warn_iterations_pct` (default 80) onward, the reason tail
 carries a `[budget]` line beside `[loop] iteration N of M`: the remaining
 count, that the turn ENDS when it hits zero, and a preference for landing a
 justified change over confirming a diagnosis already in hand. The final
-iteration is told not to open new investigation. `warn_iterations_pct` had
-been declared in `_limits` since the beginning with no behavioural
-consequence anywhere; the position line alone is information, not a steer —
-run `9ea71c55` read "iteration 19 of 20" and spent both remaining iterations
-on further diagnosis. Suppressed with the rest of the loop chrome under
-`_runtime.suppress_loop_tail` (c2447).
+iteration is told not to open new investigation. The `[budget]` line is
+suppressed with the rest of the loop chrome under
+`_runtime.suppress_loop_tail`.
 
 **The operator can end a turn well, from any client.**
 `POST /commands {type: "conclude", run_id}` rides the same durable lane as a
@@ -252,7 +240,7 @@ tool-free, "answer with what you have, say what remains". The turn ends with
 failure, not a truncation the agent caused. An optional `payload.note` is
 quoted to the model verbatim.
 
-The stuck-streak guard (0017) sits BEHIND that: it now fires on every
+The stuck-streak guard sits BEHIND that: it fires on every
 detection with `action: nudged | repeat_after_nudge | stopped`, and only
 `stopped` ends the turn. A repeat whose answers all FAILED trips at 2
 identical batches (the model has already been given a diagnosis and ignored
@@ -260,7 +248,7 @@ it); any other repeat trips at `_runtime.stuck_streak_threshold` (default 3).
 A repeat whose answers CHANGE is not a streak at all — a poll reporting
 10%, then 45%, then 80% is progress, not a loop.
 
-Budget exhaustion emits exactly ONCE per turn (0028 multi-emit fix): ReAct's
+Budget exhaustion emits exactly ONCE per turn: ReAct's
 conclusion node announces `max_iterations_reached` at first entry (before the
 conclusion call's latency) and fires `max_iterations` (canonical `turn_end`,
 outcome `iteration_budget`) once, at the completion branch where the turn
@@ -275,11 +263,9 @@ Stability contract:
 - **Canonical event names** (the table above) are frozen.
 - **Raw step names** (the inventory constants) are stable-with-announced-renames;
   a rename is a contract revision, never a drive-by edit, and lands in
-  `emit_inventory.RENAMED_STEPS` (the migration record). Executed at founding
-  publication (2026-07-13, zero consumers existed): CodeAct's
+  `emit_inventory.RENAMED_STEPS` (the migration record), which holds CodeAct's
   `parse_retry_empty_response` → `parse_retry_empty` (one semantic, one name).
-  The founding asymmetry "ReAct emits no `init`" was CLOSED 2026-07-15
-  (backlog 0026): all three loops now emit `init` (payload: `task`) once at
+  All three loops emit `init` (payload: `task`) once at
   workflow entry — a RUN moment, not a turn moment (composed visit turns
   re-enter at `reason` and never re-fire it).
 - **`#FALLBACK` / `#TRUNCATION` markers** in payloads are stable.
@@ -330,7 +316,7 @@ continuing run drains the inbox at its next reason boundary.
   directly (`BaseAgent.inject_message`) — and even that channel has a
   terminal-honesty bound: guidance landing after the loop's last drain
   cannot influence the run and is reported as `inbox_undelivered` at the
-  terminal (0026 conclude-phase honesty), never silently completed over.
+  terminal, never silently completed over.
 - **Failures are contained and observable.** A raising handler never kills
   the run; the failure surfaces as `hook_error` on the flat `on_step` stream
   AND as a pure-listen notification to the handlers themselves (returns

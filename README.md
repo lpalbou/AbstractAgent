@@ -25,12 +25,14 @@ flowchart LR
 - Getting started: [`docs/getting-started.md`](docs/getting-started.md)
 - API reference: [`docs/api.md`](docs/api.md)
 - Loop hooks (listen/steer/capture): [`docs/hooks.md`](docs/hooks.md)
-- FAQ / troubleshooting: [`docs/faq.md`](docs/faq.md)
+- FAQ: [`docs/faq.md`](docs/faq.md)
+- Troubleshooting: [`docs/troubleshooting.md`](docs/troubleshooting.md)
 - Architecture (diagrams): [`docs/architecture.md`](docs/architecture.md)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 - Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - Security: [`SECURITY.md`](SECURITY.md)
 - Acknowledgements: [`ACKNOWLEDMENTS.md`](ACKNOWLEDMENTS.md)
+- Code of conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
 
 ## What you get
 
@@ -108,8 +110,7 @@ print(state.output["answer"])
 Tip: these loops send the full transcript plus ~19 tool schemas every cycle —
 prefer a tool-capable model. On Ollama, raise the context window to the model's
 maximum available context or the server silently truncates from the oldest
-content first: per-call `llm_kwargs={"num_ctx": <model max>}` (forwarded since
-2026-07-13) or server-side `OLLAMA_CONTEXT_LENGTH=<model max> ollama serve`.
+content first: per-call `llm_kwargs={"num_ctx": <model max>}` or server-side `OLLAMA_CONTEXT_LENGTH=<model max> ollama serve`.
 House rule: maximum available context unless you explicitly choose otherwise —
 a fixed lower number is a hidden ceiling (see [`docs/faq.md`](docs/faq.md)).
 

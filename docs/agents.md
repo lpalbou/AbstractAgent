@@ -38,13 +38,12 @@ print(state.output["answer"])
 Notes (code reality):
 - ReAct persists its **loop trace** under `vars["scratchpad"]["cycles"]` (not as assistant “thought” messages).
 - ReAct disables runtime-level trimming and sends the full `context.messages` window by default.
-- `ReactAgent(..., review_mode=...)` is honored and defaults **on** (since 2026-07-13; the 0027 containment
-  met the recorded re-flip condition): the ReAct adapter runs a verifier round on final answers
+- `ReactAgent(..., review_mode=...)` is honored and defaults **on**: the ReAct adapter runs a verifier round on final answers
   (`maybe_review`/`review` nodes), and a failed verifier call degrades to accepting the held answer with a
   loud `#FALLBACK` marker (never a dead run). Pass `review_mode=False` to opt out. `plan_mode` is stored
   under `vars["_runtime"]` but the ReAct adapter does not read it — plan management rides the
   always-available `update_plan` tool and the `check_plan` gate instead.
-- CodeAct's fenced-code fallback is **capability-conditional** (since 2026-07-14, A1): the default is
+- CodeAct's fenced-code fallback is **capability-conditional**: the default is
   `not supports_native_tools` (the bit the runtime seeds per run from model capabilities) — native-tools
   models neither get taught the ```python fence nor have prose fences extracted (teaching a channel that
   competes with the trained tool_calls channel manufactured zero-tool fabrication); prompted models keep
@@ -84,10 +83,9 @@ MemAct relies on the runtime’s active memory subsystem:
 - memory blocks are injected into the system prompt and updated via structured steps
 - `create_memact_agent(tools=None)` defaults to `abstractagent.tools.ALL_TOOLS` (`src/abstractagent/agents/memact.py`).
 - MemAct has **no** plan or review nodes. `plan_mode`/`review_mode`/`review_max_rounds`
-  are DEPRECATED-IGNORED for one release (they were accepted-and-ignored dead knobs;
-  the 2026-07-13 hard removal broke shipped call sites, so a shim now warns loudly
-  with `DeprecationWarning` on non-default values and ignores legacy defaults —
-  removal lands next release). A MemAct verifier is a deliberate non-goal while
+  are deprecated and ignored: non-default values emit a `DeprecationWarning`,
+  legacy defaults are ignored silently, and the parameters will be removed in a
+  future release. A MemAct verifier is a deliberate non-goal while
   MemAct stays experimental.
 
 ## Common API and output contract

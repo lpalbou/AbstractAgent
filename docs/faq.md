@@ -154,7 +154,7 @@ Example: [`docs/getting-started.md`](getting-started.md)
 
 ## What happens when a long run exceeds the model's context window?
 
-Honestly: **nothing compacts or trims by default.** ReAct deliberately sends the full transcript
+**Nothing compacts or trims by default.** ReAct deliberately sends the full transcript
 every cycle (that is its design; MemAct's memory blocks ride *on top of* the full transcript unless
 spans are archived). When the transcript outgrows the model window:
 
@@ -165,19 +165,19 @@ spans are archived). When the transcript outgrows the model window:
   The symptom is not an error but an inexplicably degraded agent (tool calls stop, retries churn,
   the run burns to `max_iterations`). Remedies, either lane:
   - per-call: `create_react_agent(..., llm_kwargs={"num_ctx": <model max>})` — AbstractCore
-    forwards it to Ollama's `options.num_ctx` (added 2026-07-13 after this FAQ flagged the gap;
-    invalid values raise loudly, absence sends nothing so Modelfile defaults stand);
+    forwards it to Ollama's `options.num_ctx` (invalid values raise loudly; absence sends
+    nothing, so Modelfile defaults stand);
   - server-side: `OLLAMA_CONTEXT_LENGTH=<model max> ollama serve` or a Modelfile
     `PARAMETER num_ctx <model max>`.
 
   House rule either way: always the MODEL'S MAXIMUM available context unless you explicitly
   choose otherwise — any fixed number below the model's window is a hidden ceiling that
-  silently kills workflows needing more (the same trap, relocated).
+  silently breaks workflows needing more.
 
-Since 2026-07-13 the loops emit a one-shot `context_warning` step (with `#FALLBACK` marker) when
+The loops emit a one-shot `context_warning` step (with `#FALLBACK` marker) when
 estimated usage crosses `warn_tokens_pct` (default 80%) of the `max_tokens` accounting ceiling
 (a second one fires if usage crosses the ceiling itself) — subscribe via `on_step`/hooks.
-Honest scope: the accounting uses the SERVER-REPORTED input tokens of the last call, so on an
+Scope: the accounting uses the SERVER-REPORTED input tokens of the last call, so on an
 Ollama server that is already truncating, reported usage plateaus at the serving window and the
 warning may never fire — it catches the approach on providers that report true prompt usage
 against the model window (OpenAI-compatible servers), not the Ollama silent-truncation cliff
@@ -215,11 +215,14 @@ Source of truth:
 - `pyproject.toml` (`[project.scripts]`)
 - `src/abstractagent/repl.py`
 
-## Troubleshooting: “TOOL_CALLS requires a ToolExecutor”
+## Does a delegated sub-agent stream its replies?
 
-`EffectType.TOOL_CALLS` is executed by the runtime’s configured `ToolExecutor`. If you create a `Runtime` manually,
-ensure you provide a tool executor (recommended: `MappingToolExecutor.from_tools([...])`).
+Yes, when the parent run streams. `delegate_agent` children in ReAct, CodeAct and MemAct inherit the
+parent's `_runtime.stream` (and `speculation`, `thinking`, sampling and the other per-run controls), so a
+live view keeps receiving tokens while the agent delegates. An explicit `stream: False` is inherited too.
+See [`docs/api.md`](api.md) and the delegation section of [`docs/architecture.md`](architecture.md).
 
-Factory helpers already wire this for you:
-- `create_react_agent(...)` and `create_codeact_agent(...)` use `MappingToolExecutor.from_tools(...)`
-  (see `src/abstractagent/agents/react.py`, `src/abstractagent/agents/codeact.py`).
+## Where are error fixes?
+
+Symptom-first fixes (for example “TOOL_CALLS requires a ToolExecutor”) live in
+[`docs/troubleshooting.md`](troubleshooting.md).

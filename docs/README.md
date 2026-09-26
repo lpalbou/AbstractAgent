@@ -14,6 +14,7 @@ If you are new to the stack, start with [`docs/getting-started.md`](getting-star
 
 - **Getting started**: [`docs/getting-started.md`](getting-started.md)
 - **FAQ**: [`docs/faq.md`](faq.md)
+- **Troubleshooting**: [`docs/troubleshooting.md`](troubleshooting.md)
 - **API reference**: [`docs/api.md`](api.md)
 - **Agents (ReAct / CodeAct / MemAct)**: [`docs/agents.md`](agents.md)
 - **Tools and allowlists**: [`docs/tools.md`](tools.md)
@@ -24,12 +25,14 @@ If you are new to the stack, start with [`docs/getting-started.md`](getting-star
 
 ## Deep dives
 
-- **Architecture (with diagrams)**: [`docs/architecture.md`](architecture.md)
+- **Architecture (with diagrams)**: [`docs/architecture.md`](architecture.md) — layering, the ReAct graph, delegated sub-agents and the `_runtime` controls they inherit
 - **ReAct pipeline (implemented)**: [`docs/react-pipeline.md`](react-pipeline.md)
 
 ## Development
 
 - **Running tests / local dev**: [`docs/development.md`](development.md)
+
+`docs/quickstart.md` is a redirect stub to the getting-started guide, kept for older links.
 
 ## Project docs
 
@@ -37,4 +40,5 @@ If you are new to the stack, start with [`docs/getting-started.md`](getting-star
 - Contributing: [`CONTRIBUTING.md`](../CONTRIBUTING.md)
 - Security: [`SECURITY.md`](../SECURITY.md)
 - Acknowledgements: [`ACKNOWLEDMENTS.md`](../ACKNOWLEDMENTS.md)
+- Code of conduct: [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md)
 - License: [`LICENSE`](../LICENSE)
