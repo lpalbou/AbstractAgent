@@ -1,12 +1,15 @@
 # Changelog
 
-## Unreleased
+## [0.3.15] - 2026-09-26
 
 ### Fixed
 - **A reply that announces tool use without calling a tool is no longer the final answer** (ReAct, CodeAct, MemAct). With Qwen3.x on MLX the model often ended a step with one sentence ("I have strong material. Let me verify … before writing the digest.") and the run completed without doing the work. A short reply that ENDS on such an announcement, and a reply whose tool calls could not run (unknown tool name, a call cut off mid-parameter, calls left in the thinking block that AbstractCore could not recover), is now re-prompted ONCE: the failed reply, reasoning included, is quoted verbatim in the corrective user message (Qwen3.5/3.6 templates strip `<think>` from assistant history turns), which asks the model to call the tools now or answer directly. The re-prompt call is recorded in the ledger (`_runtime_observability.reprompted` on the `LLM_CALL` payload). If the second reply fails the same way, or no iteration is left, the step ends with a visible error and `stop_reason.code = "no_tool_call"` in all three loops (ReAct concludes from what the run already has). Neither the announcement nor tool markup is ever published as the answer. Genuine short finals ("Done.", refusals, questions, "Let me summarize: …", "… unless you say otherwise") are not re-prompted. Switches: `_runtime.check_plan` (announcements) and `_runtime.check_unrunnable_calls` (markup), independent. English only for announcements (backlog 0033).
 - ReAct's older long-reply followthrough check stays a soft nudge and never ends a step with an error.
+- ReAct's long-reply soft nudge fires at most once per step: when the model sends a no-call reply again after the nudge, that reply is the answer. A model that repeated a legitimate long answer was nudged on every iteration until the budget ran out.
 - The ReAct conclusion path never publishes an announcement or tool markup as the answer. When it falls back to the progress report, tool markup is stripped and the thought of a cycle whose reply was an announcement or unrunnable markup is left out. The CodeAct/MemAct budget terminals no longer pick a re-prompted reply or a turn that carried tool calls (pre-call narration) as the agent's last words.
-- CodeAct and MemAct no longer crash when a host-granted `delegate_agent` substrate profile sets `thinking`: `normalize_thinking` was called without being imported (NameError).
+- On the last iteration, a reply that announces tools or carries tool calls that cannot run stops the turn with `stop_reason.code = "no_tool_call"` and `budget_exhausted: true` in ReAct, CodeAct and MemAct alike.
+- Announcement detection also recognises "Okay, fetching …", "Time to check …" and "I just need to read …".
+- **Crash fix for 0.3.13 and 0.3.14 users:** CodeAct and MemAct crashed with a `NameError` when a host-granted `delegate_agent` substrate profile set `thinking` (`normalize_thinking` was called without being imported).
 
 ### Added
 - `jinja2>=3.1` in the `test` and `dev` extras: a test renders a vendored copy of the Qwen3.6 chat template to prove the quoted reply reaches the prompt.

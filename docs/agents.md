@@ -97,7 +97,7 @@ ReAct, CodeAct and MemAct now handle them the same way
 - **Announced**: a short reply (under 300 characters of prose) whose LAST sentence announces work a tool would
   do: first-person intent plus a tool verb ("I have strong material. Let me verify a couple of key specifics
   before writing the digest.", "I'm going to grep …") or an action statement ("Checking the remaining two
-  sources now.", "Proceeding to fetch …"). Qwen3.x on MLX often ends a step this way. Never treated as
+  sources now.", "Proceeding to fetch …", "Okay, fetching …", "Time to check …"). Qwen3.x on MLX often ends a step this way. Never treated as
   announcements: questions; replies that wait on the user ("Let me know if…", "… unless you say otherwise",
   "once you confirm …"); intent that talks rather than acts ("Let me summarize: …", "Next, I recommend …");
   refusals ("I will not run that…"); replies that start by delivering ("Done.", "Here is…"); structured answers;
@@ -125,12 +125,14 @@ What happens:
    with the error text. All three set `output.stop_reason.code = "no_tool_call"` and `output.no_tool_call_stop`;
    ReAct also adds an `error` notice and a report line.
 3. **No iteration left.** No re-prompt (`parse_reprompt_skipped`). ReAct's conclusion path answers (a conclusion
-   reply that is itself an announcement is dropped, `conclusion_announcement_dropped`); CodeAct and MemAct end
-   with the error and `stop_reason.code = "no_tool_call"`. Their budget terminal never publishes a turn that
-   carried tool calls (pre-call narration such as "Searching.").
+   reply that is itself an announcement is dropped, `conclusion_announcement_dropped`; the progress-report
+   fallback leaves out the thought of a cycle whose reply was not an answer); CodeAct and MemAct end with the
+   error. All three set `stop_reason.code = "no_tool_call"` with `budget_exhausted: true`. The CodeAct/MemAct
+   budget terminal never publishes a turn that carried tool calls (pre-call narration such as "Searching.").
 
 Long replies: ReAct's older followthrough check (`_looks_like_deferred_action`, any length) stays a separate
-soft nudge (`parse_retry_plan_only` with `soft: true`). It never ends a step with an error, so a real digest
+soft nudge (`parse_retry_plan_only` with `soft: true`), at most once per step: if the model sends a no-call
+reply again after the nudge, that reply is the answer. It never ends a step with an error, so a real digest
 that says "Let me list the three risks…" is not turned into a failure.
 
 Why quote verbatim: re-prompting with the reply as the runtime records it (content `""` when the calls sat in
