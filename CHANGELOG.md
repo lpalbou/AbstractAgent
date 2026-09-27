@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.3.16] - 2026-09-27
 
 ### Removed
 - The "announced tool use" text heuristic added in 0.3.15 (`adapters/announced_calls.py`, the `_runtime.check_unrunnable_calls`
