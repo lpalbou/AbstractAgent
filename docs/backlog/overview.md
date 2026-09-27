@@ -10,7 +10,7 @@ planning memory.
 
 | State | Count |
 |---|---|
-| Planned | 0 |
+| Planned | 1 |
 | Proposed | 14 |
 | Completed | 10 |
 | Deprecated | 0 |
@@ -42,7 +42,7 @@ default-model and max_tokens decisions.)
 
 | ID | Item | Area |
 |---|---|---|
-| (none) | | |
+| 0034 | `planned/0034_tool_effect_classes_and_read_only_workspace_refusal.md` | tools / CodeAct — effect classes so a read-only automation-discussion workspace can refuse `execute_python` and every writing/executing tool (Automations v1, framework 0928; added 2026-09-27) |
 
 ## Proposed items
 
