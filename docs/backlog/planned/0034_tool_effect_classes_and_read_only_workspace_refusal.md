@@ -41,3 +41,29 @@ mutations" passes with this package installed.
 
 Framework 0928 (umbrella) and `automations-CONTRACTS.md` C4/B; runtime 0847; 0016 (execution trust tiers) and 0020 (provider stop
 semantics over heuristics) in `proposed/loops_improvement/`.
+
+## Status note (2026-09-27, after Automations v1 was built)
+
+Still **planned**: the agent-side declaration was not done. The runtime classified the tools centrally instead, so the
+read-only guarantee holds without this item.
+- **The central table.** `abstractruntime.integrations.abstractcore.tool_effects.TOOL_EFFECT_CLASSES` (runtime `ab30729`)
+  names this package's tools too. It uses the spelling `exec`, not `execute`. For example, `execute_python` is `exec`,
+  `delegate_agent` is `delegate` and `send_email` is `comms`.
+- **Refusal.** `read_only_refusal(name)` refuses write/exec tools inside a read-only root, and refuses any unclassified
+  tool (fail closed).
+- **Evidence.** The framework E2E and the gateway acceptance script show discussions refusing `write_file` and
+  `execute_command`. Runtime tests cover the `execute_python` refusal. Framework root backlog 0928 is completed and
+  unreleased.
+- **The same table drives the unattended-tools grant.** Under `policy.tool_approval: auto`, an automation's occurrence
+  gets every classified tool (65) unless the target narrows `allowed_tools`. Tools outside the table (third-party MCP)
+  still ask.
+
+What remains open here:
+- **The package declares its own effects.** Each tool this package registers declares its effect class next to the tool,
+  so a new agent tool cannot ship unclassified without a test going red. Today it is refused under read-only, and it is
+  NOT in the unattended grant, which is safe but silent for the author.
+- **The table is not duplicated by hand.** The runtime table is either generated from those declarations or checked
+  against them.
+- **CodeAct refuses with the runtime's refusal text.** Its action executor refuses file writes and code execution in a
+  read-only scope with the same text the runtime uses. Verify whether the runtime's tool-call refusal already covers the
+  CodeAct path before building anything.

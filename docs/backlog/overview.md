@@ -42,7 +42,7 @@ default-model and max_tokens decisions.)
 
 | ID | Item | Area |
 |---|---|---|
-| 0034 | `planned/0034_tool_effect_classes_and_read_only_workspace_refusal.md` | tools / CodeAct — effect classes so a read-only automation-discussion workspace can refuse `execute_python` and every writing/executing tool (Automations v1, framework 0928; added 2026-09-27) |
+| 0034 | `planned/0034_tool_effect_classes_and_read_only_workspace_refusal.md` | tools / CodeAct — effect classes so a read-only automation-discussion workspace can refuse `execute_python` and every writing/executing tool (Automations v1, framework 0928; added 2026-09-27) Note 2026-09-27: still open. The runtime classified the tools centrally (`tool_effects.TOOL_EFFECT_CLASSES`) for Automations v1 (root 0928 completed, unreleased); the agent-side declaration and its enumerating test remain. |
 
 ## Proposed items
 
