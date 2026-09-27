@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+- The "announced tool use" text heuristic added in 0.3.15 (`adapters/announced_calls.py`, the `_runtime.check_unrunnable_calls`
+  switch, the one-time corrective re-prompt, the `no_tool_call` stop reason and the conclusion-path announcement drop) is removed from
+  ReAct, CodeAct and MemAct, together with its tests and docs. The loops behave as in 0.3.14: a reply without a tool call is the step's
+  answer, subject only to the pre-existing followthrough nudge (`_runtime.check_plan`, unchanged since before 0.3.14). Reason: the
+  heuristic inferred intent from English wording; on real runs it fixed one model's occasional stop but could replace a correct answer
+  that ends on a promised follow-up with an error, and it had no reachable switch for gateway workflows. The underlying cause of the
+  stop (MLX prompts diverging from the model's chat template) is fixed in AbstractCore 2.16.1.
+- The `jinja2` test extra and the vendored Qwen3.6 chat-template fixture that only served that heuristic's tests.
+
+### Kept from 0.3.15
+- The CodeAct/MemAct `normalize_thinking` crash fix.
+
 ## [0.3.15] - 2026-09-26
 
 ### Fixed

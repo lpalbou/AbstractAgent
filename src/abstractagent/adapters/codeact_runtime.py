@@ -31,17 +31,6 @@ from .generation_params import (
     verifier_response_schema,
 )
 from .media import extract_media_from_context
-from .announced_calls import (
-    classify_no_call_reply,
-    is_not_an_answer,
-    no_call_error_text,
-    no_call_stop_reason,
-    reprompt_text,
-    resolve_checks,
-    tool_calls_from_reasoning,
-    verbatim_reply,
-    visible_content,
-)
 from .transcripts import (
     assistant_tool_calls_payload,
     ensure_tool_call_ids,
@@ -690,14 +679,6 @@ def create_codeact_workflow(
         if req.max_tokens is not None:
             params["max_tokens"] = req.max_tokens
         payload["params"] = runtime_llm_params(runtime_ns, extra=params)
-        # Ledger record of a re-prompt (mission AGX; twin of react_runtime).
-        _reprompt = run.vars.get("_temp", {}).get("reprompt") if isinstance(run.vars.get("_temp"), dict) else None
-        if isinstance(_reprompt, dict) and _reprompt.get("reason"):
-            payload["_runtime_observability"] = {
-                "reprompted": str(_reprompt.get("reason")),
-                "reprompt_detail": str(_reprompt.get("detail") or ""),
-                "reprompted_cycle": _reprompt.get("cycle"),
-            }
 
         return StepPlan(
             node_id="reason",
@@ -715,10 +696,6 @@ def create_codeact_workflow(
         content, tool_calls = logic.parse_response(response)
 
         temp.pop("llm_response", None)
-        # One re-prompt per step (mission AGX): popped once, here.
-        prior_reprompt = temp.pop("reprompt", None)
-        if not isinstance(prior_reprompt, dict):
-            prior_reprompt = None
         # Fence decision computed BEFORE the emit (wave-F P3: on the fenced
         # path the parse payload said has_tool_calls=False with no code
         # signal, then the loop executed code — an action a common-core
@@ -814,13 +791,7 @@ def create_codeact_workflow(
             # the canonical commit signal, same raw step + payload as ReAct.
             # The fenced-code path deliberately stays out — no tool batch is
             # proposed there; `parse`'s additive `has_code` carries it.
-            _ptc: Dict[str, Any] = {"count": len(tool_calls)}
-            _from_reasoning = tool_calls_from_reasoning(response)
-            if _from_reasoning:
-                _ptc["from_reasoning"] = _from_reasoning
-            if prior_reprompt is not None:
-                _ptc["after_reprompt"] = str(prior_reprompt.get("reason") or "")
-            emit("parse_tool_calls", _ptc)
+            emit("parse_tool_calls", {"count": len(tool_calls)})
             return StepPlan(node_id="parse", next_node="act")
 
         # Empty response is an invalid step: recover with a bounded retry that carries evidence.
@@ -905,89 +876,6 @@ def create_codeact_workflow(
                         scratchpad["plan"] = updated.strip()
             temp["pending_code"] = fenced_code
             return StepPlan(node_id="parse", next_node="execute_code")
-
-        # A reply with NO tool call that is not an answer (mission AGX; twin
-        # of react_runtime.parse_node, see its comment and announced_calls):
-        # an announcement ("Let me verify ...") or tool-call markup that could
-        # not run. Re-prompt ONCE with the reply verbatim; a second failure
-        # ends the step with a visible error instead of publishing either.
-        _check_announced, _check_unrunnable = resolve_checks(runtime_ns, suppressed=suppress_loop_tail(runtime_ns))
-        _specs_now = runtime_ns.get("tool_specs") if isinstance(runtime_ns, dict) else None
-        _tools_offered = isinstance(_specs_now, list) and bool(_specs_now)
-        no_call_reason, no_call_detail = classify_no_call_reply(
-            response,
-            content,
-            tools_offered=_tools_offered,
-            check_announcement=_check_announced,
-            check_unrunnable=_check_unrunnable,
-        )
-        if no_call_reason:
-            _cycle_i = int(scratchpad.get("iteration", 0) or 0)
-            _limits_ns = run.vars.get("_limits") if isinstance(run.vars.get("_limits"), dict) else {}
-            _max_it = max(1, resolve_max_iterations(_limits_ns, scratchpad))
-            raw_reply = verbatim_reply(response, fallback=str(content or ""))
-            temp["pending_tool_calls"] = []
-            last_iteration = _cycle_i >= _max_it
-            if prior_reprompt is not None or last_iteration:
-                # Second failure, or no iteration left to re-prompt in: end the
-                # step with a visible error and go to the budget terminal (this
-                # loop's conclusion), which answers with the error and a
-                # `stop_reason.code = "no_tool_call"` — never with this reply,
-                # nor with an earlier turn's pre-call narration.
-                reprompted = prior_reprompt is not None
-                error_text = no_call_error_text(no_call_reason, no_call_detail, reprompted=reprompted)
-                context["messages"].append(
-                    _new_message(
-                        ctx,
-                        role="assistant",
-                        content=visible_content(response),
-                        metadata={"kind": "reprompt_failed_reply", "cycle": _cycle_i, "reason": no_call_reason},
-                    )
-                )
-                scratchpad["no_tool_call_stop"] = {
-                    "reason": no_call_reason,
-                    "detail": no_call_detail,
-                    "cycle": _cycle_i,
-                    "error": error_text,
-                    "reprompted": reprompted,
-                }
-                if reprompted:
-                    emit(
-                        "parse_reprompt_failed",
-                        {"cycle": _cycle_i, "reason": no_call_reason, "detail": no_call_detail, "error": error_text},
-                    )
-                else:
-                    emit(
-                        "parse_reprompt_skipped",
-                        {"cycle": _cycle_i, "reason": no_call_reason, "detail": no_call_detail, "why": "iteration_budget"},
-                    )
-                return StepPlan(node_id="parse", next_node="max_iterations")
-            # Visible content stays the assistant turn; the verbatim reply is
-            # QUOTED in the corrective (templates strip `<think>` from history).
-            context["messages"].append(
-                _new_message(
-                    ctx,
-                    role="assistant",
-                    content=visible_content(response),
-                    metadata={"kind": "reprompted_reply", "cycle": _cycle_i, "reason": no_call_reason},
-                )
-            )
-            context["messages"].append(
-                _new_message(
-                    ctx,
-                    role="user",
-                    content=reprompt_text(
-                        no_call_reason,
-                        tools_offered=_tools_offered,
-                        suppressed=suppress_loop_tail(runtime_ns),
-                        reply=raw_reply,
-                    ),
-                    metadata={"kind": "reprompt", "cycle": _cycle_i, "reason": no_call_reason},
-                )
-            )
-            temp["reprompt"] = {"reason": no_call_reason, "detail": no_call_detail, "cycle": _cycle_i}
-            emit("parse_reprompt", {"cycle": _cycle_i, "reason": no_call_reason, "detail": no_call_detail})
-            return StepPlan(node_id="parse", next_node="reason")
 
         # Default: treat as a final answer even without an explicit FINAL marker.
         if raw:
@@ -1910,9 +1798,6 @@ def create_codeact_workflow(
         }
         if has_skips:
             complete_output["review_skipped_details"] = list(skipped_reviews)
-        _no_call = scratchpad.get("no_tool_call_stop")
-        if isinstance(_no_call, dict):
-            complete_output["no_tool_call_stop"] = dict(_no_call)
         return StepPlan(node_id="done", complete_output=complete_output)
 
     def max_iterations_node(run: RunState, ctx) -> StepPlan:
@@ -1931,19 +1816,9 @@ def create_codeact_workflow(
         # Full conclusion-call parity with ReAct stays gated on 0021; this is
         # the honesty half. `.get`, not [] (fable5 2026-07-13): content-less
         # host-seeded messages raised KeyError at the terminal.
-        _no_call = scratchpad.get("no_tool_call_stop") if isinstance(scratchpad.get("no_tool_call_stop"), dict) else None
-        # An unrecovered no-call reply (mission AGX) ends with its visible error.
-        answer = str(_no_call.get("error") or "") if _no_call else ""
-        for msg in ([] if answer else reversed(messages)):
-            # A re-prompted (failed) reply is never "last words" (mission AGX).
-            # A turn that carried tool calls is pre-call narration, not an
-            # answer (review 28 D3: "Searching." was published).
-            if (
-                isinstance(msg, dict)
-                and msg.get("role") == "assistant"
-                and not is_not_an_answer(msg)
-                and not msg.get("tool_calls")
-            ):
+        answer = ""
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
                 text = str(msg.get("content") or "")
                 if text.strip():
                     answer = text
@@ -1968,14 +1843,6 @@ def create_codeact_workflow(
                 # Always-present at BOTH terminals (wave-F P3: the batch-3
                 # "always-present bool" claim was false at this one).
                 "review_skipped": bool(scratchpad.get("review_skipped")),
-                **(
-                    {
-                        "no_tool_call_stop": dict(_no_call),
-                        "stop_reason": no_call_stop_reason(_no_call, iterations=max_iterations),
-                    }
-                    if _no_call
-                    else {}
-                ),
             },
         )
 

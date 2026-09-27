@@ -192,14 +192,12 @@ All agents accept per-run sampling controls via `start(...)`:
 
 Adapters merge these values into LLM params via `runtime_llm_params(...)` in `src/abstractagent/adapters/generation_params.py`.
 
-## Why does the agent “retry” when the model says “I will do X” but calls no tools?
+## Why does ReAct “retry” when the model says “I will do X” but calls no tools?
 
-A reply that only announces tool use ("Let me verify …") or carries tool-call markup that could not run is not an
-answer. ReAct, CodeAct and MemAct re-prompt once, quoting the model's reply verbatim; if the second reply fails the
-same way, the step ends with a visible error and the reply is never published. The announcement check can be
-disabled with `_runtime.check_plan=false`; the tool-markup check has its own switch, `_runtime.check_unrunnable_calls` (see [`docs/agents.md`](agents.md#replies-that-announce-tools-without-calling-them-all-three-loops)).
+The ReAct adapter includes a followthrough heuristic that retries the loop when the model claims it will take an action
+but emits no tool calls. It is enabled by default and can be disabled with `_runtime.check_plan=false`.
 
-Source of truth: `src/abstractagent/adapters/announced_calls.py` and the `parse` nodes of the three adapters.
+Source of truth: `src/abstractagent/adapters/react_runtime.py` (`_looks_like_deferred_action`, `check_plan` behavior)
 
 ## Is `execute_python` safe?
 

@@ -49,7 +49,6 @@ default-model and max_tokens decisions.)
 | ID | Item | Promotion gate |
 |---|---|---|
 | 0001 | `proposed/0001_agent_gateway_install_boundary.md` | install-boundary evidence (legacy item, renamed from date-form 2026-07-12) |
-| 0033 | `proposed/0033_non_english_tool_announcements.md` | multilingual announcement/final set with 0 false positives (documented limit of the AGX detector) |
 | 0014 | `proposed/loops_improvement/0014_native_code_action_primary_path.md` (A1) | maintainer green-light; pairs with 0010 |
 | 0015 | `proposed/loops_improvement/0015_persistent_interpreter_session.md` (A2) | green-light + runtime executor lane (seam agreed c1110–c1112) |
 | 0016 | `proposed/loops_improvement/0016_execution_trust_tiers.md` (A3) | maintainer ruling on tier model; needs decision record |

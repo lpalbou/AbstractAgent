@@ -85,21 +85,6 @@ REACT_STEPS = COMMON_STEPS | frozenset(
         "parse_retry_empty",
         "parse_retry_plan_only",
         "parse_retry_truncated",
-        # Mission AGX (2026-09-26): a reply with no tool call that announced
-        # tool use, or carried tool calls that could not run. `parse_reprompt`
-        # = the ONE re-prompt with the verbatim reply, payload {cycle, reason:
-        # announced_tool_use|unrunnable_tool_call, detail};
-        # `parse_reprompt_failed` = the re-prompted reply failed the same way,
-        # the step ended with a visible error and the loop went to its
-        # conclusion, payload {cycle, reason, detail, error};
-        # `parse_reprompt_skipped` = no iteration left to re-prompt in, payload
-        # {cycle, reason, detail, why}; `conclusion_announcement_dropped` = the
-        # conclusion reply was itself an announcement and was not published,
-        # payload {preview}.
-        "parse_reprompt",
-        "parse_reprompt_failed",
-        "parse_reprompt_skipped",
-        "conclusion_announcement_dropped",
         # 0017 work half (2026-07-21), nudge-then-stop (2026-08-21): fires on
         # every detection of a consecutive-identical or A-B-A-B tool-batch
         # streak; payload {kind: repeat|oscillation, span, key, answered,
@@ -140,11 +125,6 @@ REACT_STEPS = COMMON_STEPS | frozenset(
 
 CODEACT_STEPS = COMMON_STEPS | frozenset(
     {
-        # Mission AGX: one re-prompt with the verbatim reply, and its failure
-        # (see REACT_STEPS for the payloads).
-        "parse_reprompt",
-        "parse_reprompt_failed",
-        "parse_reprompt_skipped",
         "parse_retry_empty",
         # Read-orchestration advice — payload {path, mode, enforcement}.
         # `enforcement: "advise"` means the model was told how to read this
@@ -165,11 +145,6 @@ CODEACT_STEPS = COMMON_STEPS | frozenset(
 
 MEMACT_STEPS = COMMON_STEPS | frozenset(
     {
-        # Mission AGX: one re-prompt with the verbatim reply, and its failure
-        # (see REACT_STEPS for the payloads).
-        "parse_reprompt",
-        "parse_reprompt_failed",
-        "parse_reprompt_skipped",
         "compose",
         "compose_query",
         "finalize",

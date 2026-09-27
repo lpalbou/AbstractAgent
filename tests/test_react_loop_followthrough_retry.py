@@ -52,9 +52,7 @@ def test_react_followthrough_retries_plan_only_no_tool_call_steps() -> None:
             # not the cache-stable system prompt.
             msgs = payload.get("messages")
             tail = str((msgs[-1].get("content") if isinstance(msgs, list) and msgs else "") or "").lower()
-            # Mission AGX wording: the corrective follows the verbatim reply.
-            assert "announced tool calls but none ran" in tail
-            assert "call the tools now" in tail
+            assert "did not call any tools" in tail or "call the next tool" in tail
             return EffectOutcome.completed(
                 {
                     "content": "Creating folder.",

@@ -18,7 +18,6 @@ Important notes (source-of-truth hints):
 - Docs entrypoint: `README.md` → `docs/getting-started.md` → `docs/README.md`
 - Version 0.3.15 requires `abstractcore[tools]>=2.13.41` and `AbstractRuntime>=0.5.0`; extras: `apple`, `gpu`, `test`, `dev`.
 - The loops stamp the runtime turn-grounding envelope into the durable user turn once (`abstractruntime.turn_grounding`) and place the loop tail with `transcripts.place_loop_tail`, keeping prompts byte-prefix stable across iterations and turns.
-- A reply with no tool call that only announces tool use ("Let me verify …") or carries tool calls that could not run (unknown tool, cut-off call, calls left in the thinking block) is not an answer: ReAct, CodeAct and MemAct re-prompt ONCE, quoting the failed reply verbatim (reasoning included) in the corrective user message; a second failure, or no iteration left, ends the step (a visible error; ReAct concludes from what it has) with `stop_reason.code = "no_tool_call"` (`budget_exhausted: true` when no iteration was left). ReAct's long-reply soft nudge fires at most once per step. Switches: `_runtime.check_plan`, `_runtime.check_unrunnable_calls`. English-only announcement detection (backlog 0033). Neither is ever published as the answer. See `src/abstractagent/adapters/announced_calls.py` and `docs/agents.md`.
 - MemAct is not re-exported at the package top-level; import from `abstractagent.agents.memact` (see `docs/api.md`).
 - After changes, run tests: `pytest -q` (`python -P -m pytest -q` from a folder with sibling checkouts)
 
@@ -73,7 +72,6 @@ Important notes (source-of-truth hints):
 - [Native-loop registry](src/abstractagent/adapters/native_loop_registry.py): `audit_native_loop_manifest`, `materialize_native_loop_spec`, `build_native_loop_manifest`, `pack_native_loop_bundle` (gateway `.flow` bundles)
 - [Loop hooks](src/abstractagent/adapters/loop_hooks.py): `LoopHooks`, `HookEvent`, `DEFAULT_EVENT_MAP` (listen/steer/capture)
 - [Circling detection](src/abstractagent/adapters/progress.py): `circling_streak` — pure read-only near-restatement detector over recent outputs (0017 detector half; policy-free, host-consumable)
-- [Announced-call detection](src/abstractagent/adapters/announced_calls.py): `classify_no_call_reply` (announced tool use / unrunnable tool markup), `verbatim_reply`, `reprompt_text`, `no_call_error_text` — the shared one-re-prompt policy of all three loops
 - [Emit-step inventory](src/abstractagent/adapters/emit_inventory.py): declared per-adapter raw step names (drift-tested; stability contract in docs/hooks.md)
 - [Factory defaults](src/abstractagent/agents/defaults.py): provider/model resolution (AbstractCore config global defaults; loud `#FALLBACK` packaged pair)
 - [Unattended recipe](src/abstractagent/agents/unattended.py): `unattended_runtime_overrides` / `unattended_allowlist` (exclude `ask_user` + no-questions directive)
@@ -98,7 +96,6 @@ Important notes (source-of-truth hints):
 
 - [ReAct workflow contract](tests/test_react_workflow_system_prompt_and_tools_override.py)
 - [ReAct followthrough retry](tests/test_react_loop_followthrough_retry.py)
-- [Announced-call re-prompt](tests/test_announced_tool_reprompt.py): announcement / unknown tool in thinking / cut-off call → one verbatim re-prompt → calls run; double failure → visible error; genuine finals untouched (all three loops)
 - [Reasoning and thinking profiles](tests/test_reasoning_first_citizen_agent.py): parse reasoning parity; delegate substrate `thinking` in ReAct, CodeAct and MemAct
 - [ReAct context transcript](tests/test_react_loop_context_transcript_levels.py)
 - [ReAct max-iterations conclusion](tests/test_react_max_iterations_concludes.py)
