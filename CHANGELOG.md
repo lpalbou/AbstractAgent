@@ -15,7 +15,8 @@
 
 ### Changed
 - Requires `AbstractRuntime>=0.7.0` (base, `apple` and `gpu` profiles): the window is `window_transcript` from 0.7.0.
-  The entity visit of runtime 0.7.0 refuses a turn from an older adapter that records no window.
+  With an older AbstractAgent, runtime 0.7.0's entity visit still completes the turn but sends the whole transcript,
+  logs a warning and records `window_applied: false, reason: "agent_too_old"`.
 
 ## [0.3.16] - 2026-09-27
 
