@@ -241,11 +241,14 @@ def _poison_tools(run: Any, effect: Effect, dnn: Any = None) -> EffectOutcome:
 
 def test_poisoned_visit_transcript_recovers_on_the_next_turn(tmp_path: Path) -> None:
     """End-to-end on the REAL merged lane (the incident's lane): turn 1
-    poisons the durable transcript with a ~495k tool message; turn 2's wire
-    payload carries a labeled stub no larger than the agent's own
-    OVERSIZED_MESSAGE_CLAMP_CHARS instead (runtime 0.7 removed its tighter
-    visit caps under ADR-0026) — the session recovers with NO manual
-    surgery while the durable record keeps the full truth."""
+    poisons the durable transcript with a ~495k tool message. Within turn 1
+    the result rides the next call clamped to OVERSIZED_MESSAGE_CLAMP_CHARS
+    (the newest turn is kept whole by the window). From turn 2 on, the visit
+    BRIDGE's history window (`_runtime.history_window_tokens`, runtime 0.7,
+    ADR-0026) drops the poisoned turn whole — call, result and reply — because
+    it no longer fits beside a newer turn: the request is the labeled notice
+    and the new words. The session recovers with NO manual surgery while the
+    durable record keeps the full truth."""
     pytest.importorskip("abstractmemory")
     from abstractruntime.identity.entity_runtime import open_entity_runtime
     from abstractruntime.identity.visit_workflow import (
@@ -254,6 +257,7 @@ def test_poisoned_visit_transcript_recovers_on_the_next_turn(tmp_path: Path) -> 
         ReactMiddle,
         build_visit_workflow,
     )
+    from abstractruntime.turn_grounding import strip_turn_grounding
 
     home_dir = _make_home(tmp_path)
     llm = _ScriptedLLM([
@@ -313,20 +317,28 @@ def test_poisoned_visit_transcript_recovers_on_the_next_turn(tmp_path: Path) -> 
         assert state.status == RunStatus.WAITING
         assert len(llm.calls) == 3
 
-        wire = llm.calls[2]["messages"]
-        wire_tool = [m for m in wire if m.get("role") == "tool"]
-        assert len(wire_tool) == 1
-        clamped = wire_tool[0]["content"]
+        # Within turn 1, the call after the read carried the clamped stub.
+        in_turn_tool = [m for m in llm.calls[1]["messages"] if m.get("role") == "tool"]
+        assert len(in_turn_tool) == 1
+        clamped = in_turn_tool[0]["content"]
         assert len(clamped) <= OVERSIZED_MESSAGE_CLAMP_CHARS + 200
         assert clamped.startswith("[read_file]: --- shared/Screenshot_2026-08-01"), "head kept - labeled, never dropped"
         assert "chars elided: oversized tool result" in clamped
-        # The visitor's words and the entity's own prose are untouched.
-        user_msgs = [m for m in wire if m.get("role") == "user"]
-        assert any("Are you still with me?" in str(m.get("content")) for m in user_msgs)
-        assert any(m.get("role") == "assistant" and "I looked at the file." == m.get("content") for m in wire)
-        # The whole request shrank from monster-class to sane.
+
+        # Turn 2: the poisoned turn is out of the request, whole, and says so.
+        wire = llm.calls[2]["messages"]
+        assert [m for m in wire if m.get("role") == "tool"] == []
+        assert not any(m.get("tool_calls") for m in wire)
+        assert len(wire) == 1 and wire[0]["role"] == "user"
+        # One head envelope (the turn's own), then the labeled drop notice.
+        assert wire[0]["content"].count("<runtime_metadata>") == 1
+        assert strip_turn_grounding(wire[0]["content"]).startswith("[#TRUNCATION: 4 earlier message(s)")
+        assert "Are you still with me?" in wire[0]["content"]
+        report = ert.runtime.get_state(run_id).vars["_runtime"]["session_history"]
+        assert report["dropped_messages"] == 4 and report["replayed_messages"] == 1
+        # The whole request shrank from monster-class to one short message.
         total = sum(len(str(m.get("content") or "")) for m in wire)
-        assert total < OVERSIZED_MESSAGE_CLAMP_CHARS + 100_000, f"recovered payload still huge: {total}"
+        assert total < 2_000, f"recovered payload still huge: {total}"
 
         # And the durable record STILL holds the full truth (ADR-0026).
         stored = ert.runtime.get_state(run_id).vars["context"]["messages"]

@@ -84,10 +84,13 @@ Native Python hardware profile cascades are available for deployment manifests:
 AbstractCore and AbstractRuntime profiles; AbstractAgent itself remains
 provider/runtime agnostic.
 
-AbstractAgent 0.3.16 requires `abstractcore[tools]>=2.13.41` and
-`AbstractRuntime>=0.5.0` (the runtime release that provides live token
-streaming, on top of turn grounding, in-flight cancellation and speculation
-inheritance). AbstractRuntime 0.5.0 itself requires AbstractCore 2.16.0 or newer.
+AbstractAgent requires `abstractcore[tools]>=2.13.41` and
+`AbstractRuntime>=0.7.0` (the runtime release with the 50k-token history
+window, which ReAct applies to its requests when a host sets
+`_runtime.history_window_tokens`, as the entity visit does; 0.5.0 brought live
+token streaming, on top of turn grounding, in-flight cancellation and
+speculation inheritance). AbstractRuntime 0.7.0 itself requires AbstractCore
+2.18.0 or newer.
 
 Note: the repository may be ahead of the latest published PyPI release. To verify what you installed:
 

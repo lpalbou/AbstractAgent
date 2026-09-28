@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 from abstractcore.tools import ToolCall
 from abstractruntime import Effect, EffectType, RunState, StepPlan, WorkflowSpec
 from abstractruntime.core.vars import ensure_limits, ensure_namespaces
+from abstractruntime.session_history import window_transcript
 from abstractruntime.turn_grounding import stamp_user_turn_grounding, strip_turn_grounding
 
 from .generation_params import (
@@ -1659,6 +1660,24 @@ def create_react_workflow(
                 out.append(d)
         return out
 
+    def _history_window_view(messages: List[Dict[str, Any]], runtime_ns: Any) -> List[Dict[str, Any]]:
+        """The transcript a model request carries when the host asks for THE
+        runtime history window (`_runtime.history_window_tokens`, set by the
+        entity visit's BRIDGE; operator ruling 2026-09-28, ADR-0026).
+
+        `abstractruntime.session_history.window_transcript`: the newest whole
+        turns up to that many tokens (a tool result stays with its turn), a
+        labeled #TRUNCATION notice when older turns were dropped. The durable
+        `context.messages` is never touched — only this request's view — and
+        the window's receipt is recorded at `_runtime.session_history`.
+        Unset = the whole transcript (the plain task lane's full-context policy).
+        """
+        if not isinstance(runtime_ns, dict) or runtime_ns.get("history_window_tokens") is None:
+            return messages
+        window = window_transcript(messages, max_tokens=runtime_ns["history_window_tokens"])
+        runtime_ns["session_history"] = dict(window.report)
+        return list(window)
+
     def _sanitize_llm_messages(
         messages: Any, *, limits: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
@@ -1874,7 +1893,7 @@ def create_react_workflow(
 
 
         payload: Dict[str, Any] = {"prompt": ""}
-        sanitized_messages = _sanitize_llm_messages(messages_view, limits=limits)
+        sanitized_messages = _sanitize_llm_messages(_history_window_view(messages_view, runtime_ns), limits=limits)
         if sanitized_messages:
             payload["messages"] = sanitized_messages
         else:
@@ -3765,7 +3784,7 @@ def create_react_workflow(
             )
 
             payload: Dict[str, Any] = {"prompt": ""}
-            sanitized_messages = _sanitize_llm_messages(messages_view, limits=limits)
+            sanitized_messages = _sanitize_llm_messages(_history_window_view(messages_view, runtime_ns), limits=limits)
             if sanitized_messages:
                 payload["messages"] = sanitized_messages
             else:

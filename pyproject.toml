@@ -10,17 +10,17 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "abstractcore[tools]>=2.13.41",
-    "abstractruntime>=0.5.0",
+    "abstractruntime>=0.7.0",
 ]
 
 [project.optional-dependencies]
 apple = [
     "abstractcore[all-apple]>=2.13.41",
-    "abstractruntime[apple]>=0.5.0",
+    "abstractruntime[apple]>=0.7.0",
 ]
 gpu = [
     "abstractcore[all-gpu]>=2.13.41",
-    "abstractruntime[gpu]>=0.5.0",
+    "abstractruntime[gpu]>=0.7.0",
 ]
 dev = [
     "pytest>=7.0",
