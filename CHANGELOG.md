@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.17] - 2026-09-28
 
 ### Fixed
 - **ReAct sends THE runtime history window when the host asks for it** (runtime re-gate, 2026-09-28; operator ruling,
@@ -8,7 +8,9 @@
   50,000 — every model request of the loop (reason and the max-iterations conclusion) carries
   `abstractruntime.session_history.window_transcript(context.messages)`: the newest whole turns up to that many tokens,
   a tool result kept with its turn, and a labeled `[#TRUNCATION: ...]` line when older turns were dropped. The window's
-  report is recorded at `_runtime.session_history`. The durable `context.messages` stays whole. Before, the visit sent
+  report is recorded at `_runtime.session_history`. The durable `context.messages` stays whole. The turn in progress
+  starts at `_runtime.history_window_turn_start` (set by the host) and is kept whole, so an `ask_user` answer or
+  operator guidance inside it never splits off the turn's own question and tool results. Before, the visit sent
   its whole transcript on every call: after 12 turns of ~10k tokens the request was ~117k tokens, and the 2026-08-01
   poisoned tool result (495k characters, clamped to 200k) rode every later turn. Now a poisoned turn drops out of the
   request once a newer turn exists. Unset (plain task runs): the whole transcript, as before.
