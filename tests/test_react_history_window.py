@@ -52,3 +52,13 @@ def test_without_the_key_the_whole_transcript_rides() -> None:
     wire, state = _run({})
     assert "session_history" not in state.vars["_runtime"]
     assert len(wire) == len(OLD) + 1 and wire[0]["content"].startswith("old 0 ")
+
+
+def test_the_turn_in_progress_is_kept_whole_from_the_hosts_turn_start() -> None:
+    """`_runtime.history_window_turn_start` marks where the turn in progress
+    began: from there on it is one turn, kept whole (and reported oversize),
+    however many user-role messages the loop added inside it."""
+    wire, state = _run({"history_window_tokens": 3000, "history_window_turn_start": 0})
+    report = state.vars["_runtime"]["session_history"]
+    assert report["dropped_messages"] == 0 and report["oversize_turn_kept"] is True
+    assert len(wire) == len(OLD) + 1 and wire[0]["content"].startswith("old 0 ")

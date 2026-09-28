@@ -1667,14 +1667,21 @@ def create_react_workflow(
 
         `abstractruntime.session_history.window_transcript`: the newest whole
         turns up to that many tokens (a tool result stays with its turn), a
-        labeled #TRUNCATION notice when older turns were dropped. The durable
+        labeled #TRUNCATION notice when older turns were dropped. The turn in
+        progress starts at `_runtime.history_window_turn_start` (set by the
+        host) and is kept whole, so an ask_user answer or operator guidance
+        inside it never splits off the turn's own question and tool results. The durable
         `context.messages` is never touched — only this request's view — and
         the window's receipt is recorded at `_runtime.session_history`.
         Unset = the whole transcript (the plain task lane's full-context policy).
         """
         if not isinstance(runtime_ns, dict) or runtime_ns.get("history_window_tokens") is None:
             return messages
-        window = window_transcript(messages, max_tokens=runtime_ns["history_window_tokens"])
+        window = window_transcript(
+            messages,
+            max_tokens=runtime_ns["history_window_tokens"],
+            current_turn_start=runtime_ns.get("history_window_turn_start"),
+        )
         runtime_ns["session_history"] = dict(window.report)
         return list(window)
 
