@@ -242,13 +242,14 @@ def _poison_tools(run: Any, effect: Effect, dnn: Any = None) -> EffectOutcome:
 def test_poisoned_visit_transcript_recovers_on_the_next_turn(tmp_path: Path) -> None:
     """End-to-end on the REAL merged lane (the incident's lane): turn 1
     poisons the durable transcript with a ~495k tool message; turn 2's wire
-    payload carries a labeled 32k stub instead — the session recovers with
-    NO manual surgery while the durable record keeps the full truth."""
+    payload carries a labeled stub no larger than the agent's own
+    OVERSIZED_MESSAGE_CLAMP_CHARS instead (runtime 0.7 removed its tighter
+    visit caps under ADR-0026) — the session recovers with NO manual
+    surgery while the durable record keeps the full truth."""
     pytest.importorskip("abstractmemory")
     from abstractruntime.identity.entity_runtime import open_entity_runtime
     from abstractruntime.identity.visit_workflow import (
         HARVEST_NODE,
-        VISIT_HISTORY_TOOL_RESULT_CAP_CHARS,
         VISITOR_WAIT_KEY,
         ReactMiddle,
         build_visit_workflow,
@@ -316,7 +317,7 @@ def test_poisoned_visit_transcript_recovers_on_the_next_turn(tmp_path: Path) -> 
         wire_tool = [m for m in wire if m.get("role") == "tool"]
         assert len(wire_tool) == 1
         clamped = wire_tool[0]["content"]
-        assert len(clamped) <= VISIT_HISTORY_TOOL_RESULT_CAP_CHARS + 200
+        assert len(clamped) <= OVERSIZED_MESSAGE_CLAMP_CHARS + 200
         assert clamped.startswith("[read_file]: --- shared/Screenshot_2026-08-01"), "head kept - labeled, never dropped"
         assert "chars elided: oversized tool result" in clamped
         # The visitor's words and the entity's own prose are untouched.
@@ -325,7 +326,7 @@ def test_poisoned_visit_transcript_recovers_on_the_next_turn(tmp_path: Path) -> 
         assert any(m.get("role") == "assistant" and "I looked at the file." == m.get("content") for m in wire)
         # The whole request shrank from monster-class to sane.
         total = sum(len(str(m.get("content") or "")) for m in wire)
-        assert total < 100_000, f"recovered payload still huge: {total}"
+        assert total < OVERSIZED_MESSAGE_CLAMP_CHARS + 100_000, f"recovered payload still huge: {total}"
 
         # And the durable record STILL holds the full truth (ADR-0026).
         stored = ert.runtime.get_state(run_id).vars["context"]["messages"]
