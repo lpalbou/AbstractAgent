@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from .interface import ExecutionResult
 
@@ -22,9 +22,14 @@ class LocalSandbox:
         *,
         cwd: Optional[str] = None,
         python_executable: Optional[str] = None,
+        command_sandbox: Any = None,
     ):
+        """`command_sandbox`: an AbstractCore `abstractcore.tools.sandbox.Sandbox` (round 12). When
+        given, the interpreter runs inside it (OS sandbox bound to the run's workspaces, the host's
+        scrubbed environment, a private TMPDIR); the caller refuses before when it `refuses`."""
         self._cwd = cwd or os.getcwd()
         self._python = python_executable or sys.executable
+        self._command_sandbox = command_sandbox
 
     def reset(self) -> None:
         # Stateless sandbox (new subprocess per call).
@@ -47,10 +52,19 @@ class LocalSandbox:
             except (TypeError, ValueError):
                 t = 0.0
             eff_timeout = t if t > 0 else None
+        argv = [self._python, "-c", code]
+        env = None
+        box = self._command_sandbox
+        if box is not None:
+            if box.kind == "unsandboxed":
+                env = box.env_for()
+            else:
+                argv, env = box.wrap(argv, self._cwd)
         try:
             completed = subprocess.run(
-                [self._python, "-c", code],
+                argv,
                 cwd=self._cwd,
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=eff_timeout,

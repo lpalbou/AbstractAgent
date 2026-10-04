@@ -94,5 +94,11 @@ Troubleshooting: [`docs/faq.md`](faq.md)
 
 ## Safety notes
 
-- `execute_python` runs a local subprocess with a timeout (`src/abstractagent/sandbox/local.py`); it is not a hardened sandbox.
+- `execute_python` runs a local subprocess (`src/abstractagent/sandbox/local.py`). When the host (AbstractRuntime 0.9.0+) stamps the
+  run's workspace set as the hidden `_sandbox` argument, the interpreter runs inside AbstractCore's OS sandbox
+  (`abstractcore.tools.sandbox`: macOS `sandbox-exec`, Linux `bwrap`/Landlock), starts in the run's private workspace,
+  and gets the host's scrubbed environment and a private `TMPDIR`: refused workspaces, credentials and (under "Deny
+  everything, allow listed workspaces") other user data are unreadable, and writes stay in the read & write
+  workspaces. No sandbox on the host = the call returns `success: false` with one sentence and nothing runs. Library
+  use without a host policy runs the subprocess as before.
 - `execute_command` can run arbitrary shell commands (depending on your tool executor / host policy).

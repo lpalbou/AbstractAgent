@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.18] - 2026-10-04
+
+### Security
+- **`execute_python` runs inside the run's OS sandbox** (AbstractFramework round 12). It accepts the hidden `_sandbox`
+  argument AbstractRuntime stamps with the run's effective workspace set and runs `python -c` through
+  `abstractcore.tools.sandbox` (macOS `sandbox-exec`, Linux `bwrap` or Landlock), starting in the run's private
+  workspace with the host's scrubbed environment and a private `TMPDIR`. Before, the snippet ran with the host
+  process's whole filesystem and environment: a run whose policy refused a folder could read it from Python. With no
+  sandbox on the host, or an AbstractCore without one, the call returns `success: false` with one sentence and runs
+  nothing (the run continues). The result carries `sandbox` and `sandbox_line`. Library use without a host policy is
+  unchanged.
+
+### Changed
+- Requires `abstractcore>=2.25.0` (base `[tools]`, `apple` and `gpu` profiles): the command sandbox.
+
 ## [0.3.17] - 2026-09-28
 
 ### Fixed
