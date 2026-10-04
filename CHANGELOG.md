@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.18] - 2026-10-04
+## [0.3.18] - 2026-10-05
 
 ### Security
 - **`execute_python` runs inside the run's OS sandbox** (AbstractFramework round 12). It accepts the hidden `_sandbox`
