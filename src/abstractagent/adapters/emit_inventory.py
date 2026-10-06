@@ -85,6 +85,12 @@ REACT_STEPS = COMMON_STEPS | frozenset(
         "parse_retry_empty",
         "parse_retry_plan_only",
         "parse_retry_truncated",
+        # Tool-call format repair (2026-10-03, shipped round 14): AbstractCore
+        # reported `metadata.tool_call_error` (code invalid_tool_syntax |
+        # unavailable_tool) and accepted ZERO calls; the model is asked once
+        # more with the tool roster — payload {cycle, attempt, code}. At most
+        # two per turn; the third raises (the run fails with the sentence).
+        "parse_retry_tool_format",
         # 0017 work half (2026-07-21), nudge-then-stop (2026-08-21): fires on
         # every detection of a consecutive-identical or A-B-A-B tool-batch
         # streak; payload {kind: repeat|oscillation, span, key, answered,

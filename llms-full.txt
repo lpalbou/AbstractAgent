@@ -11,6 +11,7 @@ This file is a *larger* index than `llms.txt` (more source files + tests). It is
 but is commonly used as a “bigger context window” companion.
 
 Important notes (source-of-truth hints):
+- ReAct consumes Core `metadata.tool_call_error` diagnostics with at most two format-repair attempts per turn; see `docs/react-pipeline.md`.
 - Runtime behavior lives in workflow adapters: `src/abstractagent/adapters/*_runtime.py`
 - Keep prompting/parsing runtime-agnostic: `src/abstractagent/logic/*` (no `abstractruntime` imports)
 - `src/abstractagent/adapters/generation_params.py` is the shared LLM param normalizer for temperature, seed, media policy, prompt-cache identity, streaming passthrough (`_runtime.stream`), Core `thinking` and `speculation` (MTP). Delegated children in ReAct, CodeAct and MemAct inherit `stream`, `speculation`, `thinking`, provider/model, sampling, `max_output_tokens`, `tool_prompt_examples` and `tool_policy` (see `docs/architecture.md`).

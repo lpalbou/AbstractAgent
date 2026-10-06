@@ -135,6 +135,13 @@ profile was applied to a delegated child), the review/verifier steps
 MemAct's finalize steps (`finalize_request`, `finalize`, `finalize_skipped`,
 `finalize_used_draft`).
 
+ReAct's `parse_retry_tool_format` (`{cycle, attempt, code}`): AbstractCore
+reported `metadata.tool_call_error` (`code` = `invalid_tool_syntax` or
+`unavailable_tool`) and accepted no call, so nothing ran and the model is
+asked again with the tool roster, pointed at the request's own tool-calling
+format. At most two per turn (`reset_react_turn` resets the budget); the
+third rejection raises.
+
 Parse payload common core: every adapter's
 `parse` payload guarantees `has_tool_calls` (bool), `tool_calls`
 (list of `{name, arguments, call_id}`), and `content_preview` (≤200 chars of
@@ -174,7 +181,7 @@ results are the founding producer), ReAct's observe emits `media_captured`
 lands first), merged after context attachments and deduped by artifact
 id/path. Consumption is ONE-SHOT per successfully parsed answer — image
 tokens ride one model call, and the malformed-output retry paths
-(`parse_retry_truncated`/`_empty`/`_plan_only`, plus the bounded
+(`parse_retry_truncated`/`_empty`/`_plan_only`/`_tool_format`, plus the bounded
 conclude-retry) restore the same refs so a rewrite is never image-blind; the
 durable transcript keeps the tool's textual ref. Dict refs captured from
 tools are stamped `origin: "tool_capture"` (provenance for degrade-not-fail

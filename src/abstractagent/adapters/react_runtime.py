@@ -1446,6 +1446,10 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
             # retry stash is the same lifecycle class.
             "pending_media",
             "last_call_media",
+            # Tool-call format repair budget is per TURN (two retries each):
+            # without this pop, two format failures anywhere in a conversation
+            # made every later failing turn raise at once.
+            "tool_format_retries",
         ):
             temp.pop(key, None)
 
@@ -2495,6 +2499,36 @@ def create_react_workflow(
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
             emit("parse_tool_calls", {"count": len(tool_calls)})
             return StepPlan(node_id="parse", next_node="act")
+
+        # Core owns syntax recognition; the agent owns bounded recovery. Retry
+        # only when zero calls were accepted, so a partial batch is never replayed.
+        metadata = response.get("metadata") if isinstance(response, dict) else None
+        tool_error = metadata.get("tool_call_error") if isinstance(metadata, dict) else None
+        if isinstance(tool_error, dict) and tool_error.get("code") in {"invalid_tool_syntax", "unavailable_tool"}:
+            retries = int(temp.get("tool_format_retries", 0) or 0)
+            if retries >= 2 or cycle_i >= max_iterations:
+                raise RuntimeError("Tool-call format repair failed: no executable tool calls after bounded retries.")
+            specs = runtime_ns.get("tool_specs") or []
+            names = [str(spec["name"]) for spec in specs if isinstance(spec, dict) and spec.get("name")]
+            if not names:
+                raise RuntimeError("The model attempted a tool call, but this run has no tools configured.")
+            temp["tool_format_retries"] = retries + 1
+            _push_inbox(
+                runtime_ns,
+                "Your previous tool call was rejected; nothing was executed. "
+                "Use only the available tools: " + ", ".join(names) + ". "
+                # No format of our own: the tool-calling format is the one the
+                # request's instructions carry (native structured calls, or the
+                # provider's prompted text format) — a hard-coded text syntax
+                # here would teach a native tool-calling model the wrong one.
+                "Follow the tool-calling format and argument schemas supplied in the instructions, "
+                "with an actual available tool name and valid arguments. "
+                "Emit the corrected call now, or explain why you cannot complete the task without it.",
+            )
+            emit("parse_retry_tool_format", {"cycle": cycle_i, "attempt": retries + 1, "code": tool_error["code"]})
+            if last_call_media:
+                temp["pending_media"] = last_call_media
+            return StepPlan(node_id="parse", next_node="reason")
 
         # If the model hit an output limit, treat the step as incomplete and continue.
         # Retry-nudge lane honesty (iteration-3 adversary P0, 2026-07-19 — the

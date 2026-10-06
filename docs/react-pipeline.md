@@ -20,6 +20,8 @@ This document explains the end-to-end pipeline of the **ReAct** workflow:
 - **AbstractRuntime**: executes effects (`LLM_CALL`, `TOOL_CALLS`, `ASK_USER`, …), persists run vars, and records the durable ledger.
 - **AbstractAgent (this repo)**: defines ReAct prompting/parsing logic and maps it onto runtime effects.
 
+When AbstractCore reports `metadata.tool_call_error` and no structured calls were accepted, ReAct supplies corrective feedback with the available tools and points the model at the tool-calling format of the request's own instructions (it adds no text syntax of its own, so a native tool-calling provider is never told a text format). It permits at most two format retries per turn (`reset_react_turn` resets the budget), within the iteration limit, then raises an error; each retry emits `parse_retry_tool_format`. A batch containing accepted calls is executed once and is not replayed by this recovery path.
+
 ## Durable state used by ReAct (`RunState.vars`)
 
 See `ensure_react_vars(...)` in `src/abstractagent/adapters/react_runtime.py`.
