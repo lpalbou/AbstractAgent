@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abstractagent"
-version = "0.3.18"
+version = "0.3.19"
 description = "Agent implementations using AbstractRuntime and AbstractCore"
 readme = "README.md"
 requires-python = ">=3.10"
