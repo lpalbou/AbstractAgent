@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.19] - 2026-10-07
+## [0.3.19] - 2026-10-08
 
 - ReAct repairs rejected tool calls: when AbstractCore reports `metadata.tool_call_error` (`invalid_tool_syntax` or `unavailable_tool`) and accepted no call, the model is asked again with the available tool roster and pointed at the tool-calling format of the request's own instructions (no text syntax of its own, so a native tool-calling model is never taught one). At most two retries per turn (`reset_react_turn` resets the budget), within the iteration limit; the third rejection raises an actionable error. Accepted tool batches are never retried. Emit `parse_retry_tool_format` `{cycle, attempt, code}` (declared in the emit inventory and docs/hooks.md).
 
