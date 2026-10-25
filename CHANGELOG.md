@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- `schedule_run` builtin (framework backlog 1045, ReAct agent): schedules a run for later (`after_s`, `at`, or `on` a trigger event) with a `task` or a reminder `note`, in the same conversation by default. Mapped to AbstractRuntime's `EffectType.SCHEDULE_RUN`; the scheduled run gets at most the agent's allowed tools and never `schedule_run` itself (recursion-blocked like `delegate_agent`). Needs an AbstractRuntime with `SCHEDULE_RUN` and a host that registers `Runtime.set_schedule_run_handler`. See [docs/tools.md](docs/tools.md).
+
 ## [0.3.19] - 2026-10-08
 
 - ReAct repairs rejected tool calls: when AbstractCore reports `metadata.tool_call_error` (`invalid_tool_syntax` or `unavailable_tool`) and accepted no call, the model is asked again with the available tool roster and pointed at the tool-calling format of the request's own instructions (no text syntax of its own, so a native tool-calling model is never taught one). At most two retries per turn (`reset_react_turn` resets the budget), within the iteration limit; the third rejection raises an actionable error. Accepted tool batches are never retried. Emit `parse_retry_tool_format` `{cycle, attempt, code}` (declared in the emit inventory and docs/hooks.md).

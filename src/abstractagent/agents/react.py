@@ -24,6 +24,7 @@ from ..logic.builtins import (
     ASK_USER_TOOL,
     COMPACT_MEMORY_TOOL,
     DELEGATE_AGENT_TOOL,
+    SCHEDULE_RUN_TOOL,
     INSPECT_VARS_TOOL,
     OPEN_ATTACHMENT_TOOL,
     RECALL_MEMORY_TOOL,
@@ -121,6 +122,7 @@ class ReactAgent(BaseAgent):
             REMEMBER_NOTE_TOOL,
             COMPACT_MEMORY_TOOL,
             DELEGATE_AGENT_TOOL,
+            SCHEDULE_RUN_TOOL,
             UPDATE_PLAN_TOOL,
             *tool_defs,
         ]

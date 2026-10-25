@@ -364,3 +364,58 @@ DELEGATE_AGENT_TOOL = ToolDefinition(
         "inspect a few files, search for specific symbols, summarize findings)."
     ),
 )
+
+SCHEDULE_RUN_TOOL = ToolDefinition(
+    name="schedule_run",
+    description="Schedule a run for later (at a time, after a delay, or on a trigger event) with a task or a reminder note.",
+    parameters={
+        "after_s": {
+            "type": "number",
+            "description": "Start this many seconds from now (e.g. 300 for five minutes). Give one of after_s, at or on.",
+            "default": None,
+        },
+        "at": {
+            "type": "string",
+            "description": "Start at this time: an RFC 3339 timestamp with its offset, e.g. 2026-10-26T09:00:00+01:00.",
+            "default": None,
+        },
+        "on": {
+            "type": "object",
+            "description": (
+                "Start when a trigger event arrives: {source_id, source_version?, connection_id?, config?}, "
+                "e.g. {\"source_id\": \"feed.item\", \"connection_id\": \"tc_...\"}. One run, on the first event."
+            ),
+            "default": None,
+        },
+        "task": {
+            "type": "string",
+            "description": "What the scheduled run should do (self-contained). Give a task or a note.",
+            "default": None,
+        },
+        "note": {
+            "type": "string",
+            "description": "A reminder to bring back to the person at that time (no tools are used).",
+            "default": None,
+        },
+        "tools": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Tools the scheduled run may use (a subset of yours). When omitted it inherits yours.",
+            "default": None,
+        },
+        "mode": {
+            "type": "string",
+            "description": "same_session (default: a new turn of this conversation) or independent (a fresh conversation).",
+            "default": "same_session",
+        },
+        "title": {
+            "type": "string",
+            "description": "A short title for the scheduled run (optional).",
+            "default": None,
+        },
+    },
+    when_to_use=(
+        "Use when the person asks to be reminded later, or when work must happen later or when something "
+        "arrives. The run joins this conversation by default, with at most your tools."
+    ),
+)

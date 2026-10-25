@@ -1740,6 +1740,7 @@ def create_react_workflow(
         "remember_note",
         "compact_memory",
         "delegate_agent",
+        "schedule_run",
         "update_plan",
     }
 
@@ -3043,6 +3044,31 @@ def create_react_workflow(
                 return StepPlan(
                     node_id="act",
                     effect=Effect(type=EffectType.START_SUBWORKFLOW, payload=payload, result_key="_temp.tool_results"),
+                    next_node="observe",
+                )
+
+            if name == "schedule_run":
+                # Framework backlog 1045: a run LATER (at a time, after a delay, or on a trigger
+                # event) with at most this run's tools, never schedule_run itself (no recursion,
+                # like delegate_agent). The runtime intersects again with the run tree's ceiling
+                # and the host creates the one-shot automation (EffectType.SCHEDULE_RUN).
+                tools_raw = args.get("tools")
+                if tools_raw is None:
+                    wake_tools = [t for t in allow if t != "schedule_run"]
+                else:
+                    parent_allow = set(allow)
+                    wake_tools = [t for t in _normalize_allowlist(tools_raw) if t in parent_allow and t != "schedule_run"]
+                payload = {
+                    k: args[k]
+                    for k in ("at", "after_s", "on", "task", "note", "mode", "title")
+                    if args.get(k) is not None
+                }
+                payload["tools"] = wake_tools
+                payload["tool_name"] = "schedule_run"
+                payload["call_id"] = str(tc.get("call_id") or "")
+                return StepPlan(
+                    node_id="act",
+                    effect=Effect(type=EffectType.SCHEDULE_RUN, payload=payload, result_key="_temp.tool_results"),
                     next_node="observe",
                 )
 
