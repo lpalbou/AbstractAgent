@@ -70,8 +70,9 @@ There are two execution paths:
   1045): a run later (`after_s`, `at` or `on` a trigger event) with a `task` or a reminder `note`, as a new turn of
   this conversation by default (`mode: independent` for a fresh one). The scheduled run gets at most the agent's
   allowed tools (`tools` narrows them) and never `schedule_run` itself; the call is refused like any tool outside
-  the run's allowlist. The host creates the one-shot automation (`Runtime.set_schedule_run_handler`); the tool
-  result carries its `automation_id`.
+  the run's allowlist. `notify` (default true for a note, false for a task) makes the scheduled run's answer a
+  notification to the person. The host creates the one-shot automation (`Runtime.set_schedule_run_handler`); the
+  tool result carries its `automation_id`.
 
 Tool definitions live in `src/abstractagent/logic/builtins.py`.
 

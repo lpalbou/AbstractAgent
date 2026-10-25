@@ -3060,7 +3060,7 @@ def create_react_workflow(
                     wake_tools = [t for t in _normalize_allowlist(tools_raw) if t in parent_allow and t != "schedule_run"]
                 payload = {
                     k: args[k]
-                    for k in ("at", "after_s", "on", "task", "note", "mode", "title")
+                    for k in ("at", "after_s", "on", "task", "note", "mode", "title", "notify")
                     if args.get(k) is not None
                 }
                 payload["tools"] = wake_tools

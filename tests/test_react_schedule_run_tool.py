@@ -86,3 +86,14 @@ def test_schedule_run_outside_the_allowlist_is_refused_without_calling_the_host(
     assert final.status == RunStatus.COMPLETED
     assert plans == []
     assert any("schedule_run" in m for m in _tool_messages(final))
+
+
+@pytest.mark.basic
+def test_schedule_run_passes_notify_and_notes_notify_by_default() -> None:
+    plans: List[Dict[str, Any]] = []
+    host = lambda run, plan: plans.append(plan) or {"automation_id": "a"}  # noqa: E731
+    _run({"after_s": 60, "note": "drink water"}, allowed_tools=["schedule_run"], handler=host)
+    _run({"after_s": 60, "task": "t", "tools": []}, allowed_tools=["schedule_run"], handler=host)
+    _run({"after_s": 60, "task": "t", "tools": [], "notify": True}, allowed_tools=["schedule_run"], handler=host)
+    assert [p["notify"] for p in plans] == [True, False, True]
+    assert plans[0]["notify_title"] == "drink water"

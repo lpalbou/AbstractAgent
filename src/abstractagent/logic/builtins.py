@@ -413,6 +413,14 @@ SCHEDULE_RUN_TOOL = ToolDefinition(
             "description": "A short title for the scheduled run (optional).",
             "default": None,
         },
+        "notify": {
+            "type": "boolean",
+            "description": (
+                "Send the person a notification with the scheduled run's answer (optional). Default: true "
+                "for a note (a reminder reaches them), false for a task."
+            ),
+            "default": None,
+        },
     },
     when_to_use=(
         "Use when the person asks to be reminded later, or when work must happen later or when something "
