@@ -226,3 +226,11 @@ See [`docs/api.md`](api.md) and the delegation section of [`docs/architecture.md
 
 Symptom-first fixes (for example “TOOL_CALLS requires a ToolExecutor”) live in
 [`docs/troubleshooting.md`](troubleshooting.md).
+
+## Can an agent schedule a reminder or work for later?
+
+Yes, with the ReAct agent's `schedule_run` built-in, when the host registers AbstractRuntime's
+`Runtime.set_schedule_run_handler(...)` and lists `schedule_run` in the run's allowed tools. The agent passes
+`after_s`, `at`, or `on` a trigger event, and a `task` or a reminder `note`. The scheduled run joins the same
+conversation by default, with at most the agent's tools. See [`docs/tools.md`](tools.md) and
+[`docs/architecture.md`](architecture.md#scheduled-runs-schedule_run).

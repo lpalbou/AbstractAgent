@@ -122,6 +122,28 @@ flowchart LR
 - The substrate palette does not propagate to grandchildren; each level needs
   its own grant.
 
+### Scheduled runs (`schedule_run`)
+
+The ReAct agent maps the schema-only `schedule_run` built-in to AbstractRuntime's `SCHEDULE_RUN` effect: work for
+later (`after_s`, `at`, or `on` a trigger event) with a `task` or a reminder `note`. The host creates the one-shot
+automation; the scheduled run joins the same conversation by default.
+
+```mermaid
+flowchart LR
+  Agent["ReAct run<br/>_runtime.allowed_tools"]
+  Effect["SCHEDULE_RUN<br/>tools = request ∩ allowlist,<br/>never schedule_run"]
+  Host["host handler<br/>(Runtime.set_schedule_run_handler)"]
+  Wake["one-shot automation<br/>new turn of the same session"]
+  Agent -->|"schedule_run(after_s | at | on, task | note, notify?)"| Effect
+  Effect --> Host
+  Host --> Wake
+```
+
+- The scheduled run gets at most the agent's allowed tools; `tools` narrows them, and `schedule_run` is never passed
+  on. A call outside the run's allowlist is refused as a tool error without reaching the host.
+- `notify` defaults to true for a note, so a reminder reaches the person as a notification, and to false for a task.
+- The tool result carries the created automation's id; archiving that automation before it fires cancels the run.
+
 ### CodeAct workflow (`codeact_agent`)
 
 Files:

@@ -47,6 +47,9 @@ flowchart LR
 - **Generation controls**: temperature, seed, media policy, prompt-cache
   identity, streaming, Core `thinking` and `speculation` (MTP) are normalized
   before LLM calls and inherited by delegated children
+- **Scheduled runs** (ReAct): the `schedule_run` tool schedules work or a reminder
+  for later in the same conversation, with at most the agent's tools (see
+  [`docs/tools.md`](docs/tools.md))
 - **Observability**: durable ledger of LLM calls, tool calls, and waits
 
 Where this lives in code (source of truth):
@@ -84,13 +87,11 @@ Native Python hardware profile cascades are available for deployment manifests:
 AbstractCore and AbstractRuntime profiles; AbstractAgent itself remains
 provider/runtime agnostic.
 
-AbstractAgent 0.3.17 requires `abstractcore[tools]>=2.13.41` and
-`AbstractRuntime>=0.7.0` (the runtime release with the 50k-token history
-window, which ReAct applies to its requests when a host sets
-`_runtime.history_window_tokens`, as the entity visit does; 0.5.0 brought live
-token streaming, on top of turn grounding, in-flight cancellation and
-speculation inheritance). AbstractRuntime 0.7.0 itself requires AbstractCore
-2.18.0 or newer.
+AbstractAgent 0.4.0 requires `abstractcore[tools]>=2.25.0` and
+`AbstractRuntime>=0.11.0` (the runtime release with the `SCHEDULE_RUN` effect
+behind the ReAct `schedule_run` tool, on top of the 50k-token history window
+that ReAct applies when a host sets `_runtime.history_window_tokens`, live token
+streaming, turn grounding, in-flight cancellation and speculation inheritance).
 
 Note: the repository may be ahead of the latest published PyPI release. To verify what you installed:
 
