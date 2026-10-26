@@ -2,9 +2,10 @@
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-10-25
+## [0.4.0] - 2026-10-27
 
-- `schedule_run` builtin (framework backlog 1045, ReAct agent): schedules a run for later (`after_s`, `at`, or `on` a trigger event) with a `task` or a reminder `note`, in the same conversation by default. Mapped to AbstractRuntime's `EffectType.SCHEDULE_RUN`; the scheduled run gets at most the agent's allowed tools and never `schedule_run` itself (recursion-blocked like `delegate_agent`). Optional `notify` (default true for a note, false for a task): the scheduled run's answer reaches the person as a notification. Requires AbstractRuntime 0.11.0 or newer (dependency floor raised from 0.7.0) and a host that registers `Runtime.set_schedule_run_handler`. See [docs/tools.md](docs/tools.md).
+- **Dependency floors**: AbstractRuntime 0.12.0 (was 0.7.0 in 0.3.19; 0.12.0 is the first published AbstractRuntime with `SCHEDULE_RUN`) and AbstractCore 2.30.0 (was 2.25.0), in the base install and the `apple` and `gpu` extras.
+- `schedule_run` builtin (framework backlog 1045, ReAct agent): schedules a run for later (`after_s`, `at`, or `on` a trigger event) with a `task` or a reminder `note`, in the same conversation by default. Mapped to AbstractRuntime's `EffectType.SCHEDULE_RUN`; the scheduled run gets at most the agent's allowed tools and never `schedule_run` itself (recursion-blocked like `delegate_agent`). Optional `notify` (default true for a note, false for a task): the scheduled run's answer reaches the person as a notification. Requires AbstractRuntime 0.11.0 or newer and a host that registers `Runtime.set_schedule_run_handler`. See [docs/tools.md](docs/tools.md).
 
 ## [0.3.19] - 2026-10-08
 

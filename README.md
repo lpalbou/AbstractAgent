@@ -87,8 +87,8 @@ Native Python hardware profile cascades are available for deployment manifests:
 AbstractCore and AbstractRuntime profiles; AbstractAgent itself remains
 provider/runtime agnostic.
 
-AbstractAgent 0.4.0 requires `abstractcore[tools]>=2.25.0` and
-`AbstractRuntime>=0.11.0` (the runtime release with the `SCHEDULE_RUN` effect
+AbstractAgent 0.4.0 requires `abstractcore[tools]>=2.30.0` and
+`AbstractRuntime>=0.12.0` (the runtime release with the `SCHEDULE_RUN` effect
 behind the ReAct `schedule_run` tool, on top of the 50k-token history window
 that ReAct applies when a host sets `_runtime.history_window_tokens`, live token
 streaming, turn grounding, in-flight cancellation and speculation inheritance).
