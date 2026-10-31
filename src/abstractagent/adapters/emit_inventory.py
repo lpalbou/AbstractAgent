@@ -67,6 +67,10 @@ COMMON_STEPS = frozenset(
 
 REACT_STEPS = COMMON_STEPS | frozenset(
     {
+        # Opt-in public conversation; explicit public content only.
+        "public_update",
+        "public_update_rejected",
+        "question_expired",
         # 0028 multi-emit fix (2026-07-14): `max_iterations_reached` announces
         # budget exhaustion ONCE at first entry of the conclusion node;
         # `max_iterations` (canonical turn_end) fires once, at the completion

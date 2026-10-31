@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- ReAct supports opt-in public conversation updates via `ReactAgent.start(conversation={"enabled": True})`
+  or `_runtime.conversation.enabled`. Explicit public messages from the ordinary continuation are
+  recorded as durable `public_update` events with source call identities; private reasoning is
+  never used to generate them. Conversational `ask_user` arguments can declare essential questions
+  or timed clarifications, and expired fallbacks remain host instructions rather than user answers.
+
 ## [0.4.0] - 2026-10-27
 
 - **Dependency floors**: AbstractRuntime 0.12.0 (was 0.7.0 in 0.3.19; 0.12.0 is the first published AbstractRuntime with `SCHEDULE_RUN`) and AbstractCore 2.30.0 (was 2.25.0), in the base install and the `apple` and `gpu` extras.

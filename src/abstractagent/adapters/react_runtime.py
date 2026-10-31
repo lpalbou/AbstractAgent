@@ -46,6 +46,12 @@ from .generation_params import (
     verifier_response_schema,
 )
 from .loop_hooks import LoopHooks, undelivered_inbox_stats
+from .public_updates import (
+    PUBLIC_UPDATE_INSTRUCTION,
+    conversation_enabled,
+    conversation_tool_specs,
+    parse_public_update,
+)
 from .media import (
     accumulate_media,
     extract_media_from_context,
@@ -1450,6 +1456,9 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
             # without this pop, two format failures anywhere in a conversation
             # made every later failing turn raise at once.
             "tool_format_retries",
+            "conversation_enabled",
+            "pending_public_update",
+            "pending_public_update_rejection",
         ):
             temp.pop(key, None)
 
@@ -1745,7 +1754,7 @@ def create_react_workflow(
     }
 
     def init_node(run: RunState, ctx) -> StepPlan:
-        context, scratchpad, runtime_ns, _, limits = ensure_react_vars(run)
+        context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
 
         scratchpad["iteration"] = 0
         limits["current_iteration"] = 0
@@ -1791,6 +1800,7 @@ def create_react_workflow(
         allowed_defs = _allowed_tool_defs(allow)
         include_examples = _tool_prompt_examples_enabled(runtime_ns)
         tool_specs = _materialize_tool_specs(allowed_defs, include_examples=include_examples)
+        tool_specs = conversation_tool_specs(tool_specs, enabled=conversation_enabled(runtime_ns, temp))
         runtime_ns["tool_specs"] = tool_specs
         runtime_ns["toolset_id"] = _compute_toolset_id(tool_specs)
         runtime_ns.setdefault("allowed_tools", allow)
@@ -1800,6 +1810,7 @@ def create_react_workflow(
 
     def reason_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
+        public_conversation = conversation_enabled(runtime_ns, temp)
 
         # Durable resume safety:
         # - tool definitions can change across restarts (env/toolset swaps, staged deploy swaps)
@@ -1812,6 +1823,7 @@ def create_react_workflow(
                 allowed_defs = _allowed_tool_defs(allow)
                 include_examples = _tool_prompt_examples_enabled(runtime_ns)
                 refreshed_specs = _materialize_tool_specs(allowed_defs, include_examples=include_examples)
+                refreshed_specs = conversation_tool_specs(refreshed_specs, enabled=public_conversation)
                 refreshed_id = _compute_toolset_id(refreshed_specs)
                 prev_id = str(runtime_ns.get("toolset_id") or "")
                 prev_specs = runtime_ns.get("tool_specs")
@@ -1941,6 +1953,8 @@ def create_react_workflow(
 
         sys_base = str(req.system_prompt or "").strip()
         sys = _compose_system_prompt(runtime_ns, base=sys_base)
+        if public_conversation:
+            sys = f"{sys}\n\n{PUBLIC_UPDATE_INSTRUCTION}".strip()
         # Prompt-prefix cache stability (0212) + context fidelity (0213):
         # Do NOT append the per-cycle scratchpad to the system prompt. It mutated the cached prefix
         # every iteration (defeating prompt caching) and double-carried observations already present
@@ -2067,7 +2081,7 @@ def create_react_workflow(
             next_node="parse",
         )
 
-    def parse_node(run: RunState, ctx) -> StepPlan:
+    def _parse_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
         response = temp.get("llm_response", {})
 
@@ -2099,6 +2113,31 @@ def create_react_workflow(
                     captures[capture_key] = list(captures.get(capture_key) or []) + list(vals)
 
         content, tool_calls = logic.parse_response(response)
+        # The logical parser may fall back to private reasoning. Only the
+        # explicit provider content lane can author a public update.
+        transcript_content = content
+        public_update = None
+        public_update_rejection = None
+        if conversation_enabled(runtime_ns, temp):
+            known_call_ids = {
+                str(o["call_id"])
+                for c in scratchpad.get("cycles", []) if isinstance(c, dict)
+                for o in c.get("observations", []) if isinstance(o, dict) and o.get("call_id")
+            }
+            for message in context.get("messages", []):
+                if not isinstance(message, dict) or message.get("role") != "tool":
+                    continue
+                metadata = message.get("metadata") or {}
+                call_id = message.get("tool_call_id") or (metadata.get("call_id") if isinstance(metadata, dict) else None)
+                if call_id:
+                    known_call_ids.add(str(call_id))
+            remainder, public_update, public_update_rejection = parse_public_update(
+                response, known_call_ids=known_call_ids,
+            )
+            if remainder is not None:
+                content = remainder
+                if not content and not tool_calls and public_update is not None:
+                    content = public_update["text"]
         finish_reason = ""
         if isinstance(response, dict):
             fr = response.get("finish_reason")
@@ -2141,6 +2180,25 @@ def create_react_workflow(
             cycles.append(cycle)
         else:
             scratchpad["cycles"] = [cycle]
+
+        if public_update_rejection is not None:
+            rejected = {"iteration": cycle_i, "code": public_update_rejection}
+            cycle["public_update_rejected"] = dict(rejected)
+            temp["pending_public_update_rejection"] = dict(rejected)
+            emit("public_update_rejected", rejected)
+        if public_update is not None:
+            # Absolute cycle position remains unique when entity visits reset
+            # the per-turn iteration counter in the same durable run.
+            public_update = {
+                "id": f"{run.run_id}:public_update:{len(scratchpad['cycles'])}",
+                "run_id": run.run_id,
+                "session_id": run.session_id,
+                "iteration": cycle_i,
+                **public_update,
+            }
+            cycle["public_update"] = dict(public_update)
+            temp["pending_public_update"] = dict(public_update)
+            emit("public_update", dict(public_update))
 
         if tool_calls:
             cycle["tool_calls"] = [tc.__dict__ for tc in tool_calls]
@@ -2492,7 +2550,7 @@ def create_react_workflow(
             context["messages"].append(
                 _new_assistant_message_with_tool_calls(
                     ctx,
-                    content=str(content or ""),
+                    content=str(transcript_content or ""),
                     tool_calls=tool_calls,
                     metadata={"kind": "tool_calls", "cycle": cycle_i},
                 )
@@ -2643,6 +2701,24 @@ def create_react_workflow(
         emit("parse_final", {"cycle": cycle_i})
         return StepPlan(node_id="parse", next_node="maybe_review")
 
+    def parse_node(run: RunState, ctx) -> StepPlan:
+        plan = _parse_node(run, ctx)
+        update = run.vars.get("_temp", {}).pop("pending_public_update", None)
+        rejected = run.vars.get("_temp", {}).pop("pending_public_update_rejection", None)
+        if update is None and rejected is None:
+            return plan
+        # Hook callbacks are process-local. An ordinary durable effect gives
+        # replay/late subscribers the same authored update, before more work
+        # begins, without spending another model call.
+        return StepPlan(
+            node_id=plan.node_id,
+            effect=Effect(type=EffectType.EMIT_EVENT, payload={
+                "name": "public_update" if update is not None else "public_update_rejected",
+                "payload": update if update is not None else rejected,
+            }),
+            next_node=plan.next_node,
+        )
+
     def act_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
 
@@ -2716,6 +2792,14 @@ def create_react_workflow(
                 question = str(args.get("question") or "Please provide input:")
                 choices = args.get("choices")
                 choices = list(choices) if isinstance(choices, list) else None
+                question_policy = None
+                if conversation_enabled(runtime_ns, temp) and any(
+                    args.get(key) is not None for key in ("importance", "timeout_s", "fallback")
+                ):
+                    question_policy = {}
+                    for key in ("importance", "timeout_s", "fallback"):
+                        if args.get(key) is not None:
+                            question_policy[key] = args[key]
 
                 msgs = context.get("messages")
                 if isinstance(msgs, list):
@@ -2723,12 +2807,17 @@ def create_react_workflow(
                         _new_message(ctx, role="assistant", content=f"[Agent question]: {question}", metadata={"kind": "ask_user_prompt"})
                     )
 
-                emit("ask_user", {"question": question, "choices": choices or []})
+                ask_payload = {"prompt": question, "choices": choices, "allow_free_text": True}
+                if question_policy is not None:
+                    ask_payload["question"] = question_policy
+                emit("ask_user", {"question": question, "choices": choices or [], **(
+                    {"question_policy": question_policy} if question_policy is not None else {}
+                )})
                 return StepPlan(
                     node_id="act",
                     effect=Effect(
                         type=EffectType.ASK_USER,
-                        payload={"prompt": question, "choices": choices, "allow_free_text": True},
+                        payload=ask_payload,
                         result_key="_temp.user_response",
                     ),
                     next_node="handle_user_response",
@@ -3397,10 +3486,29 @@ def create_react_workflow(
         user_response = temp.get("user_response", {})
         if not isinstance(user_response, dict):
             user_response = {}
-        response_text = str(user_response.get("response", "") or "")
-        emit("user_response", {"response": response_text})
-
-        context["messages"].append(_new_message(ctx, role="user", content=f"[User response]: {response_text}"))
+        question_result = user_response.get("question")
+        if user_response.get("timed_out") is True and isinstance(question_result, dict) and question_result.get("outcome") == "expired":
+            fallback = str(user_response.get("fallback") or "")
+            # A clock expiring is host input, never speech, a preference or
+            # consent attributed to the person. The declared plan remains
+            # revisitable if they answer later.
+            emit("question_expired", {"question": dict(question_result), "fallback": fallback})
+            context["messages"].append(_new_message(
+                ctx, role="system",
+                content=("The clarification question expired without an answer. "
+                         "The person did not answer or approve anything. "
+                         f"Continue with your previously declared fallback: {fallback}"),
+                metadata={"kind": "question_expired", "question": dict(question_result)},
+            ))
+        else:
+            response_text = str(user_response.get("response", "") or "")
+            emit("user_response", {"response": response_text, **(
+                {"question": dict(question_result)} if isinstance(question_result, dict) else {}
+            )})
+            context["messages"].append(_new_message(
+                ctx, role="user", content=f"[User response]: {response_text}",
+                metadata={"question": dict(question_result)} if isinstance(question_result, dict) else None,
+            ))
         temp.pop("user_response", None)
 
         # Per-TURN report state resets at the turn boundary (0028, 2026-07-14):

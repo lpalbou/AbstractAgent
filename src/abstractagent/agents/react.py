@@ -147,6 +147,7 @@ class ReactAgent(BaseAgent):
         # P1 2026-07-13). Both must be byte-stable for the run (cache prefix).
         skills_block: Optional[str] = None,
         system_prompt_extra: Optional[str] = None,
+        conversation: Optional[Dict[str, Any]] = None,
     ) -> str:
         task = str(task or "").strip()
         if not task:
@@ -198,6 +199,10 @@ class ReactAgent(BaseAgent):
             runtime_ns["skills_block"] = skills_block
         if isinstance(system_prompt_extra, str) and system_prompt_extra.strip():
             runtime_ns["system_prompt_extra"] = system_prompt_extra
+        if conversation is not None:
+            if not isinstance(conversation, dict):
+                raise ValueError("conversation must be an object such as {'enabled': True}")
+            runtime_ns["conversation"] = dict(conversation)
         # Explicit output caps must SURVIVE the adapter's init_node, which
         # deliberately nulls config-derived _limits caps (full-context policy).
         # `_runtime.max_output_tokens` is the surviving channel the adapter's

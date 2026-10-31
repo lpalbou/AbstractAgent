@@ -123,6 +123,9 @@ Key parameters:
 Per-run controls (via `ReactAgent.start(...)`):
 - `allowed_tools=[...]`: allowlist of tool names (enforced by the runtime’s tool-calls handler)
 - `temperature`, `seed`: sampling controls stored under `vars["_runtime"]`
+- `conversation={"enabled": True}`: optional public updates from normal ReAct
+  continuations, with opt-in conversational question arguments. Defaults off;
+  see [Public conversation](public-conversation.md).
 
 Host-level `_runtime` slots (raw-workflow hosts; see `docs/skills-attachment.md`):
 - `skills_block`: skills attachment slot (composed before `system_prompt_extra`)

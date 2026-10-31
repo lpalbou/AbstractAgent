@@ -142,6 +142,15 @@ asked again with the tool roster, pointed at the request's own tool-calling
 format. At most two per turn (`reset_react_turn` resets the budget); the
 third rejection raises.
 
+Opt-in ReAct public conversation adds `public_update` (`{id, text, run_id,
+session_id, iteration, source_call_ids}`), `public_update_rejected` (`{iteration,
+code}`), and `question_expired` (`{question, fallback}`). Accepted updates are
+also durable `EMIT_EVENT` effects named `public_update`; replay clients should
+read the completed event rather than infer messages from `parse.reasoning` or
+raw model output. See [Public conversation](public-conversation.md) for the
+opt-in, authoring protocol and timeout attribution. Rejection codes are also
+recorded in the cycle and a durable `public_update_rejected` event.
+
 Parse payload common core: every adapter's
 `parse` payload guarantees `has_tool_calls` (bool), `tool_calls`
 (list of `{name, arguments, call_id}`), and `content_preview` (≤200 chars of
