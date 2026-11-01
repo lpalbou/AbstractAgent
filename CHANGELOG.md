@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- Opt-in ReAct action proposals forward their same-cycle public explanation to approval waits as
+  `public_action`, bound to the exact proposed call identities and arguments. Sequential queue
+  splits retain only their own call IDs; later proposals and verifier replacements cannot reuse
+  an older explanation. Uses the ordinary continuation, without another inference call.
+
 - ReAct supports opt-in public conversation updates via `ReactAgent.start(conversation={"enabled": True})`
   or `_runtime.conversation.enabled`. Explicit public messages from the ordinary continuation are
   recorded as durable `public_update` events with source call identities; private reasoning is

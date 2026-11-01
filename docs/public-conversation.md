@@ -67,6 +67,40 @@ Source identity establishes lineage, not truth or entailment. A web lead may sti
 need verification, and a command printing a claim does not establish that claim.
 Updates do not expose private reasoning or replace the original source records.
 
+## Public purpose for an approval request
+
+When proposing an action that may need permission, the public update explains what
+the actor wants to do and why that helps the person's task. This uses the same
+optional block and ordinary continuation. It is the actor's stated purpose,
+rather than proof that the action is necessary, safe or already performed.
+
+The adapter binds an accepted update to that response's proposed calls after
+assigning their call IDs. Its `TOOL_CALLS` effect can carry:
+
+```json
+{
+  "public_action": {
+    "text": "I want to check the museum's own hours so we can choose a convenient time.",
+    "update_id": "run-id:public_update:2",
+    "run_id": "run-id",
+    "iteration": 2,
+    "call_ids": ["hours-request"]
+  }
+}
+```
+
+Here `call_ids` identifies the proposed action batch. The public update's
+`source_call_ids` continues to identify results already observed; those two roles
+are distinct. Runtime exposes validated context as approval wait
+`details.public_action`, narrowing the IDs when scope or policy withholds calls.
+Sequential queue splits carry only the IDs in each actual batch. A new proposal,
+changed arguments or verifier replacement cannot borrow an older explanation.
+
+Clients use the explanation only for the matching run and exact pending call IDs.
+When it is absent, show that the actor has not supplied an explanation; do not
+infer one from private reasoning, tool names or an unrelated earlier update.
+The existing approval decision, targets and policy remain authoritative.
+
 ## Questions and silence
 
 When opted in, the `ask_user` schema additionally accepts `importance`, `timeout_s`

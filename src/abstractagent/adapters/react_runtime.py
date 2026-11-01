@@ -317,6 +317,41 @@ def _tool_call_fingerprint(name: str, args: Any) -> str:
         return "fingerprint_err"
 
 
+def _public_action_call_signature(call: Dict[str, Any]) -> str:
+    """Full argument identity, unlike the bounded repeat-detection fingerprint."""
+    raw = json.dumps({"name": call.get("name"), "arguments": call.get("arguments")},
+                     sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _public_action_for_batch(run: RunState, batch: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Bind only this cycle's accepted public words to unchanged proposed calls."""
+    temp = run.vars.get("_temp") or {}
+    binding = temp.get("public_action_binding")
+    cycles = (run.vars.get("scratchpad") or {}).get("cycles")
+    if temp.get("conversation_enabled") is not True or not isinstance(binding, dict) or not isinstance(cycles, list) or not cycles:
+        return None
+    cycle = cycles[-1]
+    update = cycle.get("public_update") if isinstance(cycle, dict) else None
+    if (not isinstance(update, dict) or binding.get("update") != update
+            or binding.get("cycle") != len(cycles) or update.get("run_id") != run.run_id
+            or update.get("id") != f"{run.run_id}:public_update:{len(cycles)}"):
+        return None
+    ids = [call.get("call_id") for call in batch]
+    if not ids or any(not isinstance(cid, str) or not cid for cid in ids) or len(set(ids)) != len(ids):
+        return None
+    signatures = binding.get("calls")
+    if not isinstance(signatures, dict):
+        return None
+    try:
+        if any(signatures.get(call["call_id"]) != _public_action_call_signature(call) for call in batch):
+            return None
+    except (TypeError, ValueError):
+        return None
+    return {"text": update["text"], "update_id": update["id"], "run_id": run.run_id,
+            "iteration": update["iteration"], "call_ids": ids}
+
+
 def _evidence_text(context: Any, *, max_chars: int = 200_000) -> str:
     """What the ENVIRONMENT has told this run so far — user messages, tool
     outputs, system messages. Assistant turns are excluded on purpose: a value
@@ -1459,6 +1494,7 @@ def reset_react_turn(run_vars: Dict[str, Any]) -> None:
             "conversation_enabled",
             "pending_public_update",
             "pending_public_update_rejection",
+            "public_action_binding",
         ):
             temp.pop(key, None)
 
@@ -2084,6 +2120,8 @@ def create_react_workflow(
     def _parse_node(run: RunState, ctx) -> StepPlan:
         context, scratchpad, runtime_ns, temp, limits = ensure_react_vars(run)
         response = temp.get("llm_response", {})
+        # A new proposal can never borrow an earlier cycle's explanation.
+        temp.pop("public_action_binding", None)
 
         # Sight-lane retry restore (adversary P1-2): the reason call that just
         # returned may have carried one-shot captured media. Popped here into a
@@ -2556,6 +2594,16 @@ def create_react_workflow(
                 )
             )
             temp["pending_tool_calls"] = [tc.__dict__ for tc in tool_calls]
+            if public_update is not None:
+                ids = [tc.call_id for tc in tool_calls]
+                if all(isinstance(cid, str) and cid for cid in ids) and len(set(ids)) == len(ids):
+                    try:
+                        temp["public_action_binding"] = {
+                            "update": deepcopy(public_update), "cycle": len(scratchpad["cycles"]),
+                            "calls": {tc.call_id: _public_action_call_signature(tc.__dict__) for tc in tool_calls},
+                        }
+                    except (TypeError, ValueError):
+                        pass  # Invalid tool arguments never acquire a public explanation.
             emit("parse_tool_calls", {"count": len(tool_calls)})
             return StepPlan(node_id="parse", next_node="act")
 
@@ -3203,11 +3251,15 @@ def create_react_workflow(
         scratchpad["act_seq"] = act_seq
         temp["current_tool_batch"] = list(formatted_calls)
 
+        tool_payload = {"tool_calls": formatted_calls, "allowed_tools": list(allow), "act_seq": act_seq}
+        public_action = _public_action_for_batch(run, formatted_calls)
+        if public_action is not None:
+            tool_payload["public_action"] = public_action
         return StepPlan(
             node_id="act",
             effect=Effect(
                 type=EffectType.TOOL_CALLS,
-                payload={"tool_calls": formatted_calls, "allowed_tools": list(allow), "act_seq": act_seq},
+                payload=tool_payload,
                 result_key="_temp.tool_results",
             ),
             next_node="observe",
@@ -3476,6 +3528,7 @@ def create_react_workflow(
         if isinstance(pending, list) and pending:
             return StepPlan(node_id="observe", next_node="act")
         temp["pending_tool_calls"] = []
+        temp.pop("public_action_binding", None)
         # Forced-batch marker ends with its batch (queue fully consumed) — any
         # LATER tool activity is the model's own and resets the review budget.
         temp.pop("review_forced_batch", None)
@@ -3764,6 +3817,7 @@ def create_react_workflow(
                     metadata={"kind": "tool_calls", "source": "review"},
                 )
             )
+            temp.pop("public_action_binding", None)  # Review calls did not author the public update.
             temp["pending_tool_calls"] = [tc.__dict__ for tc in synthesized]
             # Mark the batch verifier-forced: observe must not reset the review
             # budget for it (c2856 re-review blowup class — the reset re-armed

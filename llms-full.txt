@@ -39,7 +39,7 @@ Important notes (source-of-truth hints):
 - [Agents](docs/agents.md): Agent types + API
 - [Tools](docs/tools.md): Default tools, allowlists, built-ins (adapter-mapped + runtime-owned, including ReAct's `schedule_run` → `SCHEDULE_RUN`)
 - [Loop hooks](docs/hooks.md): Listen/steer/capture hooks on the agent loops (`LoopHooks`, `HookEvent`) + emit-step stability contract + parse-payload common core
-- [Public conversation](docs/public-conversation.md): Opt-in actor-authored public updates, source identities and timed clarifications
+- [Public conversation](docs/public-conversation.md): Opt-in actor-authored updates, action-bound approval purpose, source identities and timed clarifications
 - [Skills attachment](docs/skills-attachment.md): `_runtime.skills_block` / `system_prompt_extra` slots, cache contract, `read_skill` progressive disclosure, unattended recipe
 - [Persistence](docs/persistence.md): Pause/resume across restarts
 - [Architecture](docs/architecture.md): How logic/adapters/agents fit together; ReAct graph with review nodes; delegated sub-agents and inherited `_runtime` controls (diagrams)

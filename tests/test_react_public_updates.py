@@ -219,3 +219,115 @@ def test_python_facade_exposes_explicit_run_opt_in():
     assert runtime.get_state(run_id).vars["_runtime"]["conversation"] == {"enabled": True}
     with pytest.raises(ValueError, match="conversation must be an object"):
         agent.start("Plan an outing.", conversation="true")
+
+
+def _tool_payloads(ledger):
+    return [r["effect"]["payload"] for r in ledger
+            if r.get("status") == "started" and (r.get("effect") or {}).get("type") == "tool_calls"
+            and isinstance((r.get("effect") or {}).get("payload", {}).get("tool_calls"), list)]
+
+
+def test_public_action_uses_only_same_proposal_update_and_host_stamped_call_ids():
+    reason = "I want to check the museum's hours so we can choose a suitable time."
+    no_id = _read(); no_id.pop("call_id")
+    later = _read("later"); later["arguments"] = {"file_path": "parking.txt"}
+    state, requests, _, ledger, _ = _harness([
+        {"content": _block(reason), "tool_calls": [no_id]},
+        {"content": "Checking parking.", "tool_calls": [later]},
+        {"content": "Done.", "tool_calls": []},
+    ])
+    payloads = _tool_payloads(ledger)
+    assert len(payloads) == 2 and len(requests) == 3
+    action = payloads[0]["public_action"]
+    assert action == {"text": reason, "update_id": state.run_id + ":public_update:1", "run_id": state.run_id,
+                      "iteration": 1, "call_ids": [payloads[0]["tool_calls"][0]["call_id"]]}
+    assert action["call_ids"] == ["call_1"]
+    assert "public_action" not in payloads[1]  # never reuse the earlier public brief
+    assert "public_action_binding" not in state.vars["_temp"]
+
+
+def test_public_action_follows_sequential_queue_splits_without_expanding_a_batch():
+    reason = "I want to check the outing details so the plan fits your needs."
+    _, requests, _, ledger, asks = _harness([
+        {"content": _block(reason), "tool_calls": [_read("before"), {
+            "name": "ask_user", "call_id": "ask", "arguments": {"question": "Keep the museum?"}}, _read("after")]},
+        {"content": "Done.", "tool_calls": []},
+    ])
+    payloads = _tool_payloads(ledger)
+    assert len(requests) == 2 and len(asks) == 1 and len(payloads) == 2
+    assert [p["public_action"]["call_ids"] for p in payloads] == [["before"], ["after"]]
+    assert len({p["public_action"]["update_id"] for p in payloads}) == 1
+    assert all(p["public_action"]["text"] == reason for p in payloads)
+
+
+@pytest.mark.parametrize("enabled,response", [
+    (False, {"content": _block("Public words in an opted-out run."), "tool_calls": [_read()]}),
+    (True, {"content": "", "reasoning": _block("PRIVATE"), "tool_calls": [_read()]}),
+    (True, {"content": _block("Unverified", ["not-observed"]), "tool_calls": [_read()]}),
+])
+def test_unpublished_or_disabled_content_never_becomes_approval_context(enabled, response):
+    _, _, _, ledger, _ = _harness([response, {"content": "Done.", "tool_calls": []}], enabled=enabled)
+    assert all("public_action" not in p for p in _tool_payloads(ledger))
+
+
+def test_public_action_rejects_replaced_arguments_duplicate_ids_and_stale_cycle():
+    from copy import deepcopy
+    from abstractagent.adapters.react_runtime import _public_action_call_signature, _public_action_for_batch
+    from abstractruntime.core.models import RunState
+    call = {"name": "read_file", "arguments": {"items": list(range(40))}, "call_id": "c1"}
+    update = {"id": "r:public_update:1", "run_id": "r", "iteration": 1, "text": "Check the full list.", "source_call_ids": []}
+    run = RunState(run_id="r", workflow_id="w", status=RunStatus.RUNNING, current_node="act", vars={
+        "scratchpad": {"cycles": [{"i": 1, "public_update": update}]},
+        "_temp": {"conversation_enabled": True, "public_action_binding": {
+            "update": deepcopy(update), "cycle": 1, "calls": {"c1": _public_action_call_signature(call)}}}})
+    assert _public_action_for_batch(run, [call])["call_ids"] == ["c1"]
+    replacement = deepcopy(call); replacement["arguments"]["items"][-1] = 999
+    assert _public_action_for_batch(run, [replacement]) is None  # includes arguments after item 25
+    assert _public_action_for_batch(run, [call, call]) is None
+    run.vars["scratchpad"]["cycles"].append({"i": 2})
+    assert _public_action_for_batch(run, [call]) is None
+    reset_react_turn(run.vars)
+    assert "public_action_binding" not in run.vars["_temp"]
+
+
+def test_review_replacement_cannot_inherit_an_actors_earlier_public_reason():
+    from abstractruntime.core.models import RunState
+    class Ctx:
+        def now_iso(self): return "2026-11-01T12:00:00Z"
+    workflow = create_react_workflow(logic=ReActLogic(tools=[ToolDefinition(name="read_file", description="Read", parameters={})]))
+    run = RunState(run_id="r", workflow_id="w", status=RunStatus.RUNNING, current_node="review_parse", vars={
+        "context": {"task": "Plan an outing", "messages": []}, "scratchpad": {"iteration": 1},
+        "_runtime": {"allowed_tools": ["read_file"], "conversation": {"enabled": True}},
+        "_temp": {"conversation_enabled": True, "public_action_binding": {"text": "STALE"},
+                  "review_llm_response": {"data": {"complete": False, "missing": ["hours"], "next_prompt": "",
+                      "next_tool_calls": [{"name": "read_file", "arguments": {"file_path": "hours.txt"}}]}}}})
+    plan = workflow.get_node("review_parse")(run, Ctx())
+    assert plan.next_node == "act" and "public_action_binding" not in run.vars["_temp"]
+    action = workflow.get_node("act")(run, Ctx())
+    assert "public_action" not in action.effect.payload
+
+
+def test_real_runtime_approval_wait_uses_authored_reason_without_extra_inference():
+    from abstractruntime.integrations.abstractcore.effect_handlers import make_tool_calls_handler
+    from abstractruntime.integrations.abstractcore.tool_executor import ApprovalToolExecutor, MappingToolExecutor, ToolApprovalPolicy
+    reason = "I want to check the museum's opening hours so we can choose a convenient time."
+    script = iter([{"content": _block(reason), "reasoning": "PRIVATE", "tool_calls": [_read("hours")]},
+                   {"content": "I left the plan unchanged.", "tool_calls": []}])
+    requests, executed = [], []
+    def llm(run, effect, next_node):
+        requests.append(effect.payload); return EffectOutcome.completed(next(script))
+    tools = ApprovalToolExecutor(delegate=MappingToolExecutor({"read_file": lambda **args: executed.append(args)}),
+                                 policy=ToolApprovalPolicy(require_approval_tools={"read_file"}))
+    rt = Runtime(run_store=InMemoryRunStore(), ledger_store=InMemoryLedgerStore(), effect_handlers={
+        EffectType.LLM_CALL: llm, EffectType.TOOL_CALLS: make_tool_calls_handler(tools=tools)})
+    rt.set_tool_executor_for_resume(tools)
+    wf = create_react_workflow(logic=ReActLogic(tools=[ToolDefinition(name="read_file", description="Read", parameters={})]))
+    rid = rt.start(workflow=wf, vars={"context": {"task": "Plan an outing.", "messages": []},
+                                   "_runtime": {"conversation": {"enabled": True}, "review_mode": False}})
+    state = rt.tick(workflow=wf, run_id=rid, max_steps=30)
+    assert state.status == RunStatus.WAITING and len(requests) == 1 and not executed
+    assert state.waiting.details["public_action"] == {
+        "text": reason, "update_id": rid + ":public_update:1", "run_id": rid, "iteration": 1, "call_ids": ["hours"]}
+    assert "PRIVATE" not in json.dumps(state.waiting.details)
+    done = rt.resume(workflow=wf, run_id=rid, wait_key=state.waiting.wait_key, payload={"approved": False}, max_steps=30)
+    assert done.status == RunStatus.COMPLETED and len(requests) == 2 and not executed
