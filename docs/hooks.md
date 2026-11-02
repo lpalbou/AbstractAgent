@@ -142,8 +142,8 @@ asked again with the tool roster, pointed at the request's own tool-calling
 format. At most two per turn (`reset_react_turn` resets the budget); the
 third rejection raises.
 
-Opt-in ReAct public conversation adds `public_update` (`{id, text, run_id,
-session_id, iteration, source_call_ids}`), `public_update_rejected` (`{iteration,
+Opt-in ReAct public conversation adds `public_update` (`{id, kind, text, run_id,
+session_id, iteration, source_call_ids}`, `kind` being `"progress"` or `"finding"`), `public_update_rejected` (`{iteration,
 code}`), and `question_expired` (`{question, fallback}`). Accepted updates are
 also durable `EMIT_EVENT` effects named `public_update`; replay clients should
 read the completed event rather than infer messages from `parse.reasoning` or

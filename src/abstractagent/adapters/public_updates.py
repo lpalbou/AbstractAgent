@@ -16,11 +16,13 @@ CLOSE = "</public_update>"
 MAX_TEXT_CHARS = 600
 MAX_BLOCK_CHARS = 4096
 MAX_SOURCES = 16
+KINDS = ("progress", "finding")
 
 PUBLIC_UPDATE_INSTRUCTION = """Public conversation updates (optional):
 When you have something useful to tell the person while continuing work, put ONE
-<public_update>{"text":"A short message to the person","source_call_ids":[]}</public_update>
+<public_update>{"kind":"progress","text":"A short message to the person","source_call_ids":[]}</public_update>
 at the very beginning of your public content, alongside your normal tool calls.
+kind is "finding" for a fact or piece of evidence you established, "progress" for what you are doing.
 Use the person's language, ordinary words and at most two short sentences.
 Keep text within 600 characters and cite at most 16 source_call_ids.
 Share a meaningful discovery, a reason affecting a choice, or honest uncertainty.
@@ -121,8 +123,12 @@ def parse_public_update(
         value = json.loads(block)
     except (ValueError, TypeError):
         return remaining, None, "invalid_json"
-    if not isinstance(value, dict) or set(value) - {"text", "source_call_ids"}:
+    if not isinstance(value, dict) or set(value) - {"kind", "text", "source_call_ids"}:
         return remaining, None, "invalid_fields"
+    # Typed by the model; an update written without a kind reports progress.
+    kind = value.get("kind", "progress")
+    if kind not in KINDS:
+        return remaining, None, "invalid_kind"
     text = value.get("text")
     sources = value.get("source_call_ids", [])
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT_CHARS:
@@ -131,4 +137,4 @@ def parse_public_update(
         not isinstance(s, str) or not s or s not in known_call_ids for s in sources
     ):
         return remaining, None, "unknown_or_invalid_sources"
-    return remaining, {"text": text.strip(), "source_call_ids": list(dict.fromkeys(sources))}, None
+    return remaining, {"kind": kind, "text": text.strip(), "source_call_ids": list(dict.fromkeys(sources))}, None
