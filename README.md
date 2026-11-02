@@ -50,6 +50,9 @@ flowchart LR
 - **Scheduled runs** (ReAct): the `schedule_run` tool schedules work or a reminder
   for later in the same conversation, with at most the agent's tools (see
   [`docs/tools.md`](docs/tools.md))
+- **Public conversation** (ReAct, opt-in): short public updates from the ordinary
+  continuation, an action-bound explanation for approval requests and timed
+  clarification questions (see [`docs/public-conversation.md`](docs/public-conversation.md))
 - **Observability**: durable ledger of LLM calls, tool calls, and waits
 
 Where this lives in code (source of truth):
@@ -87,11 +90,18 @@ Native Python hardware profile cascades are available for deployment manifests:
 AbstractCore and AbstractRuntime profiles; AbstractAgent itself remains
 provider/runtime agnostic.
 
-AbstractAgent 0.4.0 requires `abstractcore[tools]>=2.30.0` and
-`AbstractRuntime>=0.12.0` (the runtime release with the `SCHEDULE_RUN` effect
-behind the ReAct `schedule_run` tool, on top of the 50k-token history window
-that ReAct applies when a host sets `_runtime.history_window_tokens`, live token
-streaming, turn grounding, in-flight cancellation and speculation inheritance).
+AbstractAgent 0.5.0 requires `abstractcore[tools]>=2.30.0` and
+`AbstractRuntime>=0.16.0` (the runtime release that carries a public action
+explanation into tool approval waits and enforces conversational `ask_user`
+question policies, on top of the `SCHEDULE_RUN` effect behind the ReAct
+`schedule_run` tool, the 50k-token history window that ReAct applies when a host
+sets `_runtime.history_window_tokens`, live token streaming, turn grounding,
+in-flight cancellation and speculation inheritance).
+
+What's new in 0.5.0: opt-in public conversation updates for ReAct, an
+action-bound public explanation for approval requests, and timed clarification
+questions with a declared fallback. See [`docs/public-conversation.md`](docs/public-conversation.md)
+and the [changelog](CHANGELOG.md).
 
 Note: the repository may be ahead of the latest published PyPI release. To verify what you installed:
 

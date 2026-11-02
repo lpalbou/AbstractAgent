@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-02
+
+- **Dependency floor**: AbstractRuntime 0.16.0 (was 0.12.0), in the base install and the `apple` and `gpu` extras. 0.16.0 is the first AbstractRuntime that carries `public_action` into tool approval waits and enforces conversational `ASK_USER` question policies (essential questions, timed clarifications with a declared fallback). AbstractCore stays at `abstractcore[tools]>=2.30.0`; AbstractRuntime 0.16.0 itself requires AbstractCore 2.32.0.
+
 - Opt-in ReAct action proposals forward their same-cycle public explanation to approval waits as
   `public_action`, bound to the exact proposed call identities and arguments. Sequential queue
   splits retain only their own call IDs; later proposals and verifier replacements cannot reuse

@@ -144,6 +144,27 @@ flowchart LR
 - `notify` defaults to true for a note, so a reminder reaches the person as a notification, and to false for a task.
 - The tool result carries the created automation's id; archiving that automation before it fires cancels the run.
 
+### Public conversation (opt-in, ReAct)
+
+With `conversation={"enabled": True}` (or `_runtime.conversation.enabled`), the `parse` node accepts one leading
+`<public_update>` block from the model's explicit public content. An accepted update becomes a durable `EMIT_EVENT`
+named `public_update`; when the same response proposes tool calls, the update is bound to those exact calls and
+travels on the `TOOL_CALLS` effect as `public_action`, which AbstractRuntime exposes on the approval wait.
+
+```mermaid
+flowchart LR
+  Reason["reason<br/>LLM_CALL"] --> Parse["parse<br/>leading public_update block"]
+  Parse -->|"EMIT_EVENT public_update"| Ledger["durable ledger<br/>+ loop hooks"]
+  Parse -->|"tool calls + binding<br/>(call ids, argument hashes)"| Act["act<br/>TOOL_CALLS + public_action"]
+  Act --> Approval["Runtime approval wait<br/>details.public_action"]
+  Act -->|"ask_user + importance,<br/>timeout_s, fallback"| Ask["ASK_USER<br/>payload.question"]
+```
+
+- Reasoning and tool results are never mined for updates; rejected blocks emit `public_update_rejected` with a code.
+- A new proposal, changed arguments or a verifier replacement never reuses an earlier explanation.
+- An expired clarification is recorded as a host instruction (`question_expired`), never as the person's answer.
+  See [`docs/public-conversation.md`](public-conversation.md).
+
 ### CodeAct workflow (`codeact_agent`)
 
 Files:
