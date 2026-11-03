@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-03
+
+- **Dependency floors**: AbstractRuntime 0.17.0 (was 0.16.0) and AbstractCore 2.33.0 (was 2.30.0), in the base install and the `apple` and `gpu` extras. AbstractRuntime 0.17.0 reports a public update's `update_kind` in replay and interrupts, never fails, a run when its host stops.
+
 - Public updates are typed by the model: the `<public_update>` block accepts
   `"kind": "progress" | "finding"` ("finding" for a fact or piece of evidence it established,
   "progress" for what it is doing). The `public_update` event and cycle record carry `kind`; an
