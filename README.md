@@ -98,6 +98,11 @@ question policies, on top of the `SCHEDULE_RUN` effect behind the ReAct
 sets `_runtime.history_window_tokens`, live token streaming, turn grounding,
 in-flight cancellation and speculation inheritance).
 
+What's new in 0.6.0: public updates are typed by the model, `"kind": "progress"` (what it
+is doing) or `"finding"` (a fact or piece of evidence it established), so a client can list
+a conversation's findings. See [`docs/public-conversation.md`](docs/public-conversation.md)
+and the [changelog](CHANGELOG.md).
+
 What's new in 0.5.0: opt-in public conversation updates for ReAct, an
 action-bound public explanation for approval requests, and timed clarification
 questions with a declared fallback. See [`docs/public-conversation.md`](docs/public-conversation.md)
