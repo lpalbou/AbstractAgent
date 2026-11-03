@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Public updates are typed by the model: the `<public_update>` block accepts
+  `"kind": "progress" | "finding"` ("finding" for a fact or piece of evidence it established,
+  "progress" for what it is doing). The `public_update` event and cycle record carry `kind`; an
+  update without it is recorded as `"progress"`, and any other value is rejected with
+  `invalid_kind`. The public-update instruction in the system prompt gains one line describing
+  the field. See [docs/public-conversation.md](docs/public-conversation.md).
+
 ## [0.5.0] - 2026-11-02
 
 - **Dependency floor**: AbstractRuntime 0.16.0 (was 0.12.0), in the base install and the `apple` and `gpu` extras. 0.16.0 is the first AbstractRuntime that carries `public_action` into tool approval waits and enforces conversational `ASK_USER` question policies (essential questions, timed clarifications with a declared fallback). AbstractCore stays at `abstractcore[tools]>=2.30.0`; AbstractRuntime 0.16.0 itself requires AbstractCore 2.32.0.

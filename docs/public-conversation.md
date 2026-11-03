@@ -27,8 +27,17 @@ depends on the backend and should be measured separately from request stability.
 The model may start its explicit public `content` with one block:
 
 ```xml
-<public_update>{"text":"The museum lists parking nearby; I still need to check the hours.","source_call_ids":["read-1"]}</public_update>
+<public_update>{"kind":"finding","text":"The museum lists parking nearby; I still need to check the hours.","source_call_ids":["read-1"]}</public_update>
 ```
+
+The model types each update with `kind`:
+
+- `"finding"`: a fact or piece of evidence it established;
+- `"progress"`: what it is doing.
+
+An update written without `kind` is recorded as `"progress"`; any other value is
+rejected with `invalid_kind`. Clients use the type as given, for example to keep a
+list of the findings of a conversation, and never infer it from the text.
 
 Its normal tool calls or final answer accompany that block. A normal final answer
 requires no block. Updates should communicate a meaningful discovery, a reason
@@ -39,7 +48,7 @@ Only a leading block in explicit public content is eligible. Private reasoning,
 tool results, quoted examples and code-fenced examples are never mined for updates.
 Text is limited to 600 characters, the block to 4,096 characters and source IDs to
 16. Source IDs must identify results already observed. Malformed, oversized,
-unknown-source, cancelled or truncated updates are rejected rather than clipped;
+unknown-kind, unknown-source, cancelled or truncated updates are rejected rather than clipped;
 `public_update_rejected` reports a code without repeating the rejected text.
 That code is retained in the cycle and a durable event for technical replay.
 The usual tool-call and final-answer contracts still apply.
@@ -49,6 +58,7 @@ Accepted updates produce an `EMIT_EVENT` effect named `public_update`, containin
 ```json
 {
   "id": "run-id:public_update:2",
+  "kind": "finding",
   "text": "The museum lists parking nearby; I still need to check the hours.",
   "run_id": "run-id",
   "session_id": "session-id",

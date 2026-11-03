@@ -23,8 +23,8 @@ from abstractruntime.storage.in_memory import InMemoryLedgerStore, InMemoryRunSt
 pytestmark = pytest.mark.basic
 
 
-def _block(text: str, sources: list[str] | None = None) -> str:
-    return '<public_update>' + json.dumps({"text": text, "source_call_ids": sources or []}) + '</public_update>'
+def _block(text: str, sources: list[str] | None = None, **extra: Any) -> str:
+    return '<public_update>' + json.dumps({**extra, "text": text, "source_call_ids": sources or []}) + '</public_update>'
 
 
 def _harness(script: list[dict[str, Any]], *, enabled: Any = True, question_result=None):
@@ -102,6 +102,7 @@ def test_joined_observations_publish_in_normal_continuation_and_durable_event():
     assert len(updates) == 1
     update = updates[0]
     assert update["text"] == note
+    assert update["kind"] == "progress"  # written without a kind
     assert update["source_call_ids"] == ["read-1", "read-2"]
     assert update["run_id"] == state.run_id and update["session_id"] == "conversation-session"
     assert update["id"] == state.run_id + ":public_update:2"
@@ -114,6 +115,23 @@ def test_joined_observations_publish_in_normal_continuation_and_durable_event():
     # Every prior request's complete stable messages remain an exact prefix.
     for first, second in zip(payloads, payloads[1:]):
         assert second["messages"][:len(first["messages"])] == first["messages"]
+
+
+def test_model_types_a_finding_and_the_durable_event_keeps_it():
+    found = "The museum's own site lists free parking on Rue Verte."
+    _, _, events, ledger, _ = _harness([
+        {"content": "", "tool_calls": [_read()]},
+        {"content": _block(found, ["read-1"], kind="finding"), "tool_calls": [_read("read-2")]},
+        {"content": _block("Checking the opening hours next.", kind="progress"), "tool_calls": [_read("read-3")]},
+        {"content": "Here is the plan.", "tool_calls": []},
+    ])
+    assert [(d["kind"], d["text"]) for n, d in events if n == "public_update"] == [
+        ("finding", found), ("progress", "Checking the opening hours next.")]
+    durable = [r["effect"]["payload"]["payload"] for r in ledger if r["status"] == "completed"
+               and (r.get("effect") or {}).get("type") == "emit_event"
+               and r["effect"]["payload"].get("name") == "public_update"]
+    assert [d["kind"] for d in durable] == ["finding", "progress"]
+    assert '"kind":"progress"' in PUBLIC_UPDATE_INSTRUCTION and '"finding" for a fact' in PUBLIC_UPDATE_INSTRUCTION
 
 
 def test_reasoning_fallback_never_publishes_and_final_needs_no_update():
@@ -131,6 +149,10 @@ def test_reasoning_fallback_never_publishes_and_final_needs_no_update():
     (_block("I checked it.", ["proposed-not-observed"]), "unknown_or_invalid_sources"),
     ('<public_update>{"text":"Unfinished"}', "unclosed_block"),
     (_block("One") + _block("Two"), "multiple_blocks"),
+    (_block("I checked it.", kind="evidence"), "invalid_kind"),
+    (_block("I checked it.", kind=None), "invalid_kind"),
+    (_block("I checked it.", kind=["finding"]), "invalid_kind"),
+    (_block("I checked it.", tone="calm"), "invalid_fields"),
 ])
 def test_malformed_update_is_rejected_without_affecting_valid_tool_calls(content, code):
     state, payloads, events, ledger, _ = _harness([
