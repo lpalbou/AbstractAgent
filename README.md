@@ -90,13 +90,19 @@ Native Python hardware profile cascades are available for deployment manifests:
 AbstractCore and AbstractRuntime profiles; AbstractAgent itself remains
 provider/runtime agnostic.
 
-AbstractAgent 0.5.0 requires `abstractcore[tools]>=2.30.0` and
-`AbstractRuntime>=0.16.0` (the runtime release that carries a public action
-explanation into tool approval waits and enforces conversational `ask_user`
+AbstractAgent 0.6.0 requires `abstractcore[tools]>=2.33.0` and
+`AbstractRuntime>=0.17.0` (the runtime release that reports a public update's
+type in replay and interrupts, never fails, a run when its host stops; it also
+carries a public action explanation into tool approval waits and enforces conversational `ask_user`
 question policies, on top of the `SCHEDULE_RUN` effect behind the ReAct
 `schedule_run` tool, the 50k-token history window that ReAct applies when a host
 sets `_runtime.history_window_tokens`, live token streaming, turn grounding,
 in-flight cancellation and speculation inheritance).
+
+What's new in 0.6.0: public updates are typed by the model, `"kind": "progress"` (what it
+is doing) or `"finding"` (a fact or piece of evidence it established), so a client can list
+a conversation's findings. See [`docs/public-conversation.md`](docs/public-conversation.md)
+and the [changelog](CHANGELOG.md).
 
 What's new in 0.5.0: opt-in public conversation updates for ReAct, an
 action-bound public explanation for approval requests, and timed clarification
